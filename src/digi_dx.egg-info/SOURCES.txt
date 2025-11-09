@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/digi_dx/__init__.py
+src/digi_dx/__main__.py
+src/digi_dx/pipeline_registry.py
+src/digi_dx/settings.py
+src/digi_dx.egg-info/PKG-INFO
+src/digi_dx.egg-info/SOURCES.txt
+src/digi_dx.egg-info/dependency_links.txt
+src/digi_dx.egg-info/entry_points.txt
+src/digi_dx.egg-info/requires.txt
+src/digi_dx.egg-info/top_level.txt
+src/digi_dx/pipelines/__init__.py
+tests/test_run.py
