@@ -3,13 +3,22 @@ This module provides a parser for FT8 messages as found in the ALL.TXT log file 
 """
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, Union
 
 
 @dataclass(frozen=True)
 class FT8Message:
     """Base class for all FT8 messages."""
+    raw_line: str
     raw_message: str
+    timestamp: datetime
+    frequency: float
+    direction: str
+    mode: str
+    snr: int
+    time_offset: float
+    audio_frequency: int
 
 
 @dataclass(frozen=True)
@@ -67,6 +76,18 @@ class Unknown(FT8Message):
 # Type alias for any valid FT8 message type
 ParsedMessage = Union[CQ, Reply, Report, RogerReport, Rogers, Signoff, Unknown]
 
+# Regex to parse the entire log line, including metadata
+LINE_RE = re.compile(
+    r"^(?P<timestamp>\d{6}_\d{6})\s+"
+    r"(?P<frequency>\d+\.\d+)\s+"
+    r"(?P<direction>Tx|Rx)\s+"
+    r"(?P<mode>FT\d+)\s+"
+    r"(?P<snr>[-+]?\d+)\s+"
+    r"(?P<time_offset>\d+\.\d+)\s+"
+    r"(?P<audio_frequency>\d+)\s+"
+    r"(?P<payload>.*)$"
+)
+
 # Pre-compiled regex patterns for efficiency
 # Note on callsign regex: This is a simplified version for common callsigns.
 CALLSIGN_RE = r"[A-Z0-9/]{3,}"
@@ -109,59 +130,76 @@ def parse_message(line: str) -> Optional[ParsedMessage]:
         instance if the message cannot be parsed. Returns None if the line
         is empty or doesn't contain a message payload.
     """
-    if not line or len(line) < 48:
+    if not line:
         return None
 
-    message_payload = line[47:].strip()
+    line_match = LINE_RE.match(line.strip())
+    if not line_match:
+        return None
+
+    metadata = line_match.groupdict()
+    message_payload = metadata["payload"].strip()
     if not message_payload:
         return None
+
+    base_fields = {
+        "raw_line": line.strip(),
+        "raw_message": message_payload,
+        "timestamp": datetime.strptime(metadata["timestamp"], "%y%m%d_%H%M%S"),
+        "frequency": float(metadata["frequency"]),
+        "direction": metadata["direction"],
+        "mode": metadata["mode"],
+        "snr": int(metadata["snr"]),
+        "time_offset": float(metadata["time_offset"]),
+        "audio_frequency": int(metadata["audio_frequency"]),
+    }
 
     # Iterate through patterns, from most specific to most general
     if match := PATTERNS["roger_report"].match(message_payload):
         return RogerReport(
-            raw_message=message_payload,
+            **base_fields,
             caller_callsign=match.group("caller"),
             called_callsign=match.group("called"),
             report=f"R{match.group('report')}",
         )
     if match := PATTERNS["rogers"].match(message_payload):
         return Rogers(
-            raw_message=message_payload,
+            **base_fields,
             caller_callsign=match.group("caller"),
             called_callsign=match.group("called"),
         )
     if match := PATTERNS["report"].match(message_payload):
         return Report(
-            raw_message=message_payload,
+            **base_fields,
             caller_callsign=match.group("caller"),
             called_callsign=match.group("called"),
             report=match.group("report"),
         )
     if match := PATTERNS["signoff"].match(message_payload):
         return Signoff(
-            raw_message=message_payload,
+            **base_fields,
             caller_callsign=match.group("caller"),
             called_callsign=match.group("called"),
         )
     if match := PATTERNS["cq_dx"].match(message_payload):
         return CQ(
-            raw_message=message_payload,
+            **base_fields,
             callsign=match.group("callsign"),
             grid=match.group("grid"),
             is_dx=True,
         )
     if match := PATTERNS["cq"].match(message_payload):
         return CQ(
-            raw_message=message_payload,
+            **base_fields,
             callsign=match.group("callsign"),
             grid=match.group("grid"),
         )
     if match := PATTERNS["reply"].match(message_payload):
         return Reply(
-            raw_message=message_payload,
+            **base_fields,
             caller_callsign=match.group("caller"),
             called_callsign=match.group("called"),
             grid=match.group("grid"),
         )
 
-    return Unknown(raw_message=message_payload)
+    return Unknown(**base_fields)
