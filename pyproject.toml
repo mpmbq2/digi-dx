@@ -106,3 +106,9 @@ default = { solve-group = "default" }
 [tool.pixi.tasks]
 
 [tool.pixi.dependencies]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.4",
+    "pytest-cov>=3.0.0",
+]
