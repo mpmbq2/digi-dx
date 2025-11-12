@@ -1,2 +1,0 @@
-[console_scripts]
-digi-dx = digi_dx.__main__:main
