@@ -106,6 +106,9 @@ dev = { features = ["dev"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
 
 [tool.pixi.tasks]
+app = "shiny run app/app.py --reload"
+test = "pytest"
+lint = "ruff check ."
 
 [tool.pixi.dependencies]
 
