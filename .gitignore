@@ -222,4 +222,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 notebooks/*
+data/*
 !.gitkeep
+.viz/

@@ -4,7 +4,7 @@ generated using Kedro 1.0.0
 """
 
 from kedro.pipeline import Node, Pipeline  # noqa
-from nodes import convert_all_to_messages, create_message_tables
+from .nodes import convert_all_to_messages, create_message_tables
 
 def create_pipeline(**kwargs) -> Pipeline:
     return Pipeline(

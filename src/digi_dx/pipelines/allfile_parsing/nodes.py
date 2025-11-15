@@ -21,7 +21,13 @@ def _group_messages_by_type(messages):
 
     for msg in messages:
         msg_type = type(msg).__name__
-        grouped[msg_type].append(asdict(msg))
+        if msg is not None:
+            try:
+                grouped[msg_type].append(asdict(msg))
+            except TypeError as e:
+                print(msg_type)
+                print(msg)
+                raise e
 
     return dict(grouped)
 
