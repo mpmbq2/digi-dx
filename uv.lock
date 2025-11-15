@@ -770,6 +770,12 @@ docs = [
     { name = "sphinx-rtd-theme" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "docutils", marker = "extra == 'docs'", specifier = "<0.21" },
@@ -778,7 +784,7 @@ requires-dist = [
     { name = "ipython", specifier = ">=8.10" },
     { name = "jinja2", marker = "extra == 'docs'", specifier = "<3.2.0" },
     { name = "jupyterlab", specifier = ">=3.0" },
-    { name = "kedro", specifier = "~=1.0.0" },
+    { name = "kedro", specifier = ">=1.0.0" },
     { name = "kedro-datasets", specifier = ">=4.1.0" },
     { name = "kedro-viz", specifier = ">=12.1.0" },
     { name = "matplotlib", specifier = ">=3.9.4" },
@@ -800,6 +806,12 @@ requires-dist = [
     { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'", specifier = "==1.20.2" },
     { name = "sphinx-copybutton", marker = "extra == 'docs'", specifier = "==0.5.2" },
     { name = "sphinx-rtd-theme", marker = "extra == 'docs'", specifier = "==2.0.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=7.4.4" },
+    { name = "pytest-cov", specifier = ">=3.0.0" },
 ]
 
 [[package]]
