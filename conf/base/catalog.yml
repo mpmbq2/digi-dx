@@ -6,3 +6,8 @@
 all_txt_lines:
   type: digi_dx.io.AllTxtDataSet
   filepath: data/01_raw/ALL.TXT
+
+"table#{name}":
+  type: polars.LazyPolarsDataset
+  filepath: "data/02_transformed/{name}.parquet"
+  file_format: parquet
