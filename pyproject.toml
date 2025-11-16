@@ -23,6 +23,8 @@ dependencies = [
     "plotnine>=0.13.6",
     "shiny>=1.5.0",
     "pyarrow>=21.0.0",
+    "geopy>=2.4.1",
+    "morethemes>=0.5.1",
 ]
 
 [project.scripts]
@@ -40,7 +42,6 @@ docs = [
     "sphinx_copybutton==0.5.2",
     "ipykernel>=5.3, <7.0",
     "Jinja2<3.2.0",
-    "myst-parser>=1.0,<2.1"
 ]
 dev = [
     "pytest-cov~=3.0",
@@ -102,8 +103,8 @@ digi_dx = { path = ".", editable = true }
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
-dev = { features = ["dev"], solve-group = "default" }
-docs = { features = ["docs"], solve-group = "default" }
+#dev = { features = ["dev"], solve-group = "default" }
+#docs = { features = ["docs"], solve-group = "default" }
 
 [tool.pixi.tasks]
 app = "shiny run app/app.py --reload"
@@ -111,6 +112,9 @@ test = "pytest"
 lint = "ruff check ."
 
 [tool.pixi.dependencies]
+pymc = ">=5.26.1,<6"
+bambi = ">=0.16.0,<0.17"
+arviz = ">=0.22.0,<0.23"
 
 [dependency-groups]
 dev = [
