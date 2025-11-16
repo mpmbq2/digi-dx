@@ -111,4 +111,8 @@ def convert_reply_to_hunters(reply: pl.LazyFrame) -> pl.LazyFrame:
 
 
 def combine_target_contacts(callers: pl.LazyFrame, hunters: pl.LazyFrame) -> pl.DataFrame:
-    return pl.concat([callers, hunters], how="vertical")
+    return (
+        pl.concat([callers, hunters], how="vertical")
+        .sort(["callsign", "timestamp"], descending=True)
+        .unique("callsign", keep="first")
+    )

@@ -25,6 +25,7 @@ dependencies = [
     "pyarrow>=21.0.0",
     "geopy>=2.4.1",
     "morethemes>=0.5.1",
+    "altair>=6.0.0",
 ]
 
 [project.scripts]
