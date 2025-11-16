@@ -4,7 +4,7 @@
 # Link: https://docs.kedro.org/en/stable/data/data_catalog.html
 
 all_txt_lines:
-  type: digi_dx.io.AllTxtDataSet
+  type: digi_dx.io.AllTxtDataset
   filepath: data/01_raw/ALL.TXT
 
 "table#{name}":

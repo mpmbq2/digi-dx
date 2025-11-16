@@ -6,7 +6,7 @@ from kedro.io import AbstractDataset
 from kedro.io.core import get_filepath_str, get_protocol_and_path
 
 
-class AllTxtDataSet(AbstractDataset[list[str], None]):
+class AllTxtDataset(AbstractDataset[list[str], None]):
     """``AllTxtDataSet`` loads a list of lines from a text file."""
 
     def __init__(self, filepath: str):
