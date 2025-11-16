@@ -1,64 +1,23 @@
+import os
 from pathlib import Path
+import yaml
+
 import polars as pl
+from kedro.io import DataCatalog
 
 
-# def load_data(filepath: str="data/01_raw/ALL.TXT") -> pl.DataFrame:
-#    import re
-#
-#    # Read the file and replace multi-byte whitespace with a single delimiter
-#    with open(filepath, 'r') as f:
-#        content = f.read(5_000)
-#
-#    # Replace one or more whitespace characters with a single pipe character
-#    content = re.sub(r'\s+', '|', content)
-#
-#    # Write to a temporary location or use StringIO
-#    from io import StringIO
-#    return (
-#        pl.read_csv(
-#            StringIO(content),
-#            has_header=False,
-#            new_columns=[
-#                "date",
-#                "freq",
-#                "transmission_type",
-#                "protocol",
-#                "snr",
-#                "freq_offset",
-#                "signal_report",
-#                "message",
-#                "sender",
-#                "grid_square",
-#            ],
-#            separator="|",
-#        )
-#    )
+def get_data_catalog():
+
+    conf_path = Path(__file__).parent / ".." / "conf" / "base" / "catalog.yml"
+
+    with open(conf_path) as f:
+        conf = yaml.safe_load(f)
+
+    catalog = DataCatalog.from_config(conf)
+    return catalog
 
 
-# def load_data(filepath: str="data/01_raw/ALL.TXT") -> pl.DataFrame:
-#    return (
-#        pl.read_csv(
-#            filepath,
-#            has_header=False,
-#            new_columns=[
-#                "date",
-#                "freq",
-#                "transmission_type",
-#                "protocol",
-#                "snr",
-#                "freq_offset",
-#                "signal_report",
-#                "message",
-#                "sender",
-#                "grid_square",
-#            ],
-#            separator=r"\s+",
-#        )
-#    )
-#
-
-
-def load_data(filepath: str = "data/01_raw/ALL.TXT"):
+def load_data(filepath: str = "../data/01_raw/ALL.TXT"):
     return (
         pl.read_csv(
             str(filepath),
