@@ -48,11 +48,39 @@ app_ui = ui.page_fluid(
             ui.nav_panel(
                 "Caller Table",
                 ui.h3("Caller Table"),
+                ui.layout_columns(
+                    ui.card(
+                        ui.card_header("Potential Contacts"),
+                        ui.output_text("caller_count"),
+                    ),
+                    ui.card(
+                        ui.card_header("Total Miles"),
+                        ui.output_text("caller_total_miles"),
+                    ),
+                    ui.card(
+                        ui.card_header("Average Miles"),
+                        ui.output_text("caller_avg_miles"),
+                    ),
+                ),
                 ui.output_data_frame("caller_table"),
             ),
             ui.nav_panel(
                 "Hunter Table",
                 ui.h3("Hunter Table"),
+                ui.layout_columns(
+                    ui.card(
+                        ui.card_header("Potential Contacts"),
+                        ui.output_text("hunter_count"),
+                    ),
+                    ui.card(
+                        ui.card_header("Total Miles"),
+                        ui.output_text("hunter_total_miles"),
+                    ),
+                    ui.card(
+                        ui.card_header("Average Miles"),
+                        ui.output_text("hunter_avg_miles"),
+                    ),
+                ),
                 ui.output_data_frame("hunter_table"),
             ),
             id="main_tabs",
@@ -99,6 +127,52 @@ def server(input, output, session):
         )
 
         return filtered
+
+    @reactive.calc
+    def filtered_caller_data():
+        """Filter caller data based on selected date range"""
+        date_range = input.date_range()
+
+        if date_range is None or date_range[0] is None or date_range[1] is None:
+            # Load all data if dates aren't selected
+            return CATALOG.load("table#Callers").collect()
+
+        start_date = date_range[0]
+        end_date = date_range[1]
+
+        data = (
+            CATALOG.load("table#Callers")
+            .filter(
+                (pl.col("timestamp").dt.date() >= start_date),
+                (pl.col("timestamp").dt.date() <= end_date)
+            )
+            .collect()
+        )
+
+        return data
+
+    @reactive.calc
+    def filtered_hunter_data():
+        """Filter hunter data based on selected date range"""
+        date_range = input.date_range()
+
+        if date_range is None or date_range[0] is None or date_range[1] is None:
+            # Load all data if dates aren't selected
+            return CATALOG.load("table#Hunters").collect()
+
+        start_date = date_range[0]
+        end_date = date_range[1]
+
+        data = (
+            CATALOG.load("table#Hunters")
+            .filter(
+                (pl.col("timestamp").dt.date() >= start_date),
+                (pl.col("timestamp").dt.date() <= end_date)
+            )
+            .collect()
+        )
+
+        return data
 
     @render.text
     def first_timestamp():
@@ -179,43 +253,67 @@ Unique Protocols: {unique_protocols}
 
         return render.DataGrid(data)
 
+    @render.text
+    def caller_count():
+        """Display the number of potential caller contacts"""
+        data = filtered_caller_data()
+        if len(data) > 0:
+            return str(len(data))
+        return "0"
+
+    @render.text
+    def caller_total_miles():
+        """Display the total miles available from caller contacts"""
+        data = filtered_caller_data()
+        if len(data) > 0:
+            total = data["distance_miles"].sum()
+            return f"{total:,.0f}"
+        return "0"
+
+    @render.text
+    def caller_avg_miles():
+        """Display the average miles for caller contacts"""
+        data = filtered_caller_data()
+        if len(data) > 0:
+            avg = data["distance_miles"].mean()
+            return f"{avg:.1f}"
+        return "0.0"
+
     @render.data_frame
     def caller_table():
+        """Display the caller data grid"""
+        return render.DataGrid(filtered_caller_data())
 
-        date_range = input.date_range()
+    @render.text
+    def hunter_count():
+        """Display the number of potential hunter contacts"""
+        data = filtered_hunter_data()
+        if len(data) > 0:
+            return str(len(data))
+        return "0"
 
-        start_date = date_range[0]
-        end_date = date_range[1]
+    @render.text
+    def hunter_total_miles():
+        """Display the total miles available from hunter contacts"""
+        data = filtered_hunter_data()
+        if len(data) > 0:
+            total = data["distance_miles"].sum()
+            return f"{total:,.0f}"
+        return "0"
 
-        data = (
-            CATALOG.load("table#Callers")
-            .filter(
-                (pl.col("timestamp").dt.date() >= start_date),
-                (pl.col("timestamp").dt.date() <= end_date)
-            )
-            .collect()
-        )
-
-        return render.DataGrid(data)
+    @render.text
+    def hunter_avg_miles():
+        """Display the average miles for hunter contacts"""
+        data = filtered_hunter_data()
+        if len(data) > 0:
+            avg = data["distance_miles"].mean()
+            return f"{avg:.1f}"
+        return "0.0"
 
     @render.data_frame
     def hunter_table():
-
-        date_range = input.date_range()
-
-        start_date = date_range[0]
-        end_date = date_range[1]
-
-        data = (
-            CATALOG.load("table#Hunters")
-            .filter(
-                (pl.col("timestamp").dt.date() >= start_date),
-                (pl.col("timestamp").dt.date() <= end_date)
-            )
-            .collect()
-        )
-
-        return render.DataGrid(data)
+        """Display the hunter data grid"""
+        return render.DataGrid(filtered_hunter_data())
 
 
 
