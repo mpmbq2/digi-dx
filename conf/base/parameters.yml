@@ -1,0 +1,9 @@
+# Parameters for Message Processing Pipeline
+
+# Rx namespace parameters (received messages)
+rx:
+  direction: "Rx"
+
+# Tx namespace parameters (transmitted messages)
+tx:
+  direction: "Tx"

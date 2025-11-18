@@ -1,4 +1,31 @@
-# Here you can define all your datasets by using simple YAML syntax.
+# Data Catalog for Message Processing Pipeline
 #
-# Documentation for this file format can be found in "The Data Catalog"
-# Link: https://docs.kedro.org/en/stable/data/data_catalog.html
+# This catalog defines datasets for both Rx (received) and Tx (transmitted)
+# message processing pipelines using Kedro's namespacing feature.
+
+# Shared raw input file (used by both namespaces)
+raw_messages_file:
+  type: text.TextDataset
+  filepath: data/01_raw/ALL.TXT
+
+# Rx namespace datasets (received messages)
+rx.raw_messages:
+  type: polars.LazyPolarsDataset
+
+rx.parsed_messages:
+  type: polars.LazyPolarsDataset
+
+rx.filtered_messages:
+  type: polars.LazyPolarsDataset
+  filepath: data/02_intermediate/rx_messages.parquet
+
+# Tx namespace datasets (transmitted messages)
+tx.raw_messages:
+  type: polars.LazyPolarsDataset
+
+tx.parsed_messages:
+  type: polars.LazyPolarsDataset
+
+tx.filtered_messages:
+  type: polars.LazyPolarsDataset
+  filepath: data/02_intermediate/tx_messages.parquet
