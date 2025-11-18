@@ -1,0 +1,139 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Digi-Dx is a prototype tool for aiding in contact prioritization for digital amateur radio contests (FT8/WSJT-X). The system parses WSJT-X ALL.TXT files, processes radio messages through Kedro ML pipelines, and presents data through a Shiny for Python UI.
+
+**Current Status**: Early prototype - core parsing and UI functional, but ML modeling and WSJT-X live monitoring not yet implemented.
+
+## Environment & Package Management
+
+This project uses **Pixi** (not Poetry/pip) for dependency management:
+
+```bash
+# Install dependencies (use Pixi, not pip)
+pixi install
+
+# Run the Shiny UI (main development interface)
+pixi run app
+
+# Run Kedro pipelines
+pixi run kedro run
+
+# Run tests
+pixi run test
+
+# Lint code
+pixi run lint
+```
+
+**Important**: The project uses Python 3.9-3.11 (defined in pyproject.toml). Pixi manages the virtual environment automatically.
+
+## Testing
+
+```bash
+# Run all tests with coverage
+pixi run test
+
+# Run specific test file
+pixi run pytest tests/test_ft8_parser.py
+
+# Run tests for a specific function
+pixi run pytest tests/test_ft8_parser.py::test_function_name
+```
+
+Tests are configured with coverage reporting (pytest-cov) and should maintain the coverage threshold defined in pyproject.toml.
+
+## Code Quality
+
+- **Linter**: Ruff (configured in pyproject.toml)
+- **Line length**: 88 characters (Black-compatible)
+- **Import sorting**: Handled by Ruff (isort rules)
+- **Forbidden**: Print statements (T201 rule enabled)
+
+## Architecture
+
+### High-Level Components
+
+1. **Kedro Pipeline Layer** (`src/digi_dx/pipelines/`)
+   - Processes raw WSJT-X data through transformation pipelines
+   - Uses custom `AllTxtDataset` for reading ALL.TXT files line-by-line
+   - Pipelines are auto-discovered and registered via `register_pipelines()`
+
+2. **Shiny UI Layer** (`app/`)
+   - Reactive web interface for viewing parsed data
+   - Loads data from Kedro's data catalog (parquet tables in `data/02_transformed/`)
+   - Displays Contacts, Callers, and Hunters in separate tabs
+
+3. **Domain Logic** (`src/digi_dx/`)
+   - `message_parsing/ft8.py`: FT8 message protocol parsing
+   - `geography/`: Distance/bearing calculations for radio propagation
+   - `io/`: Custom Kedro dataset implementations
+
+### Data Flow
+
+```
+ALL.TXT (raw WSJT-X log)
+    ↓
+AllTxtDataset (custom Kedro dataset)
+    ↓
+allfile_parsing pipeline
+    → Parses lines into structured messages (CQ, Reply, Report, etc.)
+    → Outputs: table#CQ, table#Reply, table#Report, etc.
+    ↓
+active_callsigns pipeline
+    → Derives Callers (from CQ), Hunters (from Reply)
+    → Combines into Contacts table
+    → Outputs: table#Callers, table#Hunters, table#Contacts
+    ↓
+Parquet files in data/02_transformed/
+    ↓
+Shiny app loads via Kedro catalog
+```
+
+### Kedro Integration
+
+- **Config**: `conf/base/catalog.yml` defines datasets
+  - Pattern-based catalog entry: `"table#{name}"` maps to `data/02_transformed/{name}.parquet`
+  - Uses `polars.LazyPolarsDataset` for lazy loading
+- **Pipelines**: Auto-registered via `find_pipelines()` in `pipeline_registry.py`
+- **Default pipeline**: Runs all pipelines sequentially (sum of all pipelines)
+
+### Shiny UI Architecture
+
+- `app/app.py`: Main UI definition with reactive data loading
+- `app/data_handlers.py`: Data loading utilities (wraps Kedro catalog access)
+- **Reactive pattern**: File upload → parse → filter by date → display in tabs
+- **Data source**: Can load from uploaded file or default `data/01_raw/ALL.TXT`
+
+## Key File Locations
+
+- **Pipelines**: `src/digi_dx/pipelines/{pipeline_name}/`
+  - Each pipeline has: `pipeline.py` (Node definitions), `nodes.py` (functions)
+- **Custom datasets**: `src/digi_dx/io/`
+- **Data catalog**: `conf/base/catalog.yml`
+- **Shiny app**: `app/app.py`
+- **Tests**: `tests/` (mirrors src structure)
+
+## Development Workflow
+
+1. **Adding new pipeline logic**: Create nodes in `pipelines/{name}/nodes.py`, wire in `pipeline.py`
+2. **Adding datasets**: Define in `conf/base/catalog.yml`, create custom loaders in `src/digi_dx/io/` if needed
+3. **Testing pipelines**: Run `pixi run digi-dx run` to execute all pipelines
+4. **UI development**: Run `pixi run app` for live reload during development
+
+## Important Constraints
+
+- **Python version**: Must use Python 3.9-3.11 (Kedro/dependency compatibility)
+- **Platform**: Currently configured for `osx-arm64` (see `pyproject.toml`)
+- **Data format**: ALL.TXT follows WSJT-X format (timestamp, frequency, protocol, message fields)
+- **No live WSJT-X monitoring yet**: Current implementation only processes static ALL.TXT files
+
+## Common Gotchas
+
+- **Don't use pip**: All dependency management through Pixi
+- **Kedro catalog patterns**: The `"table#{name}"` pattern in catalog.yml is a template - actual tables are `table#CQ`, `table#Callers`, etc.
+- **Parquet files**: Generated by Kedro pipelines, consumed by Shiny app - ensure pipelines run before starting UI with new data
+- **Date filtering in UI**: Requires valid date range; defaults to showing all data if not set
