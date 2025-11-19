@@ -11,7 +11,7 @@ def create_pipeline(**kwargs) -> Pipeline:
         [
             Node(
                 convert_cq_to_callers,
-                inputs="table#CQ",
+                inputs="table#CQ_Rx",
                 outputs="callers_raw"
             ),
             Node(
@@ -21,7 +21,7 @@ def create_pipeline(**kwargs) -> Pipeline:
             ),
             Node(
                 convert_reply_to_hunters,
-                inputs="table#Reply",
+                inputs="table#Reply_Rx",
                 outputs="hunters_raw"
             ),
             Node(

@@ -23,7 +23,7 @@ app_ui = ui.page_fluid(
             ui.hr(),
             # Date range selector
             ui.input_date_range(
-                "date_range", "Filter by Date Range", start=None, end=None
+                "date_range", "Filter by Date Range", start="2025-01-01", end=None
             ),
             width=300,
         ),

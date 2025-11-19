@@ -15,8 +15,7 @@ from digi_dx.geography import (
 
 def convert_cq_to_callers(cq: pl.LazyFrame) -> pl.LazyFrame:
     return (
-        cq.filter(pl.col("direction") == "Rx")
-        .select(["timestamp", "frequency", "callsign", "grid", "snr"])
+        cq.select(["timestamp", "frequency", "callsign", "grid", "snr"])
         .sort(["timestamp", "callsign"], descending=True)
         .unique(pl.col("callsign"), keep="first")
         .with_columns(
@@ -62,8 +61,7 @@ def convert_cq_to_callers(cq: pl.LazyFrame) -> pl.LazyFrame:
 
 def convert_reply_to_hunters(reply: pl.LazyFrame) -> pl.LazyFrame:
     return (
-        reply.filter(pl.col("direction") == "Rx")
-        .select(["timestamp", "frequency", "called_callsign", "grid", "snr"])
+        reply.select(["timestamp", "frequency", "called_callsign", "grid", "snr"])
         .sort(["timestamp", "called_callsign"], descending=True)
         .unique(pl.col("called_callsign"), keep="first")
         .with_columns(
