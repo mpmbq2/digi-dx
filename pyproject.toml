@@ -111,11 +111,13 @@ default = { solve-group = "default" }
 app = "shiny run app/app.py --reload"
 test = "pytest"
 lint = "ruff check ."
+pipeline = "kedro run"
 
 [tool.pixi.dependencies]
 pymc = ">=5.26.1,<6"
 bambi = ">=0.16.0,<0.17"
 arviz = ">=0.22.0,<0.23"
+dill = ">=0.4.0,<0.5"
 
 [dependency-groups]
 dev = [
