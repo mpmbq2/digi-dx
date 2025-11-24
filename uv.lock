@@ -744,6 +744,7 @@ name = "digi-dx"
 source = { editable = "." }
 dependencies = [
     { name = "altair" },
+    { name = "dill" },
     { name = "duckdb" },
     { name = "geopy" },
     { name = "ipython", version = "8.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
@@ -761,6 +762,7 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
     { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pandas" },
+    { name = "plotly" },
     { name = "plotnine", version = "0.13.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "plotnine", version = "0.15.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "polars" },
@@ -797,6 +799,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "altair", specifier = ">=6.0.0" },
+    { name = "dill", specifier = ">=0.4.0" },
     { name = "docutils", marker = "extra == 'docs'", specifier = "<0.21" },
     { name = "duckdb", specifier = ">=1.4.1" },
     { name = "geopy", specifier = ">=2.4.1" },
@@ -813,6 +816,7 @@ requires-dist = [
     { name = "notebook" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "pandas", specifier = ">=2.3.3" },
+    { name = "plotly", specifier = ">=6.4.0" },
     { name = "plotnine", specifier = ">=0.13.6" },
     { name = "polars", specifier = ">=1.35.2" },
     { name = "pyarrow", specifier = ">=21.0.0" },
@@ -832,6 +836,15 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=7.4.4" },
     { name = "pytest-cov", specifier = ">=3.0.0" },
+]
+
+[[package]]
+name = "dill"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/12/80/630b4b88364e9a8c8c5797f4602d0f76ef820909ee32f0bacb9f90654042/dill-0.4.0.tar.gz", hash = "sha256:0633f1d2df477324f53a895b02c901fb961bdbf65a17122586ea7019292cbcf0", size = 186976 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/50/3d/9373ad9c56321fdab5b41197068e1d8c25883b3fea29dd361f9b55116869/dill-0.4.0-py3-none-any.whl", hash = "sha256:44f54bf6412c2c8464c14e8243eb163690a9800dbe2c367330883b19c7561049", size = 119668 },
 ]
 
 [[package]]
