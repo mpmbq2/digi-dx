@@ -26,9 +26,9 @@ all_txt_lines:
 # Model artifacts (04_models/)
 p_contact_model:
   type: pickle.PickleDataset
-  filepath: data/04_models/p_contact_model.pkl
+  filepath: data/04_models/p_transition_model.pkl
   backend: dill
 
 p_contact_idata:
   type: pickle.PickleDataset
-  filepath: data/04_models/p_contact_idata.pkl
+  filepath: data/04_models/p_transition_idata.pkl

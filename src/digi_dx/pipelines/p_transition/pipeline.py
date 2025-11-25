@@ -29,11 +29,11 @@ def create_pipeline(**kwargs) -> Pipeline:
             Node(
                 fit_transition_model,
                 inputs="features::table#Transitions",
-                outputs=["p_contact_model", "p_contact_idata"],
+                outputs=["p_transition_model", "p_transition_idata"],
             ),
             Node(
                 extract_transition_probabilities,
-                inputs="p_contact_idata",
+                inputs="p_transition_idata",
                 outputs="inference::table#TransitionProbabilities",
             ),
         ]
