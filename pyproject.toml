@@ -11,7 +11,7 @@ dependencies = [
     "ipython>=8.10",
     "jupyterlab>=3.0",
     "notebook",
-    "kedro~=1.0.0",
+    "kedro>=1.0.0",
     "numpy>=2.0.2",
     "pandas>=2.3.3",
     "polars>=1.35.2",
@@ -106,8 +106,17 @@ dev = { features = ["dev"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
 
 [tool.pixi.tasks]
+app = "shiny run app/app.py --reload"
+test = "pytest"
+lint = "ruff check ."
 
 [tool.pixi.dependencies]
-numpy = "*"
-pandas = "*"
-matplotlib = "*"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.4",
+    "pytest-cov>=3.0.0",
+]
+
+[tool.kedro_telemetry]
+project_id = "33c7580f14e6412d9c637052af704b68"
