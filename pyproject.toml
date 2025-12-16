@@ -11,7 +11,8 @@ dependencies = [
     "ipython>=8.10",
     "jupyterlab>=3.0",
     "notebook",
-    "kedro>=1.0.0",
+    "kedro @ git+https://github.com/kedro-org/kedro.git",
+    #"kedro>=1.0.0",
     "numpy>=2.0.2",
     "pandas>=2.3.3",
     "polars>=1.35.2",
@@ -26,6 +27,8 @@ dependencies = [
     "geopy>=2.4.1",
     "morethemes>=0.5.1",
     "altair>=6.0.0",
+    "plotly>=6.4.0",
+    "dill>=0.4.0",
 ]
 
 [project.scripts]
@@ -111,11 +114,13 @@ default = { solve-group = "default" }
 app = "shiny run app/app.py --reload"
 test = "pytest"
 lint = "ruff check ."
+pipeline = "kedro run"
 
 [tool.pixi.dependencies]
 pymc = ">=5.26.1,<6"
 bambi = ">=0.16.0,<0.17"
 arviz = ">=0.22.0,<0.23"
+dill = ">=0.4.0,<0.5"
 
 [dependency-groups]
 dev = [

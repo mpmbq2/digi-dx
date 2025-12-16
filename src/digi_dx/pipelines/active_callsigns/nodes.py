@@ -15,8 +15,7 @@ from digi_dx.geography import (
 
 def convert_cq_to_callers(cq: pl.LazyFrame) -> pl.LazyFrame:
     return (
-        cq.filter(pl.col("direction") == "Rx")
-        .select(["timestamp", "frequency", "callsign", "grid", "snr"])
+        cq.select(["timestamp", "frequency", "callsign", "grid", "snr"])
         .sort(["timestamp", "callsign"], descending=True)
         .unique(pl.col("callsign"), keep="first")
         .with_columns(
@@ -43,7 +42,6 @@ def convert_cq_to_callers(cq: pl.LazyFrame) -> pl.LazyFrame:
                 pl.col("locations").map_elements(calc_bearing, return_dtype=pl.Float64)
             ),
         )
-        .sort("distance_miles", descending=True)
         .select(
             [
                 "timestamp",
@@ -63,8 +61,7 @@ def convert_cq_to_callers(cq: pl.LazyFrame) -> pl.LazyFrame:
 
 def convert_reply_to_hunters(reply: pl.LazyFrame) -> pl.LazyFrame:
     return (
-        reply.filter(pl.col("direction") == "Rx")
-        .select(["timestamp", "frequency", "called_callsign", "grid", "snr"])
+        reply.select(["timestamp", "frequency", "called_callsign", "grid", "snr"])
         .sort(["timestamp", "called_callsign"], descending=True)
         .unique(pl.col("called_callsign"), keep="first")
         .with_columns(
@@ -92,7 +89,6 @@ def convert_reply_to_hunters(reply: pl.LazyFrame) -> pl.LazyFrame:
                 pl.col("locations").map_elements(calc_bearing, return_dtype=pl.Float64)
             ),
         )
-        .sort("distance_miles", descending=True)
         .select(
             [
                 "timestamp",
@@ -107,6 +103,40 @@ def convert_reply_to_hunters(reply: pl.LazyFrame) -> pl.LazyFrame:
                 "bearing_degrees",
             ]
         )
+    )
+
+
+def add_priority(contacts: pl.LazyFrame) -> pl.LazyFrame:
+    """Add priority score based on distance and SNR ranking.
+
+    Priority score is calculated as the sum of:
+    - Distance rank (furthest = rank 1)
+    - SNR rank (highest = rank 1)
+
+    Lower priority scores indicate higher priority contacts.
+
+    Args:
+        contacts: LazyFrame with distance_miles and snr columns
+
+    Returns:
+        LazyFrame with added distance_rank, snr_rank, and priority_score columns,
+        sorted by priority_score (ascending)
+    """
+    return (
+        contacts.with_columns(
+            [
+                pl.col("distance_miles")
+                .rank(method="ordinal", descending=True)
+                .alias("distance_rank"),
+                pl.col("snr")
+                .rank(method="ordinal", descending=True)
+                .alias("snr_rank"),
+            ]
+        )
+        .with_columns(
+            priority_score=(pl.col("distance_rank") + pl.col("snr_rank"))
+        )
+        .sort("priority_score")
     )
 
 

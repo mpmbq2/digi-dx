@@ -11,3 +11,30 @@ all_txt_lines:
   type: polars.LazyPolarsDataset
   filepath: "data/02_transformed/{name}.parquet"
   file_format: parquet
+
+# Feature tables for model inputs (03_features/)
+"features::table#{name}":
+  type: pandas.ParquetDataset
+  filepath: "data/03_features/{name}.parquet"
+
+# Inference tables for model outputs (05_inference/)
+"inference::table#{name}":
+  type: polars.LazyPolarsDataset
+  filepath: "data/05_inference/{name}.parquet"
+  file_format: parquet
+
+# Model artifacts (04_models/)
+p_contact_model:
+  type: pickle.PickleDataset
+  filepath: data/04_models/p_contact_model.pkl
+  backend: dill
+
+p_contact_idata:
+  type: pickle.PickleDataset
+  filepath: data/04_models/p_contact_idata.pkl
+  backend: dill
+
+p_contact_predictions:
+  type: pickle.PickleDataset
+  filepath: data/04_models/p_contact_predictions.pkl
+  backend: dill

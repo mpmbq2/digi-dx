@@ -22,12 +22,7 @@ def _group_messages_by_type(messages):
     for msg in messages:
         msg_type = type(msg).__name__
         if msg is not None:
-            try:
-                grouped[msg_type].append(asdict(msg))
-            except TypeError as e:
-                print(msg_type)
-                print(msg)
-                raise e
+            grouped[msg_type].append(asdict(msg))
 
     return dict(grouped)
 
@@ -47,3 +42,18 @@ def create_message_tables(allfile_messages: list[FT8Message]) -> list[pl.DataFra
         message_tables["Rogers"],
         message_tables["Signoff"],
     ]
+
+
+def split_table_by_direction(table: pl.DataFrame) -> dict[str, pl.DataFrame]:
+    """Split a message table into separate Tx and Rx tables based on direction column.
+
+    Args:
+        table: DataFrame containing a 'direction' column with values 'Tx' or 'Rx'
+
+    Returns:
+        Dictionary with keys 'tx' and 'rx' containing filtered DataFrames
+    """
+    return {
+        "tx": table.filter(pl.col("direction") == "Tx"),
+        "rx": table.filter(pl.col("direction") == "Rx"),
+    }
