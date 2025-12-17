@@ -1,7 +1,9 @@
-from shiny import App, ui, render, reactive
-from data_handlers import load_data, get_data_catalog
-from pathlib import Path
 import polars as pl
+from pathlib import Path
+
+from shiny import App, reactive, render, ui
+
+from data_handlers import get_data_catalog, load_data
 
 CATALOG = get_data_catalog()
 
@@ -135,19 +137,25 @@ def server(input, output, session):
 
         if date_range is None or date_range[0] is None or date_range[1] is None:
             # Load all data if dates aren't selected
-            return CATALOG.load("table#Callers").collect()
+            data = CATALOG.load("table#Callers").collect()
+        else:
+            start_date = date_range[0]
+            end_date = date_range[1]
 
-        start_date = date_range[0]
-        end_date = date_range[1]
-
-        data = (
-            CATALOG.load("table#Callers")
-            .filter(
-                (pl.col("timestamp").dt.date() >= start_date),
-                (pl.col("timestamp").dt.date() <= end_date)
+            data = (
+                CATALOG.load("table#Callers")
+                .filter(
+                    (pl.col("timestamp").dt.date() >= start_date),
+                    (pl.col("timestamp").dt.date() <= end_date),
+                )
+                .collect()
             )
-            .collect()
-        )
+
+        # Default sort by probability-weighted priority if available
+        if "priority_score_prob" in data.columns:
+            data = data.sort("priority_score_prob")
+        elif "priority_score" in data.columns:
+            data = data.sort("priority_score")
 
         return data
 
@@ -158,19 +166,22 @@ def server(input, output, session):
 
         if date_range is None or date_range[0] is None or date_range[1] is None:
             # Load all data if dates aren't selected
-            return CATALOG.load("table#Hunters").collect()
+            data = CATALOG.load("table#Hunters").collect()
+        else:
+            start_date = date_range[0]
+            end_date = date_range[1]
 
-        start_date = date_range[0]
-        end_date = date_range[1]
-
-        data = (
-            CATALOG.load("table#Hunters")
-            .filter(
-                (pl.col("timestamp").dt.date() >= start_date),
-                (pl.col("timestamp").dt.date() <= end_date)
+            data = (
+                CATALOG.load("table#Hunters")
+                .filter(
+                    (pl.col("timestamp").dt.date() >= start_date),
+                    (pl.col("timestamp").dt.date() <= end_date),
+                )
+                .collect()
             )
-            .collect()
-        )
+
+        if "priority_score" in data.columns:
+            data = data.sort("priority_score")
 
         return data
 
@@ -246,10 +257,15 @@ Unique Protocols: {unique_protocols}
             CATALOG.load("table#Contacts")
             .filter(
                 (pl.col("timestamp").dt.date() >= start_date),
-                (pl.col("timestamp").dt.date() <= end_date)
+                (pl.col("timestamp").dt.date() <= end_date),
             )
             .collect()
         )
+
+        if "priority_score_prob" in data.columns:
+            data = data.sort("priority_score_prob")
+        elif "priority_score" in data.columns:
+            data = data.sort("priority_score")
 
         return render.DataGrid(data)
 
