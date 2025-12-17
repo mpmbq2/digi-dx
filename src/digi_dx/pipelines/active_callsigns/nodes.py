@@ -202,7 +202,7 @@ def add_contact_probability(
 
 def combine_target_contacts(callers: pl.LazyFrame, hunters: pl.LazyFrame) -> pl.DataFrame:
     return (
-        pl.concat([callers, hunters], how="vertical")
+        pl.concat([callers, hunters], how="diagonal")
         .sort(["callsign", "timestamp"], descending=True)
         .unique("callsign", keep="first")
     )
