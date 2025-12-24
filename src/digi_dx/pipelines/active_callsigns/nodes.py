@@ -1,9 +1,7 @@
-"""
-This is a boilerplate pipeline 'active_callsigns'
-generated using Kedro 1.0.0
-"""
-
 import polars as pl
+import arviz as az
+import pandas as pd
+from typing import Any
 
 from digi_dx.geography import (
     calc_distance,
@@ -140,9 +138,71 @@ def add_priority(contacts: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
+def add_contact_probability(
+    callers: pl.LazyFrame,
+    model: Any,
+    idata: Any,
+) -> pl.LazyFrame:
+    """Add contact probability and probability-weighted priority score.
+
+    Uses the fitted Bayesian logistic regression contact model to compute
+    per-caller contact probabilities based on SNR, then multiplies by distance
+    to get a probability-weighted priority score. Lower scores are better.
+
+    Args:
+        callers: LazyFrame with at least snr and distance_miles columns, and
+            existing rank-based priority columns.
+        model: Fitted Bambi contact model (p_contact_model).
+        idata: ArviZ InferenceData from the fitted model (p_contact_idata).
+
+    Returns:
+        LazyFrame with added p_contact and priority_score_prob columns,
+        sorted by probability-weighted priority (ascending).
+    """
+    callers_df = callers.collect()
+
+    if callers_df.height == 0:
+        # Preserve empty LazyFrame and schema
+        return callers
+
+    # Build prediction data frame compatible with the contact model
+    prediction_data = pd.DataFrame(
+        {"snr_cq": callers_df["snr"].to_pandas()}
+    )
+
+    prediction = model.predict(idata, data=prediction_data, inplace=False)
+
+    posterior = (
+        az.extract(prediction, var_names="p")
+        .to_dataframe()
+        .reset_index()
+        .groupby("__obs__")
+        .agg(p_mean=("p", "mean"))
+        .reset_index(drop=True)
+    )
+
+    callers_df = callers_df.with_columns(
+        [
+            pl.Series(
+                name="p_contact",
+                values=posterior["p_mean"].to_numpy(),
+            ),
+        ]
+    ).with_columns(
+        (pl.col("distance_miles") * pl.col("p_contact")).alias(
+            "priority_score_prob"
+        )
+    )
+
+    # Sort by probability-weighted priority (lower is better)
+    callers_df = callers_df.sort("priority_score_prob")
+
+    return callers_df.lazy()
+
+
 def combine_target_contacts(callers: pl.LazyFrame, hunters: pl.LazyFrame) -> pl.DataFrame:
     return (
-        pl.concat([callers, hunters], how="vertical")
+        pl.concat([callers, hunters], how="diagonal")
         .sort(["callsign", "timestamp"], descending=True)
         .unique("callsign", keep="first")
     )

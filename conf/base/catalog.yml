@@ -29,6 +29,11 @@ p_contact_model:
   filepath: data/04_models/p_contact_model.pkl
   backend: dill
 
+p_transition_model:
+  type: pickle.PickleDataset
+  filepath: data/04_models/p_transition_model.pkl
+  backend: dill
+
 p_contact_idata:
   type: pickle.PickleDataset
   filepath: data/04_models/p_contact_idata.pkl
