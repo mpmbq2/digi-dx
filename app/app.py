@@ -1,9 +1,9 @@
-import polars as pl
+from shiny import App, ui, render, reactive
+from data_handlers import load_data, get_data_catalog
 from pathlib import Path
+import polars as pl
 
-from shiny import App, reactive, render, ui
-
-from data_handlers import get_data_catalog, load_data
+from modules import metric_dashboard, raw_analysis, contacts
 
 CATALOG = get_data_catalog()
 
@@ -31,59 +31,28 @@ app_ui = ui.page_fluid(
         ),
         # Main content area with tabs
         ui.navset_tab(
-            ui.nav_panel("All Data", ui.output_data_frame("data_grid")),
+            ui.nav_panel("All Data", raw_analysis.all_data_ui("raw")),
             ui.nav_panel(
                 "Summary Statistics",
-                ui.h3("Summary Statistics"),
-                ui.output_text("summary_stats"),
+                raw_analysis.summary_stats_ui("raw"),
             ),
             ui.nav_panel(
                 "Frequency Analysis",
-                ui.h3("Frequency Analysis"),
-                ui.output_data_frame("frequency_table"),
+                raw_analysis.frequency_ui("raw"),
             ),
             ui.nav_panel(
                 "Contacts Table",
-                ui.h3("Contacts Table"),
-                ui.output_data_frame("contacts_table"),
+                contacts.contacts_ui("contacts"),
             ),
             ui.nav_panel(
                 "Caller Table",
                 ui.h3("Caller Table"),
-                ui.layout_columns(
-                    ui.card(
-                        ui.card_header("Potential Contacts"),
-                        ui.output_text("caller_count"),
-                    ),
-                    ui.card(
-                        ui.card_header("Total Miles"),
-                        ui.output_text("caller_total_miles"),
-                    ),
-                    ui.card(
-                        ui.card_header("Average Miles"),
-                        ui.output_text("caller_avg_miles"),
-                    ),
-                ),
-                ui.output_data_frame("caller_table"),
+                metric_dashboard.dashboard_ui("callers"),
             ),
             ui.nav_panel(
                 "Hunter Table",
                 ui.h3("Hunter Table"),
-                ui.layout_columns(
-                    ui.card(
-                        ui.card_header("Potential Contacts"),
-                        ui.output_text("hunter_count"),
-                    ),
-                    ui.card(
-                        ui.card_header("Total Miles"),
-                        ui.output_text("hunter_total_miles"),
-                    ),
-                    ui.card(
-                        ui.card_header("Average Miles"),
-                        ui.output_text("hunter_avg_miles"),
-                    ),
-                ),
-                ui.output_data_frame("hunter_table"),
+                metric_dashboard.dashboard_ui("hunters"),
             ),
             id="main_tabs",
         ),
@@ -105,7 +74,7 @@ def server(input, output, session):
             # Use default file
             file_path = Path(__file__).parent / ".." / "data" / "01_raw" / "ALL.TXT"
 
-        return load_data(file_path)
+        return load_data(str(file_path))
 
     @reactive.calc
     def filtered_data():
@@ -131,6 +100,33 @@ def server(input, output, session):
         return filtered
 
     @reactive.calc
+    def filtered_contacts_data():
+        """Filter contacts data based on selected date range"""
+        date_range = input.date_range()
+
+        if date_range is None or date_range[0] is None or date_range[1] is None:
+            data = CATALOG.load("table#Contacts").collect()
+        else:
+            start_date = date_range[0]
+            end_date = date_range[1]
+
+            data = (
+                CATALOG.load("table#Contacts")
+                .filter(
+                    (pl.col("timestamp").dt.date() >= start_date),
+                    (pl.col("timestamp").dt.date() <= end_date)
+                )
+                .collect()
+            )
+
+        if "priority_score_prob" in data.columns:
+            data = data.sort("priority_score_prob")
+        elif "priority_score" in data.columns:
+            data = data.sort("priority_score")
+        
+        return data
+
+    @reactive.calc
     def filtered_caller_data():
         """Filter caller data based on selected date range"""
         date_range = input.date_range()
@@ -146,12 +142,11 @@ def server(input, output, session):
                 CATALOG.load("table#Callers")
                 .filter(
                     (pl.col("timestamp").dt.date() >= start_date),
-                    (pl.col("timestamp").dt.date() <= end_date),
+                    (pl.col("timestamp").dt.date() <= end_date)
                 )
                 .collect()
             )
-
-        # Default sort by probability-weighted priority if available
+            
         if "priority_score_prob" in data.columns:
             data = data.sort("priority_score_prob")
         elif "priority_score" in data.columns:
@@ -175,14 +170,14 @@ def server(input, output, session):
                 CATALOG.load("table#Hunters")
                 .filter(
                     (pl.col("timestamp").dt.date() >= start_date),
-                    (pl.col("timestamp").dt.date() <= end_date),
+                    (pl.col("timestamp").dt.date() <= end_date)
                 )
                 .collect()
             )
 
         if "priority_score" in data.columns:
             data = data.sort("priority_score")
-
+            
         return data
 
     @render.text
@@ -191,7 +186,7 @@ def server(input, output, session):
         data = get_data()
         if len(data) > 0:
             first_ts = data["timestamp"].min()
-            return first_ts
+            return str(first_ts)
         return "No data available"
 
     @render.text
@@ -200,137 +195,14 @@ def server(input, output, session):
         data = get_data()
         if len(data) > 0:
             last_ts = data["timestamp"].max()
-            return last_ts
+            return str(last_ts)
         return "No data available"
 
-    @render.data_frame
-    def data_grid():
-        """Display the filtered data grid"""
-        return render.DataGrid(filtered_data())
-
-    @render.text
-    def summary_stats():
-        """Display summary statistics for the filtered data"""
-        data = filtered_data()
-        if len(data) > 0:
-            total_records = len(data)
-            unique_senders = data["sender"].n_unique()
-            unique_targets = data["target"].n_unique()
-            unique_protocols = data["protocol"].n_unique()
-
-            return f"""
-Total Records: {total_records}
-Unique Senders: {unique_senders}
-Unique Targets: {unique_targets}
-Unique Protocols: {unique_protocols}
-            """
-        return "No data available"
-
-    @render.data_frame
-    def frequency_table():
-        """Display frequency analysis by protocol"""
-        data = filtered_data()
-        if len(data) > 0:
-            freq_analysis = (
-                data.group_by("protocol")
-                .agg(
-                    [
-                        pl.count().alias("count"),
-                        pl.col("sender").n_unique().alias("unique_senders"),
-                        pl.col("target").n_unique().alias("unique_targets"),
-                    ]
-                )
-                .sort("count", descending=True)
-            )
-            return render.DataGrid(freq_analysis)
-        return render.DataGrid(pl.DataFrame())
-
-    @render.data_frame
-    def contacts_table():
-
-        date_range = input.date_range()
-
-        start_date = date_range[0]
-        end_date = date_range[1]
-
-        data = (
-            CATALOG.load("table#Contacts")
-            .filter(
-                (pl.col("timestamp").dt.date() >= start_date),
-                (pl.col("timestamp").dt.date() <= end_date),
-            )
-            .collect()
-        )
-
-        if "priority_score_prob" in data.columns:
-            data = data.sort("priority_score_prob")
-        elif "priority_score" in data.columns:
-            data = data.sort("priority_score")
-
-        return render.DataGrid(data)
-
-    @render.text
-    def caller_count():
-        """Display the number of potential caller contacts"""
-        data = filtered_caller_data()
-        if len(data) > 0:
-            return str(len(data))
-        return "0"
-
-    @render.text
-    def caller_total_miles():
-        """Display the total miles available from caller contacts"""
-        data = filtered_caller_data()
-        if len(data) > 0:
-            total = data["distance_miles"].sum()
-            return f"{total:,.0f}"
-        return "0"
-
-    @render.text
-    def caller_avg_miles():
-        """Display the average miles for caller contacts"""
-        data = filtered_caller_data()
-        if len(data) > 0:
-            avg = data["distance_miles"].mean()
-            return f"{avg:.1f}"
-        return "0.0"
-
-    @render.data_frame
-    def caller_table():
-        """Display the caller data grid"""
-        return render.DataGrid(filtered_caller_data())
-
-    @render.text
-    def hunter_count():
-        """Display the number of potential hunter contacts"""
-        data = filtered_hunter_data()
-        if len(data) > 0:
-            return str(len(data))
-        return "0"
-
-    @render.text
-    def hunter_total_miles():
-        """Display the total miles available from hunter contacts"""
-        data = filtered_hunter_data()
-        if len(data) > 0:
-            total = data["distance_miles"].sum()
-            return f"{total:,.0f}"
-        return "0"
-
-    @render.text
-    def hunter_avg_miles():
-        """Display the average miles for hunter contacts"""
-        data = filtered_hunter_data()
-        if len(data) > 0:
-            avg = data["distance_miles"].mean()
-            return f"{avg:.1f}"
-        return "0.0"
-
-    @render.data_frame
-    def hunter_table():
-        """Display the hunter data grid"""
-        return render.DataGrid(filtered_hunter_data())
-
+    # Call module servers
+    raw_analysis.analysis_server("raw", filtered_data)
+    contacts.contacts_server("contacts", filtered_contacts_data)
+    metric_dashboard.dashboard_server("callers", filtered_caller_data)
+    metric_dashboard.dashboard_server("hunters", filtered_hunter_data)
 
 
 # Create the Shiny app
