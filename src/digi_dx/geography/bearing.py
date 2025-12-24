@@ -30,8 +30,8 @@ def calc_bearing(coords):
     Expects a dict with keys: lat1, lon1, lat2, lon2
     """
     return calculate_bearing(
-        coords["Tx_latitude"],
-        coords["Tx_longitude"],
-        coords["Rx_latitude"],
-        coords["Rx_longitude"],
+        coords["reference_latitude"],
+        coords["reference_longitude"],
+        coords["latitude"],
+        coords["longitude"],
     )
