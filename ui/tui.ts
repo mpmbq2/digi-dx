@@ -6,7 +6,10 @@ import {
   messageForQso,
   parseFt8Message,
   QsoAutomation,
+  renderOccupancyBar,
   secondsUntilNextSlot,
+  slotFromTimestamp,
+  suggestClearAf,
   type AutomationTx,
   type DecodeRecord,
   type QsoAutomationEvent,
@@ -30,7 +33,19 @@ let pendingAutomationTx: AutomationTx | null = null;
 let automationTimer: NodeJS.Timeout | null = null;
 let manualOverridePending = false;
 let latestTxState: "idle" | "pending" | "active" = "idle";
+let statusBase = "connecting...";
 const loggedQsoIds = new Set<string>();
+
+// Slot survey: hold TX for one full receive cycle of our TX parity so the
+// (otherwise deaf) TX slot can be observed, then suggest a clear frequency.
+const SURVEY_LO_HZ = 300;
+const SURVEY_HI_HZ = 2700;
+const SURVEY_DECODE_LAG_SECONDS = 5;
+let surveyActive = false;
+let surveySlot: TxSlot | null = null;
+let surveyStartSec = 0;
+let surveyEndSec = 0;
+let surveyTimer: NodeJS.Timeout | null = null;
 
 const ws = new WebSocket(url);
 
@@ -223,6 +238,7 @@ sendButton.on("press", () => {
   }
   // Manual transmit is a one-shot override: pause automation until the next
   // matching daemon tx event (or until the pending state clears).
+  cancelSurvey("manual transmit");
   manualOverridePending = true;
   pendingAutomationTx = null;
   clearAutomationTimer();
@@ -243,6 +259,7 @@ const cancelButton = blessed.button({
 });
 cancelButton.on("press", () => {
   send({ type: "cancel_transmit" });
+  cancelSurvey("cancelled");
   pendingAutomationTx = null;
   manualOverridePending = false;
   clearAutomationTimer();
@@ -292,6 +309,19 @@ opButton(21, 1, "Prev step", () => actOnSelected((qso) => automation.previousSte
 opButton(21, "48%", "Next step", () => actOnSelected((qso) => automation.nextStep(qso.id)));
 opButton(22, 1, "Up", () => moveSelected(-1));
 opButton(22, "48%", "Down", () => moveSelected(1));
+
+const surveyButton = blessed.button({
+  parent: composePanel,
+  top: 23,
+  left: 1,
+  width: "91%",
+  height: 1,
+  mouse: true,
+  align: "center",
+  content: "Survey TX slot (find clear freq)",
+  style: { fg: "black", bg: "cyan", focus: { bg: "blue" }, hover: { bg: "blue" } }
+});
+surveyButton.on("press", startSurvey);
 
 const logBox = blessed.log({
   top: "73%",
@@ -386,6 +416,34 @@ function mentionsMyCall(message: string): boolean {
 
 function appendLog(line: string): void {
   logBox.log(line);
+  screen.render();
+}
+
+// --- cycle clock ----------------------------------------------------------
+// Shows the current even/odd 15s period, the countdown to the next boundary,
+// and whether we are transmitting. Ticks on a timer independent of daemon
+// messages so the countdown stays live.
+
+function clockSegment(): string {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const parity = slotFromTimestamp(nowSec);
+  const remain = 15 - (nowSec % 15);
+  let tx: string;
+  if (surveyActive) {
+    const left = Math.max(0, surveyEndSec - nowSec);
+    tx = `{cyan-fg}{bold}SURVEY ${surveySlot} t-${left}s{/bold}{/cyan-fg}`;
+  } else if (latestTxState === "active") {
+    tx = "{red-fg}{bold}TX{/bold}{/red-fg}";
+  } else if (latestTxState === "pending") {
+    tx = "{yellow-fg}TX-arm{/yellow-fg}";
+  } else {
+    tx = "{green-fg}RX{/green-fg}";
+  }
+  return `cycle={bold}${parity}{/bold} t-${String(remain).padStart(2)}s ${tx}`;
+}
+
+function renderStatusBar(): void {
+  statusBar.setContent(`${statusBase}  ||  ${clockSegment()}`);
   screen.render();
 }
 
@@ -578,12 +636,27 @@ function clearAutomationTimer(): void {
   }
 }
 
+// The daemon rests in "pending" after a transmission (its desiredTx lingers
+// until cancel/clear), so we can never rely on seeing "idle" to resume. Re-arm
+// automation on the falling edge of "active" (a transmission just finished), or
+// on a genuine "idle" (e.g. after cancel).
+function updateTxState(next: "idle" | "pending" | "active"): void {
+  const wasActive = latestTxState === "active";
+  latestTxState = next;
+  if (manualOverridePending || surveyActive || next === "active") {
+    return;
+  }
+  if (wasActive || next === "idle") {
+    scheduleAutomation();
+  }
+}
+
 function scheduleAutomation(): void {
   clearAutomationTimer();
   renderQsoList();
   updateAfWarning();
 
-  if (manualOverridePending || latestTxState === "active") {
+  if (surveyActive || manualOverridePending || latestTxState === "active") {
     return;
   }
 
@@ -604,7 +677,7 @@ function scheduleAutomation(): void {
 
 function sendAutomatedTx(tx: AutomationTx): void {
   automationTimer = null;
-  if (manualOverridePending || latestTxState === "active") {
+  if (surveyActive || manualOverridePending || latestTxState === "active") {
     return;
   }
   const af = currentAfOrNull();
@@ -621,6 +694,90 @@ function sendAutomatedTx(tx: AutomationTx): void {
   pendingAutomationTx = refreshed;
   send({ type: "transmit", ...refreshed.intent });
   renderQsoList();
+}
+
+// --- slot survey ----------------------------------------------------------
+
+function startSurvey(): void {
+  if (surveyActive) {
+    appendLog("[survey] already running");
+    return;
+  }
+  // Our TX parity is the active CQ row's slot, falling back to the manual slot.
+  const cq = automation.qsos.find((qso) => qso.kind === "calling-cq" && qso.status === "active");
+  const slot: TxSlot = cq ? cq.nextSlot : currentSlot;
+
+  surveyActive = true;
+  surveySlot = slot;
+  surveyStartSec = Math.floor(Date.now() / 1000);
+
+  // Stop transmitting so the radio can actually hear its own TX slot: drop any
+  // armed timer and cancel a queued (not yet keyed) automated transmit.
+  clearAutomationTimer();
+  if (pendingAutomationTx) {
+    send({ type: "cancel_transmit" });
+    pendingAutomationTx = null;
+  }
+
+  // Wait for the next full receive cycle of this parity, plus decode latency.
+  const delaySec = secondsUntilNextSlot(slot) + 15 + SURVEY_DECODE_LAG_SECONDS;
+  surveyEndSec = surveyStartSec + delaySec;
+  appendLog(`[survey] holding TX ~${delaySec}s to listen on the ${slot} slot`);
+  updateSurveyButton();
+  renderStatusBar();
+  if (surveyTimer) {
+    clearTimeout(surveyTimer);
+  }
+  surveyTimer = setTimeout(finishSurvey, delaySec * 1000);
+}
+
+function finishSurvey(): void {
+  surveyTimer = null;
+  const slot = surveySlot;
+  const startSec = surveyStartSec;
+  surveyActive = false;
+  surveySlot = null;
+
+  if (slot) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const occupied = decodes
+      .filter((decode) => decode.ts >= startSec && decode.ts <= nowSec && slotFromTimestamp(decode.ts) === slot)
+      .map((decode) => decode.af);
+    const suggestion = suggestClearAf(occupied, SURVEY_LO_HZ, SURVEY_HI_HZ);
+    const bar = renderOccupancyBar(occupied, SURVEY_LO_HZ, SURVEY_HI_HZ, 24, suggestion);
+    appendLog(`[survey] ${slot} ${SURVEY_LO_HZ}|${bar}|${SURVEY_HI_HZ}  clear@${suggestion}Hz (${occupied.length} sigs)`);
+    afInput.setValue(String(suggestion));
+  }
+
+  updateSurveyButton();
+  renderStatusBar();
+  scheduleAutomation();
+}
+
+function cancelSurvey(reason: string): void {
+  if (!surveyActive) {
+    return;
+  }
+  if (surveyTimer) {
+    clearTimeout(surveyTimer);
+    surveyTimer = null;
+  }
+  surveyActive = false;
+  surveySlot = null;
+  appendLog(`[survey] aborted (${reason})`);
+  updateSurveyButton();
+  renderStatusBar();
+}
+
+function updateSurveyButton(): void {
+  if (surveyActive) {
+    surveyButton.setContent("SURVEYING… (CANCEL TX to stop)");
+    surveyButton.style.bg = "red";
+  } else {
+    surveyButton.setContent("Survey TX slot (find clear freq)");
+    surveyButton.style.bg = "cyan";
+  }
+  screen.render();
 }
 
 // --- daemon command parsing (mirrors ui/cli.ts) ---------------------------
@@ -726,16 +883,12 @@ function handleMessage(msg: Record<string, unknown>): void {
       if (typeof session.grid === "string") {
         myGrid = session.grid;
       }
-      latestTxState = (tx.state as typeof latestTxState) ?? "idle";
-      statusBar.setContent(
+      statusBase =
         `{bold}active{/bold}=${session.active} device=${(session.device as { id?: number } | null)?.id ?? "-"} ` +
-          `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
-          `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`
-      );
-      screen.render();
-      if (latestTxState === "idle" && !manualOverridePending) {
-        scheduleAutomation();
-      }
+        `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
+        `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`;
+      updateTxState((tx.state as typeof latestTxState) ?? "idle");
+      renderStatusBar();
       break;
     }
     case "decode": {
@@ -753,12 +906,19 @@ function handleMessage(msg: Record<string, unknown>): void {
       decodeList.scrollTo(decodes.length);
       screen.render();
 
+      // Occupied-frequency info depends on all decodes, so refresh it every time.
+      updateAfWarning();
+
+      // Only touch the scheduler when a decode actually advances a QSO. An
+      // unrelated decode must not re-arm (or re-fire) the active transmission,
+      // e.g. it must not keep re-triggering CQ while we wait for a reply.
       const events = automation.handleDecode(record, myCall, myGrid);
       if (events.length > 0) {
         handleQsoEvents(events);
+        // A live QSO beats surveying: if a caller just answered, stop holding.
+        cancelSurvey("answering caller");
+        scheduleAutomation();
       }
-      // A relevant decode may advance a QSO; reschedule the next automated tx.
-      scheduleAutomation();
       break;
     }
     case "tx": {
@@ -785,10 +945,7 @@ function handleMessage(msg: Record<string, unknown>): void {
     }
     case "tx_update":
       appendLog(`[tx_update] state=${msg.state} af=${msg.af ?? "-"} slot=${msg.slot ?? "-"} msg=${msg.message ?? "-"}`);
-      latestTxState = (msg.state as typeof latestTxState) ?? latestTxState;
-      if (latestTxState === "idle" && !manualOverridePending) {
-        scheduleAutomation();
-      }
+      updateTxState((msg.state as typeof latestTxState) ?? latestTxState);
       break;
     case "log":
       appendLog(`[${msg.level}] ${msg.message}`);
@@ -815,4 +972,5 @@ function handleMessage(msg: Record<string, unknown>): void {
   }
 }
 
+setInterval(renderStatusBar, 500);
 screen.render();

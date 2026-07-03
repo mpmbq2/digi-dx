@@ -588,6 +588,52 @@ export function normalizeMessage(message: string): string {
   return message.trim().toUpperCase().replace(/\s+/g, " ");
 }
 
+// Given the audio frequencies occupied by stations in a single TX slot, return
+// the frequency at the centre of the widest clear gap within [loHz, hiHz]. Band
+// edges act as sentinels so a gap next to an edge is considered. With nothing
+// occupied, returns the band centre.
+export function suggestClearAf(occupiedAfs: number[], loHz = 300, hiHz = 2700): number {
+  const inBand = occupiedAfs.filter((af) => af >= loHz && af <= hiHz).sort((a, b) => a - b);
+  const points = [loHz, ...inBand, hiHz];
+  let bestGap = -1;
+  let bestMid = Math.round((loHz + hiHz) / 2);
+  for (let index = 0; index < points.length - 1; index++) {
+    const gap = points[index + 1]! - points[index]!;
+    if (gap > bestGap) {
+      bestGap = gap;
+      bestMid = Math.round((points[index]! + points[index + 1]!) / 2);
+    }
+  }
+  return bestMid;
+}
+
+// Render a compact single-line occupancy strip for one TX slot: each cell is a
+// Hz bucket across [loHz, hiHz], "#" if any station occupied it, "." if clear,
+// and "^" at the marked (suggested) frequency.
+export function renderOccupancyBar(
+  occupiedAfs: number[],
+  loHz = 300,
+  hiHz = 2700,
+  width = 24,
+  markAf?: number
+): string {
+  const cells = new Array<string>(width).fill(".");
+  const bucketOf = (af: number): number => {
+    const ratio = (af - loHz) / (hiHz - loHz);
+    return Math.max(0, Math.min(width - 1, Math.floor(ratio * width)));
+  };
+  for (const af of occupiedAfs) {
+    if (af < loHz || af > hiHz) {
+      continue;
+    }
+    cells[bucketOf(af)] = "#";
+  }
+  if (markAf !== undefined && markAf >= loHz && markAf <= hiHz) {
+    cells[bucketOf(markAf)] = "^";
+  }
+  return cells.join("");
+}
+
 function parseDirectedPayload(token: string): DirectedPayload | null {
   // Check terminal literals before isGrid: "RR73" also matches the Maidenhead
   // grid pattern ([A-R]{2}\d{2}), so it must be classified as rr73 first.

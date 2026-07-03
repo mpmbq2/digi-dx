@@ -9,7 +9,9 @@ import {
   messageForQso,
   parseFt8Message,
   QsoAutomation,
+  renderOccupancyBar,
   secondsUntilNextSlot,
+  suggestClearAf,
   type AutomationTx,
   type DecodeRecord
 } from "../ui/qso.js";
@@ -173,6 +175,24 @@ describe("QsoAutomation scheduler state", () => {
         "even"
       )?.decode.message
     ).toBe("CQ W1AW FN31");
+  });
+});
+
+describe("slot survey frequency helpers", () => {
+  it("suggests the centre of the widest clear gap in the band", () => {
+    expect(suggestClearAf([], 300, 2700)).toBe(1500);
+    // stations clustered low: the wide upper gap 600->2700 wins, centre 1650
+    expect(suggestClearAf([400, 500, 600], 300, 2700)).toBe(1650);
+    // ignores occupants outside the band: only 1000 remains, widest gap 1000->2700
+    expect(suggestClearAf([100, 2900, 1000], 300, 2700)).toBe(1850);
+  });
+
+  it("renders an occupancy strip with markers", () => {
+    const bar = renderOccupancyBar([300, 2700], 300, 2700, 10, 1500);
+    expect(bar.length).toBe(10);
+    expect(bar[0]).toBe("#");
+    expect(bar[9]).toBe("#");
+    expect(bar).toContain("^");
   });
 });
 
