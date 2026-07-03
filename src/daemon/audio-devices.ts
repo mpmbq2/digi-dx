@@ -17,24 +17,33 @@ export function resolveFt8modemPath(env: NodeJS.ProcessEnv = process.env): strin
 }
 
 export async function listAudioDevices(ft8modemPath = resolveFt8modemPath()): Promise<AudioDevice[]> {
+  let stdout: string;
+  let stderr: string;
+
   try {
     const result = await execFileAsync(ft8modemPath, ["-h"], {
       timeout: 5000,
       maxBuffer: 1024 * 1024
     });
-    const devices = parseFt8modemHelp(`${result.stdout}\n${result.stderr}`);
-    if (devices.length === 0) {
-      throw new Error("no audio devices found in ft8modem help output");
-    }
-    return devices;
+    stdout = result.stdout;
+    stderr = result.stderr;
   } catch (error) {
-    if (error instanceof DaemonError) {
-      throw error;
+    // ft8modem exits with status 1 for -h; its help text is still on stdout/stderr.
+    const execError = error as { stdout?: string; stderr?: string; code?: unknown };
+    if (typeof execError.stdout !== "string" && typeof execError.stderr !== "string") {
+      throw new DaemonError("AUDIO_DISCOVERY_FAILED", "failed to discover audio devices", {
+        message: error instanceof Error ? error.message : String(error)
+      });
     }
-    throw new DaemonError("AUDIO_DISCOVERY_FAILED", "failed to discover audio devices", {
-      message: error instanceof Error ? error.message : String(error)
-    });
+    stdout = execError.stdout ?? "";
+    stderr = execError.stderr ?? "";
   }
+
+  const devices = parseFt8modemHelp(`${stdout}\n${stderr}`);
+  if (devices.length === 0) {
+    throw new DaemonError("AUDIO_DISCOVERY_FAILED", "no audio devices found in ft8modem help output");
+  }
+  return devices;
 }
 
 export function parseFt8modemHelp(output: string): AudioDevice[] {
@@ -58,6 +67,19 @@ export function parseFt8modemHelp(output: string): AudioDevice[] {
 }
 
 function parseSingleLineDevice(line: string): AudioDevice | null {
+  // Real ft8modem -h format: `+ ID = 141: "USB Audio CODEC (USB Audio)", best rate = 48000`
+  const ft8modemMatch = /^\+\s*ID\s*=\s*(\d+)\s*:\s*"(.+?)"\s*,\s*best rate\s*=\s*(\d+)/i.exec(line);
+  if (ft8modemMatch) {
+    return {
+      id: Number(ft8modemMatch[1]),
+      name: cleanDeviceName(ft8modemMatch[2]),
+      // ft8modem -h does not report channel counts; PortAudio-style output does.
+      inputs: 0,
+      outputs: 0,
+      defaultSampleRate: Number(ft8modemMatch[3])
+    };
+  }
+
   const match =
     /^(?:device\s*)?(\d+)\s*[:.)-]\s*(.+?)(?:\s+\(|\s{2,}|\s+-\s+|\s*$)(.*)$/i.exec(line) ??
     /^\[(\d+)]\s*(.+?)(?:\s+\(|\s{2,}|\s+-\s+|\s*$)(.*)$/i.exec(line);

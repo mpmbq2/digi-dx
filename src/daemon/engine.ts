@@ -372,35 +372,61 @@ export function statusFromSnapshot(snapshot: EngineSnapshot, control: DaemonStat
   };
 }
 
+// Real `ft8cat -A -u` lines follow the same layout as `-a` ALL.TXT-style
+// output, only with an integer unix timestamp instead of a yymmdd_hhmmss
+// field. Captured example (from a live session, non-`-u` timestamp):
+//   260702_151115   144.174 Tx FT8      0  0.0 1000 CQ N1MPM FN42
+//   260703_031600   144.174 Rx FT8     10 -0.6 2024 WM8Q DL0EO -17
+// Fields are whitespace-padded for alignment, and some Rx lines carry extra
+// trailing decoder-pass metadata (e.g. "? a1") that we keep as part of the
+// message text; Phase 1 does not parse FT8 message grammar.
 export function parseInternalUdpLine(line: string): DecodeEvent | TxEvent | null {
-  const trimmed = line.trim();
-  const rx = /^(\d{10})\s+(-?\d+)\s+([+-]?\d+(?:\.\d+)?)\s+(\d+)\s+(?:FT[48]\s+)?[~#]\s+(.+)$/.exec(trimmed);
-  if (rx) {
+  const parts = line.trim().split(/\s+/);
+  if (parts.length < 7) {
+    return null;
+  }
+
+  const [ts, freq, direction, mode, snr, dt, af, ...rest] = parts;
+  if (!/^\d{10}$/.test(ts)) {
+    return null;
+  }
+  if (!/^\d+(?:\.\d+)?$/.test(freq)) {
+    return null;
+  }
+  if (direction !== "Rx" && direction !== "Tx") {
+    return null;
+  }
+  if (mode !== "FT8" && mode !== "FT4") {
+    return null;
+  }
+  if (!/^-?\d+$/.test(snr) || !/^[+-]?\d+(?:\.\d+)?$/.test(dt) || !/^\d+$/.test(af)) {
+    return null;
+  }
+
+  const message = rest.join(" ").trim().toUpperCase();
+  if (!message) {
+    return null;
+  }
+
+  if (direction === "Rx") {
     return {
       type: "decode",
-      ts: Number(rx[1]),
-      snr: Number(rx[2]),
-      dt: Number(rx[3]),
-      af: Number(rx[4]),
-      mode: "FT8",
-      message: rx[5].trim().toUpperCase()
+      ts: Number(ts),
+      snr: Number(snr),
+      dt: Number(dt),
+      af: Number(af),
+      mode,
+      message
     };
   }
 
-  const tx =
-    /^(?:E:\s*)?(\d{10})\s+(?:E:\s*)?(\d+)\s+(FT8|FT4)\s+(.+)$/i.exec(trimmed) ??
-    /^E:\s*(\d{10})?\s*(\d+)\s+(FT8|FT4)\s+(.+)$/i.exec(trimmed);
-  if (tx) {
-    return {
-      type: "tx",
-      ts: tx[1] ? Number(tx[1]) : Math.floor(Date.now() / 1000),
-      af: Number(tx[2]),
-      mode: tx[3].toUpperCase() as "FT8" | "FT4",
-      message: tx[4].trim().toUpperCase()
-    };
-  }
-
-  return null;
+  return {
+    type: "tx",
+    ts: Number(ts),
+    af: Number(af),
+    mode,
+    message
+  };
 }
 
 function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
