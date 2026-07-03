@@ -99,6 +99,50 @@ describe("QsoAutomation sequencing", () => {
     });
   });
 
+  it("starts a QSO for any station that calls us, even with no CQ active", () => {
+    const automation = new QsoAutomation(fixedNow);
+    const events = automation.handleDecode(decode("N1MPM JA2KVB PM95", 1_800_000_015, -7), "N1MPM", "FN33");
+
+    expect(events.map((event) => event.type)).toEqual(["qso_created"]);
+    expect(automation.qsos[0]?.theirCall).toBe("JA2KVB");
+    expect(automation.nextTransmission(1000)?.intent.message).toBe("JA2KVB N1MPM -07");
+  });
+
+  it("adds a second caller while a QSO is already in progress", () => {
+    const automation = new QsoAutomation(fixedNow);
+    automation.createCq("N1MPM", "FN33", "even");
+    automation.handleDecode(decode("N1MPM JA2KVB PM95", 1_800_000_015, -7), "N1MPM", "FN33");
+
+    // CQ row is now stopped; a different station calls us.
+    const events = automation.handleDecode(decode("N1MPM W1AW FN31", 1_800_000_045, -9), "N1MPM", "FN33");
+
+    expect(events.map((event) => event.type)).toEqual(["qso_created"]);
+    const calls = automation.qsos.filter((qso) => qso.kind === "standard").map((qso) => qso.theirCall);
+    expect(calls).toEqual(["JA2KVB", "W1AW"]);
+  });
+
+  it("keeps calling CQ without timing out, and stops CQ once answered", () => {
+    const automation = new QsoAutomation(fixedNow);
+    automation.createCq("N1MPM", "FN33", "even");
+    expect(automation.isCallingCq()).toBe(true);
+
+    const pending = automation.nextTransmission(1000)!;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      automation.confirmTransmission(pending, { ts: 1_800_000_030, af: 1000, message: pending.intent.message });
+    }
+    expect(automation.isCallingCq()).toBe(true);
+
+    automation.handleDecode(decode("N1MPM JA2KVB PM95", 1_800_000_015, -7), "N1MPM", "FN33");
+    expect(automation.isCallingCq()).toBe(false);
+  });
+
+  it("re-engaging CQ replaces the previous CQ row", () => {
+    const automation = new QsoAutomation(fixedNow);
+    automation.createCq("N1MPM", "FN33", "even");
+    automation.createCq("N1MPM", "FN33", "odd");
+    expect(automation.qsos.filter((qso) => qso.kind === "calling-cq")).toHaveLength(1);
+  });
+
   it("locks a QSO to the expected station addressed to my call", () => {
     const automation = new QsoAutomation(fixedNow);
     const qso = automation.createReplyToCq(decode("CQ JA2KVB PM95", 1_800_000_000, -16), "N1MPM", "FN33");

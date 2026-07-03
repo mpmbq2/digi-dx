@@ -112,7 +112,17 @@ export class QsoAutomation {
 
   constructor(private readonly now: () => Date = () => new Date()) {}
 
+  isCallingCq(): boolean {
+    return this.qsos.some((qso) => qso.kind === "calling-cq" && qso.status === "active");
+  }
+
   createCq(myCall: string, myGrid: string, initialSlot: TxSlot, position: "top" | "bottom" = "top"): QsoRecord {
+    // Re-engaging CQ replaces any earlier CQ row rather than stacking them.
+    for (let index = this.qsos.length - 1; index >= 0; index--) {
+      if (this.qsos[index]!.kind === "calling-cq") {
+        this.qsos.splice(index, 1);
+      }
+    }
     const qso = this.makeQso({
       kind: "calling-cq",
       myCall,
@@ -175,10 +185,11 @@ export class QsoAutomation {
       return this.advanceFromDirected(existing, parsed.payload, decode);
     }
 
-    const cq = this.qsos.find(
-      (qso) => qso.kind === "calling-cq" && qso.myCall === normalizedMyCall && qso.status === "active"
-    );
-    if (!cq) {
+    // A directed message to us from a new station means they are calling us, so
+    // start a QSO even if we are not (or no longer) calling CQ — e.g. a second
+    // station answers while we are already working the first. A bare terminal
+    // "73" is ignored: there is nothing left to answer.
+    if (parsed.payload.type === "73") {
       return [];
     }
 
@@ -196,13 +207,20 @@ export class QsoAutomation {
     updateReportsFromPayload(qso, parsed.payload, decode.snr);
     this.insertQso(qso, "bottom");
 
-    cq.status = "stopped";
-    cq.note = `reply from ${parsed.from}`;
-    cq.updatedAt = this.isoNow();
-    return [
-      { type: "qso_created", qso },
-      { type: "cq_stopped", qso: cq }
-    ];
+    const events: QsoAutomationEvent[] = [{ type: "qso_created", qso }];
+
+    // If we were calling CQ, stop that row now that we have a caller.
+    const cq = this.qsos.find(
+      (candidate) => candidate.kind === "calling-cq" && candidate.myCall === normalizedMyCall && candidate.status === "active"
+    );
+    if (cq) {
+      cq.status = "stopped";
+      cq.note = `reply from ${parsed.from}`;
+      cq.updatedAt = this.isoNow();
+      events.push({ type: "cq_stopped", qso: cq });
+    }
+
+    return events;
   }
 
   nextTransmission(af: number): AutomationTx | null {
@@ -254,7 +272,8 @@ export class QsoAutomation {
       return { matched: true, events: [{ type: "qso_completed", qso, reason: "final 73 transmitted" }] };
     }
 
-    if ((qso.attempts[pending.step] ?? 0) >= maxAttemptsPerStep && qso.status === "active") {
+    // CQ keeps calling until answered or cancelled; only real QSOs time out.
+    if (qso.kind === "standard" && (qso.attempts[pending.step] ?? 0) >= maxAttemptsPerStep && qso.status === "active") {
       qso.status = "timed_out";
       qso.note = `timed out on ${pending.step}`;
       return { matched: true, events: [{ type: "qso_timed_out", qso }] };
@@ -628,7 +647,8 @@ export function renderOccupancyBar(
     }
     cells[bucketOf(af)] = "#";
   }
-  if (markAf !== undefined && markAf >= loHz && markAf <= hiHz) {
+  // Only mark a clear cell, so the marker never hides an occupied bucket.
+  if (markAf !== undefined && markAf >= loHz && markAf <= hiHz && cells[bucketOf(markAf)] === ".") {
     cells[bucketOf(markAf)] = "^";
   }
   return cells.join("");

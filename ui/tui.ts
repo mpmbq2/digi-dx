@@ -21,6 +21,14 @@ const url = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8787";
 const token = process.env.DIGI_DX_AUTH_TOKEN;
 
 const decodes: DecodeRecord[] = [];
+
+// Band Activity is a chronological list of rows: decodes, per-cycle separators,
+// and our own TX lines. bandRows mirrors the list items 1:1 so a selected row
+// maps back to its decode (separators/TX rows are not selectable for reply).
+type BandRow = { kind: "decode"; decode: DecodeRecord } | { kind: "sep" } | { kind: "tx" };
+const bandRows: BandRow[] = [];
+let lastBandPeriod: number | null = null;
+
 let myCall = "";
 let myGrid = "";
 let idCounter = 1;
@@ -46,6 +54,10 @@ let surveySlot: TxSlot | null = null;
 let surveyStartSec = 0;
 let surveyEndSec = 0;
 let surveyTimer: NodeJS.Timeout | null = null;
+const PLOT_WIDTH = 24;
+
+// Last device id seen in a status update, used to pre-fill the save dialog.
+let lastDeviceId: number | null = null;
 
 const ws = new WebSocket(url);
 
@@ -91,15 +103,30 @@ const decodeList = blessed.list({
   scrollable: true,
   alwaysScroll: true,
   style: {
-    selected: { bg: "blue" }
+    selected: { bg: "blue", fg: "black" }
   }
 });
 
-const qsoList = blessed.list({
-  top: "48%",
+// The QSO panel holds a CQ indicator, the active QSO list, and a completed list.
+const qsoArea = blessed.box({ top: "48%", left: 0, width: "55%", height: "25%" });
+
+const cqIndicator = blessed.box({
+  parent: qsoArea,
+  top: 0,
   left: 0,
-  width: "55%",
-  height: "25%",
+  width: "100%",
+  height: 1,
+  tags: true,
+  align: "center",
+  content: ""
+});
+
+const qsoList = blessed.list({
+  parent: qsoArea,
+  top: 1,
+  left: 0,
+  width: "100%",
+  height: "48%",
   border: { type: "line" },
   label: " active qsos (r=reply c=cq u/d=reorder) ",
   mouse: true,
@@ -108,7 +135,24 @@ const qsoList = blessed.list({
   tags: true,
   scrollable: true,
   alwaysScroll: true,
-  style: { selected: { bg: "blue" } }
+  style: { selected: { bg: "blue", fg: "black" } }
+});
+
+const completedList = blessed.list({
+  parent: qsoArea,
+  top: "50%",
+  left: 0,
+  width: "100%",
+  height: "48%",
+  border: { type: "line" },
+  label: " completed ",
+  mouse: true,
+  keys: true,
+  vi: true,
+  tags: true,
+  scrollable: true,
+  alwaysScroll: true,
+  style: { selected: { bg: "blue", fg: "black" } }
 });
 
 const composePanel = blessed.box({
@@ -142,12 +186,32 @@ const afInput = blessed.textbox({
 });
 afInput.on("submit", () => {
   updateAfWarning();
+  renderOccupancyPlots();
   screen.render();
 });
 
-const slotButton = blessed.button({
+const surveyButton = blessed.button({
   parent: composePanel,
   top: 4,
+  left: 1,
+  width: "91%",
+  height: 1,
+  mouse: true,
+  align: "center",
+  content: "Survey TX slot (pause 1 cycle, find clear freq)",
+  style: { fg: "black", bg: "cyan", focus: { bg: "blue" }, hover: { bg: "blue" } }
+});
+surveyButton.on("press", startSurvey);
+
+// Live per-slot occupancy strips, refreshed each RX period. The slot you TX in
+// stays stale until a Survey (or manual pause) lets the radio hear it; that
+// slot's label is starred.
+const evenPlot = blessed.text({ parent: composePanel, top: 5, left: 1, tags: true, content: "" });
+const oddPlot = blessed.text({ parent: composePanel, top: 6, left: 1, tags: true, content: "" });
+
+const slotButton = blessed.button({
+  parent: composePanel,
+  top: 7,
   left: 1,
   width: "90%",
   height: 3,
@@ -161,13 +225,14 @@ slotButton.on("press", () => {
   currentSlot = currentSlot === "even" ? "odd" : "even";
   slotButton.setContent(`slot: ${currentSlot} (click to toggle)`);
   updateAfWarning();
+  renderOccupancyPlots();
   screen.render();
 });
 
-const messageLabel = blessed.text({ parent: composePanel, top: 7, left: 1, content: "message:" });
+const messageLabel = blessed.text({ parent: composePanel, top: 10, left: 1, content: "message:" });
 const messageInput = blessed.textbox({
   parent: composePanel,
-  top: 8,
+  top: 11,
   left: 1,
   width: "90%",
   height: 3,
@@ -176,7 +241,7 @@ const messageInput = blessed.textbox({
   mouse: true
 });
 
-const macroBar = blessed.box({ parent: composePanel, top: 11, left: 1, width: "90%", height: 3 });
+const macroBar = blessed.box({ parent: composePanel, top: 14, left: 1, width: "90%", height: 3 });
 const cqButton = blessed.button({
   parent: macroBar,
   top: 0,
@@ -215,7 +280,7 @@ rr73Button.on("press", () => {
 
 const sendButton = blessed.button({
   parent: composePanel,
-  top: 14,
+  top: 17,
   left: 1,
   width: "44%",
   height: 3,
@@ -247,7 +312,7 @@ sendButton.on("press", () => {
 
 const cancelButton = blessed.button({
   parent: composePanel,
-  top: 14,
+  top: 17,
   left: "48%",
   width: "44%",
   height: 3,
@@ -269,7 +334,7 @@ cancelButton.on("press", () => {
 
 // --- qso automation controls ---------------------------------------------
 
-blessed.text({ parent: composePanel, top: 17, left: 1, content: "-- qso automation --" });
+blessed.text({ parent: composePanel, top: 20, left: 1, content: "-- qso automation --" });
 
 function opButton(top: number, left: string | number, content: string, handler: () => void): void {
   const button = blessed.button({
@@ -286,17 +351,17 @@ function opButton(top: number, left: string | number, content: string, handler: 
   button.on("press", handler);
 }
 
-opButton(18, 1, "Call CQ", callCq);
-opButton(18, "48%", "Reply QSO", replyToSelectedDecode);
-opButton(19, 1, "Resume", () => actOnSelected((qso) => automation.resume(qso.id)));
-opButton(19, "48%", "Complete", () => {
+opButton(21, 1, "Call CQ", callCq);
+opButton(21, "48%", "Reply QSO", replyToSelectedDecode);
+opButton(22, 1, "Resume", () => actOnSelected((qso) => automation.resume(qso.id)));
+opButton(22, "48%", "Complete", () => {
   const qso = selectedQso();
   if (qso) {
     handleQsoEvents(automation.complete(qso.id));
     scheduleAutomation();
   }
 });
-opButton(20, 1, "Abandon", () => {
+opButton(23, 1, "Abandon", () => {
   const qso = selectedQso();
   if (qso) {
     automation.abandon(qso.id);
@@ -304,72 +369,76 @@ opButton(20, 1, "Abandon", () => {
     scheduleAutomation();
   }
 });
-opButton(20, "48%", "Retry", () => actOnSelected((qso) => automation.resetAttempts(qso.id)));
-opButton(21, 1, "Prev step", () => actOnSelected((qso) => automation.previousStep(qso.id)));
-opButton(21, "48%", "Next step", () => actOnSelected((qso) => automation.nextStep(qso.id)));
-opButton(22, 1, "Up", () => moveSelected(-1));
-opButton(22, "48%", "Down", () => moveSelected(1));
-
-const surveyButton = blessed.button({
-  parent: composePanel,
-  top: 23,
-  left: 1,
-  width: "91%",
-  height: 1,
-  mouse: true,
-  align: "center",
-  content: "Survey TX slot (find clear freq)",
-  style: { fg: "black", bg: "cyan", focus: { bg: "blue" }, hover: { bg: "blue" } }
-});
-surveyButton.on("press", startSurvey);
+opButton(23, "48%", "Retry", () => actOnSelected((qso) => automation.resetAttempts(qso.id)));
+opButton(24, 1, "Prev step", () => actOnSelected((qso) => automation.previousStep(qso.id)));
+opButton(24, "48%", "Next step", () => actOnSelected((qso) => automation.nextStep(qso.id)));
+opButton(25, 1, "Up", () => moveSelected(-1));
+opButton(25, "48%", "Down", () => moveSelected(1));
 
 const logBox = blessed.log({
   top: "73%",
   left: 0,
   width: "100%",
-  height: "100%-3-73%",
+  bottom: 3,
   border: { type: "line" },
   label: " log ",
   scrollable: true,
   alwaysScroll: true
 });
 
-const cmdInput = blessed.textbox({
+const commandBar = blessed.box({
   bottom: 0,
   left: 0,
   width: "100%",
   height: 3,
   border: { type: "line" },
-  label: " command (claim / release / devices / config / save.. / start.. / stop) ",
-  inputOnFocus: true,
-  mouse: true
+  label: " commands "
+});
+
+// One button per daemon command. Commands that need arguments (save) open a
+// dialog pre-filled from current status; the rest send immediately.
+const commandButtons: Array<{ label: string; run: () => void }> = [
+  { label: "claim", run: () => send({ type: "claim_control", ...(token ? { token } : {}) }) },
+  { label: "release", run: () => send({ type: "release_control" }) },
+  { label: "start", run: () => send({ type: "start_session" }) },
+  { label: "stop", run: () => send({ type: "stop_session" }) },
+  { label: "status", run: () => send({ type: "get_status" }) },
+  { label: "config", run: () => send({ type: "get_config" }) },
+  { label: "devices", run: () => send({ type: "list_audio_devices" }) },
+  { label: "save…", run: openSaveDialog }
+];
+commandButtons.forEach((command, index) => {
+  const button = blessed.button({
+    parent: commandBar,
+    top: 0,
+    left: `${(index * 100) / commandButtons.length}%`,
+    width: `${100 / commandButtons.length}%`,
+    height: 1,
+    mouse: true,
+    align: "center",
+    content: command.label,
+    style: { fg: "white", focus: { bg: "blue" }, hover: { bg: "blue" } }
+  });
+  button.on("press", command.run);
 });
 
 screen.append(statusBar);
 screen.append(decodeList);
-screen.append(qsoList);
+screen.append(qsoArea);
 screen.append(composePanel);
 screen.append(logBox);
-screen.append(cmdInput);
+screen.append(commandBar);
 
 screen.key(["C-c"], () => process.exit(0));
 screen.key(["tab"], () => screen.focusNext());
 screen.key(["S-tab"], () => screen.focusPrevious());
 
-cmdInput.key(["enter"], () => {
-  const line = cmdInput.getValue().trim();
-  cmdInput.clearValue();
-  screen.render();
-  if (line) {
-    runCommand(line);
-  }
-});
-
 decodeList.on("select", (_item, index) => {
-  const record = decodes[index];
-  if (!record) {
+  const row = bandRows[index];
+  if (!row || row.kind !== "decode") {
     return;
   }
+  const record = row.decode;
   afInput.setValue(String(record.af));
   const decodeSlot = record.ts % 30 === 0 ? "even" : "odd";
   currentSlot = decodeSlot === "even" ? "odd" : "even";
@@ -384,7 +453,7 @@ decodeList.key(["c"], callCq);
 
 function trackQsoSelection(): void {
   const index = (qsoList as unknown as { selected: number }).selected;
-  const qso = automation.qsos[index];
+  const qso = renderedActive[index];
   if (qso) {
     selectedQsoId = qso.id;
   }
@@ -417,6 +486,37 @@ function mentionsMyCall(message: string): boolean {
 function appendLog(line: string): void {
   logBox.log(line);
   screen.render();
+}
+
+// --- band activity rows ---------------------------------------------------
+
+function pushBandSeparator(periodStart: number, youTx: boolean): void {
+  if (lastBandPeriod === periodStart) {
+    return;
+  }
+  const time = new Date(periodStart * 1000).toISOString().slice(11, 19);
+  const parity = slotFromTimestamp(periodStart);
+  bandRows.push({ kind: "sep" });
+  decodeList.addItem(`{grey-fg}──── ${time}  ${parity}${youTx ? " · YOU TX" : ""} ────{/grey-fg}`);
+  lastBandPeriod = periodStart;
+}
+
+function appendBandDecode(record: DecodeRecord): void {
+  pushBandSeparator(Math.floor(record.ts / 15) * 15, false);
+  bandRows.push({ kind: "decode", decode: record });
+  const time = new Date(record.ts * 1000).toISOString().slice(11, 19);
+  const line = `${time} ${String(record.snr).padStart(4)} ${String(record.af).padStart(5)}  ${record.message}`;
+  decodeList.addItem(mentionsMyCall(record.message) ? `{black-fg}{yellow-bg}${line}{/yellow-bg}{/black-fg}` : line);
+  decodeList.scrollTo(bandRows.length);
+}
+
+// Our TX slot is deaf, so a cycle we transmit in has no decodes; show the TX
+// message there instead.
+function appendBandTx(ts: number, af: number, message: string): void {
+  pushBandSeparator(Math.floor(ts / 15) * 15, true);
+  bandRows.push({ kind: "tx" });
+  decodeList.addItem(`{cyan-fg}» TX ${String(af).padStart(5)}  ${message}{/cyan-fg}`);
+  decodeList.scrollTo(bandRows.length);
 }
 
 // --- cycle clock ----------------------------------------------------------
@@ -461,9 +561,9 @@ function callCq(): void {
   if (!ensureAutomationIdentity()) {
     return;
   }
-  const qso = automation.createCq(myCall, myGrid, currentSlot, "top");
+  automation.createCq(myCall, myGrid, currentSlot, "top");
   appendLog("[qso] calling CQ");
-  selectQso(qso.id);
+  renderQsoList();
   scheduleAutomation();
 }
 
@@ -472,11 +572,12 @@ function replyToSelectedDecode(): void {
     return;
   }
   const index = (decodeList as unknown as { selected: number }).selected;
-  const record = decodes[index];
-  if (!record) {
-    appendLog("no decode selected");
+  const row = bandRows[index];
+  if (!row || row.kind !== "decode") {
+    appendLog("select a decoded CQ row first");
     return;
   }
+  const record = row.decode;
   const parsed = parseFt8Message(record.message);
   if (!parsed || parsed.type !== "cq") {
     appendLog("selected decode is not a CQ");
@@ -534,32 +635,54 @@ function formatQsoRow(qso: QsoRecord, priority: number): string {
   const who = qso.theirCall ?? "CQ";
   const attempts = qso.attempts[qso.step] ?? 0;
   const preview = messageForQso(qso) ?? "-";
+  const lastRx = qso.rxMessages[qso.rxMessages.length - 1]?.message ?? "-";
   const note = qso.note ? ` (${qso.note})` : "";
-  const base = `${priority} ${qso.status} ${who} step=${qso.step} att=${attempts} slot=${qso.nextSlot} ${preview}${note}`;
+  const base = `${priority} ${qso.status} ${who} ${qso.step} att=${attempts} tx>${preview} rx>${lastRx}${note}`;
   switch (qso.status) {
     case "timed_out":
       return `{red-fg}${base}{/red-fg}`;
     case "paused":
     case "stopped":
       return `{yellow-fg}${base}{/yellow-fg}`;
-    case "complete":
-      return `{green-fg}${base}{/green-fg}`;
     default:
       return base;
   }
 }
 
+function formatCompletedRow(qso: QsoRecord): string {
+  const grid = qso.theirGrid ? ` ${qso.theirGrid}` : "";
+  const reports = `${qso.sentReport ?? "?"}/${qso.receivedReport ?? "?"}`;
+  return `{green-fg}✓ ${qso.theirCall ?? "?"}${grid} ${reports}{/green-fg}`;
+}
+
+function renderCqIndicator(): void {
+  cqIndicator.setContent(
+    automation.isCallingCq()
+      ? "{green-bg}{black-fg} ● CALLING CQ {/black-fg}{/green-bg}"
+      : "{grey-fg}○ CQ idle — press Call CQ to start{/grey-fg}"
+  );
+}
+
+// Active QSOs exclude the hidden CQ row (shown via the indicator) and completed
+// QSOs (shown in their own list). renderedActive maps list rows to records.
+let renderedActive: QsoRecord[] = [];
+
 function renderQsoList(): void {
-  const rows = automation.qsos.map((qso, index) => formatQsoRow(qso, index + 1));
-  qsoList.setItems(rows);
+  renderCqIndicator();
+
+  renderedActive = automation.qsos.filter((qso) => qso.kind !== "calling-cq" && qso.status !== "complete");
+  qsoList.setItems(renderedActive.map((qso, index) => formatQsoRow(qso, index + 1)));
   if (selectedQsoId) {
-    const index = automation.qsos.findIndex((qso) => qso.id === selectedQsoId);
+    const index = renderedActive.findIndex((qso) => qso.id === selectedQsoId);
     if (index >= 0) {
       qsoList.select(index);
     } else {
       selectedQsoId = null;
     }
   }
+
+  completedList.setItems(automation.qsos.filter((qso) => qso.status === "complete").map(formatCompletedRow));
+
   screen.render();
 }
 
@@ -617,6 +740,41 @@ function updateAfWarning(): void {
   afWarning.setContent(
     match ? `{yellow-fg}occupied +/-50Hz: ${match.decode.af} ${match.decode.message}{/yellow-fg}` : ""
   );
+}
+
+// The slot we transmit in: the active CQ row's slot, else the manual slot.
+function currentTxSlot(): TxSlot {
+  const cq = automation.qsos.find((qso) => qso.kind === "calling-cq" && qso.status === "active");
+  return cq ? cq.nextSlot : currentSlot;
+}
+
+// AFs decoded in the most recent RX period of the given parity ("the last set
+// of decodes" for that slot). Empty until a period of that parity is heard.
+function latestSlotAfs(parity: TxSlot): number[] {
+  let latestStart = -1;
+  for (const decode of decodes) {
+    if (slotFromTimestamp(decode.ts) !== parity) {
+      continue;
+    }
+    const start = Math.floor(decode.ts / 15) * 15;
+    if (start > latestStart) {
+      latestStart = start;
+    }
+  }
+  if (latestStart < 0) {
+    return [];
+  }
+  return decodes.filter((decode) => Math.floor(decode.ts / 15) * 15 === latestStart).map((decode) => decode.af);
+}
+
+function renderOccupancyPlots(): void {
+  const afValue = Number(afInput.getValue());
+  const mark = Number.isInteger(afValue) ? afValue : undefined;
+  const txSlot = currentTxSlot();
+  const even = renderOccupancyBar(latestSlotAfs("even"), SURVEY_LO_HZ, SURVEY_HI_HZ, PLOT_WIDTH, mark);
+  const odd = renderOccupancyBar(latestSlotAfs("odd"), SURVEY_LO_HZ, SURVEY_HI_HZ, PLOT_WIDTH, mark);
+  evenPlot.setContent(`${txSlot === "even" ? "{bold}E*{/bold}" : "E "}|${even}|`);
+  oddPlot.setContent(`${txSlot === "odd" ? "{bold}O*{/bold}" : "O "}|${odd}|`);
 }
 
 // --- scheduler ------------------------------------------------------------
@@ -734,22 +892,19 @@ function startSurvey(): void {
 function finishSurvey(): void {
   surveyTimer = null;
   const slot = surveySlot;
-  const startSec = surveyStartSec;
   surveyActive = false;
   surveySlot = null;
 
   if (slot) {
-    const nowSec = Math.floor(Date.now() / 1000);
-    const occupied = decodes
-      .filter((decode) => decode.ts >= startSec && decode.ts <= nowSec && slotFromTimestamp(decode.ts) === slot)
-      .map((decode) => decode.af);
+    // The held cycle refreshed this slot's plot; auto-pick the widest clear gap.
+    const occupied = latestSlotAfs(slot);
     const suggestion = suggestClearAf(occupied, SURVEY_LO_HZ, SURVEY_HI_HZ);
-    const bar = renderOccupancyBar(occupied, SURVEY_LO_HZ, SURVEY_HI_HZ, 24, suggestion);
-    appendLog(`[survey] ${slot} ${SURVEY_LO_HZ}|${bar}|${SURVEY_HI_HZ}  clear@${suggestion}Hz (${occupied.length} sigs)`);
     afInput.setValue(String(suggestion));
+    appendLog(`[survey] ${slot} slot updated, clear@${suggestion}Hz (${occupied.length} sigs)`);
   }
 
   updateSurveyButton();
+  renderOccupancyPlots();
   renderStatusBar();
   scheduleAutomation();
 }
@@ -780,80 +935,143 @@ function updateSurveyButton(): void {
   screen.render();
 }
 
-// --- daemon command parsing (mirrors ui/cli.ts) ---------------------------
+// --- command dialogs ------------------------------------------------------
 
-function runCommand(line: string): void {
-  const [cmd, ...rest] = line.split(/\s+/);
+let dialogOpen = false;
 
-  switch (cmd) {
-    case "claim":
-      send({ type: "claim_control", ...(token ? { token } : {}) });
-      break;
-    case "release":
-      send({ type: "release_control" });
-      break;
-    case "devices":
-      send({ type: "list_audio_devices" });
-      break;
-    case "config":
-      send({ type: "get_config" });
-      break;
-    case "status":
-      send({ type: "get_status" });
-      break;
-    case "stop":
-      send({ type: "stop_session" });
-      break;
-    case "save": {
-      const [deviceId, callsign, grid, catMode, catPort] = rest;
-      if (!deviceId || !callsign || !grid || !catMode) {
-        appendLog("usage: save <deviceId> <call> <grid> <catMode:rigctld|dummy> [port=4532]");
-        break;
+// Modal form: a labelled textbox per field plus OK/Cancel. Pre-filled values
+// are shown so the operator can accept or edit them.
+function openDialog(
+  title: string,
+  fields: Array<{ name: string; label: string; value: string }>,
+  onSubmit: (values: Record<string, string>) => void
+): void {
+  if (dialogOpen) {
+    return;
+  }
+  dialogOpen = true;
+
+  const dialog = blessed.box({
+    parent: screen,
+    top: "center",
+    left: "center",
+    width: 56,
+    height: fields.length * 3 + 6,
+    border: { type: "line" },
+    label: ` ${title} `,
+    tags: true,
+    style: { border: { fg: "cyan" } }
+  });
+
+  const inputs = fields.map((field, index) => {
+    blessed.text({ parent: dialog, top: index * 3, left: 2, content: `${field.label}:` });
+    return blessed.textbox({
+      parent: dialog,
+      top: index * 3 + 1,
+      left: 2,
+      width: "92%",
+      height: 1,
+      inputOnFocus: true,
+      mouse: true,
+      keys: true,
+      style: { bg: "black", focus: { bg: "blue" } },
+      value: field.value
+    });
+  });
+
+  const onEsc = (): void => close();
+  function close(): void {
+    screen.unkey("escape", onEsc);
+    dialog.destroy();
+    dialogOpen = false;
+    decodeList.focus();
+    screen.render();
+  }
+  function submit(): void {
+    const values: Record<string, string> = {};
+    fields.forEach((field, index) => {
+      values[field.name] = inputs[index]!.getValue().trim();
+    });
+    close();
+    onSubmit(values);
+  }
+
+  const ok = blessed.button({
+    parent: dialog,
+    bottom: 1,
+    left: 2,
+    width: 10,
+    height: 1,
+    content: "[ OK ]",
+    mouse: true,
+    align: "center",
+    style: { fg: "black", bg: "green", focus: { bg: "blue" } }
+  });
+  const cancel = blessed.button({
+    parent: dialog,
+    bottom: 1,
+    left: 14,
+    width: 12,
+    height: 1,
+    content: "[Cancel]",
+    mouse: true,
+    align: "center",
+    style: { fg: "black", bg: "red", focus: { bg: "blue" } }
+  });
+  ok.on("press", submit);
+  cancel.on("press", close);
+  ok.key(["enter", "space"], submit);
+  cancel.key(["enter", "space"], close);
+
+  // Enter advances to the next field; from the last field it moves to OK.
+  inputs.forEach((input, index) => {
+    input.on("submit", () => {
+      (inputs[index + 1] ?? ok).focus();
+      screen.render();
+    });
+  });
+
+  screen.key("escape", onEsc);
+  (inputs[0] ?? ok).focus();
+  screen.render();
+}
+
+function openSaveDialog(): void {
+  openDialog(
+    "save config",
+    [
+      { name: "deviceId", label: "device id", value: lastDeviceId != null ? String(lastDeviceId) : "" },
+      { name: "callsign", label: "callsign", value: myCall },
+      { name: "grid", label: "grid", value: myGrid },
+      { name: "catMode", label: "cat mode (rigctld|dummy)", value: "rigctld" },
+      { name: "catPort", label: "cat port", value: "4532" }
+    ],
+    (values) => {
+      const deviceId = Number(values.deviceId);
+      if (!Number.isInteger(deviceId) || !values.callsign || !values.grid || !values.catMode) {
+        appendLog("save: device id, callsign, grid, and cat mode are required");
+        return;
       }
       send({
         type: "save_config",
         session: {
           mode: "FT8",
-          device: { id: Number(deviceId) },
-          callsign,
-          grid,
-          cat: { mode: catMode, port: catPort ? Number(catPort) : 4532 }
+          device: { id: deviceId },
+          callsign: values.callsign,
+          grid: values.grid,
+          cat: { mode: values.catMode, port: values.catPort ? Number(values.catPort) : 4532 }
         }
       });
-      break;
+      appendLog(`[save] device=${deviceId} ${values.callsign} ${values.grid} ${values.catMode}`);
     }
-    case "start": {
-      if (rest.length === 0) {
-        send({ type: "start_session" });
-        break;
-      }
-      const [deviceId, callsign, grid, catMode, catPort] = rest;
-      if (!deviceId || !callsign || !grid || !catMode) {
-        appendLog("usage: start [deviceId] [call] [grid] [catMode:rigctld|dummy] [port=4532]");
-        break;
-      }
-      send({
-        type: "start_session",
-        session: {
-          mode: "FT8",
-          device: { id: Number(deviceId) },
-          callsign,
-          grid,
-          cat: { mode: catMode, port: catPort ? Number(catPort) : 4532 }
-        }
-      });
-      break;
-    }
-    default:
-      appendLog(`unknown command '${cmd}'`);
-  }
+  );
 }
 
 // --- websocket event handling ---------------------------------------------
 
 ws.on("open", () => {
   appendLog(`connected to ${url}`);
-  cmdInput.focus();
+  decodeList.focus();
   screen.render();
 });
 
@@ -883,6 +1101,10 @@ function handleMessage(msg: Record<string, unknown>): void {
       if (typeof session.grid === "string") {
         myGrid = session.grid;
       }
+      const device = session.device as { id?: number } | null;
+      if (device && typeof device.id === "number") {
+        lastDeviceId = device.id;
+      }
       statusBase =
         `{bold}active{/bold}=${session.active} device=${(session.device as { id?: number } | null)?.id ?? "-"} ` +
         `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
@@ -900,14 +1122,12 @@ function handleMessage(msg: Record<string, unknown>): void {
         message: msg.message as string
       };
       decodes.push(record);
-      const time = new Date(record.ts * 1000).toISOString().slice(11, 19);
-      const line = `${time} ${String(record.snr).padStart(4)} ${String(record.af).padStart(5)}  ${record.message}`;
-      decodeList.addItem(mentionsMyCall(record.message) ? `{black-fg}{yellow-bg}${line}{/yellow-bg}{/black-fg}` : line);
-      decodeList.scrollTo(decodes.length);
+      appendBandDecode(record);
       screen.render();
 
-      // Occupied-frequency info depends on all decodes, so refresh it every time.
+      // Occupied-frequency info and the per-slot plots depend on decodes.
       updateAfWarning();
+      renderOccupancyPlots();
 
       // Only touch the scheduler when a decode actually advances a QSO. An
       // unrelated decode must not re-arm (or re-fire) the active transmission,
@@ -923,6 +1143,7 @@ function handleMessage(msg: Record<string, unknown>): void {
     }
     case "tx": {
       appendLog(`[tx] af=${msg.af} ${msg.message}`);
+      appendBandTx(msg.ts as number, msg.af as number, msg.message as string);
       if (manualOverridePending) {
         manualOverridePending = false;
         pendingAutomationTx = null;
@@ -972,5 +1193,10 @@ function handleMessage(msg: Record<string, unknown>): void {
   }
 }
 
-setInterval(renderStatusBar, 500);
+setInterval(() => {
+  renderOccupancyPlots();
+  renderStatusBar();
+}, 500);
+renderOccupancyPlots();
+renderQsoList();
 screen.render();
