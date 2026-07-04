@@ -161,6 +161,30 @@ export class QsoAutomation {
     return qso;
   }
 
+  // Create a standard QSO targeting a callsign (from the target box), starting
+  // at the call-grid step. theirGrid/nextSlot are best-effort from any recent
+  // decode of that station.
+  createReplyToCall(
+    theirCall: string,
+    myCall: string,
+    myGrid: string,
+    nextSlot: TxSlot,
+    theirGrid: string | null = null,
+    position: "top" | "bottom" = "top"
+  ): QsoRecord {
+    const qso = this.makeQso({
+      kind: "standard",
+      myCall,
+      myGrid,
+      theirCall,
+      theirGrid,
+      step: "call-grid",
+      nextSlot
+    });
+    this.insertQso(qso, position);
+    return qso;
+  }
+
   handleDecode(decode: DecodeRecord, myCall: string, myGrid: string): QsoAutomationEvent[] {
     const parsed = parseFt8Message(decode.message);
     if (!parsed || parsed.type !== "directed") {

@@ -136,6 +136,19 @@ describe("QsoAutomation sequencing", () => {
     expect(automation.isCallingCq()).toBe(false);
   });
 
+  it("creates a QSO from a target callsign at the call-grid step", () => {
+    const automation = new QsoAutomation(fixedNow);
+    const qso = automation.createReplyToCall("W1AW", "N1MPM", "FN33", "odd", "FN31");
+    expect(qso.theirCall).toBe("W1AW");
+    expect(qso.theirGrid).toBe("FN31");
+    expect(qso.step).toBe("call-grid");
+    expect(automation.nextTransmission(1000)?.intent).toEqual({
+      af: 1000,
+      slot: "odd",
+      message: "W1AW N1MPM FN33"
+    });
+  });
+
   it("re-engaging CQ replaces the previous CQ row", () => {
     const automation = new QsoAutomation(fixedNow);
     automation.createCq("N1MPM", "FN33", "even");

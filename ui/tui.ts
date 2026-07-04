@@ -4,6 +4,7 @@ import { appendQsoLog } from "./qso-log.js";
 import {
   findOccupiedAf,
   messageForQso,
+  oppositeSlot,
   parseFt8Message,
   QsoAutomation,
   renderOccupancyBar,
@@ -89,11 +90,13 @@ const statusBar = blessed.box({
   content: "connecting..."
 });
 
+// Explicit height (not a bottom anchor) so blessed's list scroll math works;
+// "48%-3" makes it end exactly at the QSO panel's top (row 3 + height = 48%).
 const decodeList = blessed.list({
   top: 3,
   left: 0,
   width: "55%",
-  height: "45%",
+  height: "48%-3",
   border: { type: "line" },
   label: " band activity (click a row to draft a reply) ",
   mouse: true,
@@ -107,7 +110,7 @@ const decodeList = blessed.list({
   }
 });
 
-// The QSO panel holds a CQ indicator, the active QSO list, and a completed list.
+// The QSO panel holds a CQ indicator (top line) and the active QSO list.
 const qsoArea = blessed.box({ top: "48%", left: 0, width: "55%", height: "25%" });
 
 const cqIndicator = blessed.box({
@@ -126,7 +129,7 @@ const qsoList = blessed.list({
   top: 1,
   left: 0,
   width: "100%",
-  height: "48%",
+  bottom: 0,
   border: { type: "line" },
   label: " active qsos (r=reply c=cq u/d=reorder) ",
   mouse: true,
@@ -138,14 +141,15 @@ const qsoList = blessed.list({
   style: { selected: { bg: "blue", fg: "black" } }
 });
 
-const completedList = blessed.list({
-  parent: qsoArea,
-  top: "50%",
+// Completed QSOs: bottom-left, under Active QSOs. Explicit height ("27%-3" ends
+// at 100%-3, above the command bar) keeps list scrolling working.
+const completedPanel = blessed.list({
+  top: "73%",
   left: 0,
-  width: "100%",
-  height: "48%",
+  width: "55%",
+  height: "27%-3",
   border: { type: "line" },
-  label: " completed ",
+  label: " completed qsos ",
   mouse: true,
   keys: true,
   vi: true,
@@ -229,8 +233,15 @@ slotButton.on("press", () => {
   screen.render();
 });
 
-const messageLabel = blessed.text({ parent: composePanel, top: 10, left: 1, content: "message:" });
-const messageInput = blessed.textbox({
+// No manual message composition: a target callsign drives Reply QSO. Fill it by
+// double-clicking a decode (uses that message's sender) or by typing.
+const targetLabel = blessed.text({
+  parent: composePanel,
+  top: 10,
+  left: 1,
+  content: "target callsign (dbl-click a decode):"
+});
+const targetInput = blessed.textbox({
   parent: composePanel,
   top: 11,
   left: 1,
@@ -241,85 +252,16 @@ const messageInput = blessed.textbox({
   mouse: true
 });
 
-const macroBar = blessed.box({ parent: composePanel, top: 14, left: 1, width: "90%", height: 3 });
-const cqButton = blessed.button({
-  parent: macroBar,
-  top: 0,
-  left: 0,
-  width: "50%-1",
-  height: 3,
-  border: { type: "line" },
-  mouse: true,
-  align: "center",
-  content: "draft CQ"
-});
-cqButton.on("press", () => {
-  messageInput.setValue(`CQ ${myCall || "MYCALL"} ${myGrid || "GRID"}`);
-  screen.render();
-});
-
-const rr73Button = blessed.button({
-  parent: macroBar,
-  top: 0,
-  left: "50%",
-  width: "50%-1",
-  height: 3,
-  border: { type: "line" },
-  mouse: true,
-  align: "center",
-  content: "draft RR73"
-});
-rr73Button.on("press", () => {
-  const current = messageInput.getValue().trim();
-  const target = current.split(/\s+/)[0];
-  if (target) {
-    messageInput.setValue(`${target} ${myCall || "MYCALL"} RR73`);
-    screen.render();
-  }
-});
-
-const sendButton = blessed.button({
-  parent: composePanel,
-  top: 17,
-  left: 1,
-  width: "44%",
-  height: 3,
-  border: { type: "line" },
-  mouse: true,
-  align: "center",
-  content: "TRANSMIT",
-  style: { fg: "black", bg: "green" }
-});
-sendButton.on("press", () => {
-  const af = Number(afInput.getValue());
-  const message = messageInput.getValue().trim();
-  if (!Number.isInteger(af) || af < 200 || af > 3000) {
-    appendLog("invalid AF, must be an integer 200-3000");
-    return;
-  }
-  if (!message) {
-    appendLog("message is empty");
-    return;
-  }
-  // Manual transmit is a one-shot override: pause automation until the next
-  // matching daemon tx event (or until the pending state clears).
-  cancelSurvey("manual transmit");
-  manualOverridePending = true;
-  pendingAutomationTx = null;
-  clearAutomationTimer();
-  send({ type: "transmit", af, slot: currentSlot, message });
-});
-
 const cancelButton = blessed.button({
   parent: composePanel,
-  top: 17,
-  left: "48%",
-  width: "44%",
+  top: 14,
+  left: 1,
+  width: "91%",
   height: 3,
   border: { type: "line" },
   mouse: true,
   align: "center",
-  content: "CANCEL TX",
+  content: "CANCEL TX (pause automation)",
   style: { fg: "black", bg: "red" }
 });
 cancelButton.on("press", () => {
@@ -334,7 +276,7 @@ cancelButton.on("press", () => {
 
 // --- qso automation controls ---------------------------------------------
 
-blessed.text({ parent: composePanel, top: 20, left: 1, content: "-- qso automation --" });
+blessed.text({ parent: composePanel, top: 18, left: 1, content: "-- qso automation --" });
 
 function opButton(top: number, left: string | number, content: string, handler: () => void): void {
   const button = blessed.button({
@@ -346,22 +288,22 @@ function opButton(top: number, left: string | number, content: string, handler: 
     mouse: true,
     align: "center",
     content,
-    style: { fg: "white", focus: { bg: "blue" }, hover: { bg: "blue" } }
+    style: { fg: "white", focus: { bg: "blue", fg: "black" }, hover: { bg: "blue", fg: "black" } }
   });
   button.on("press", handler);
 }
 
-opButton(21, 1, "Call CQ", callCq);
-opButton(21, "48%", "Reply QSO", replyToSelectedDecode);
-opButton(22, 1, "Resume", () => actOnSelected((qso) => automation.resume(qso.id)));
-opButton(22, "48%", "Complete", () => {
+opButton(19, 1, "Call CQ", callCq);
+opButton(19, "48%", "Reply QSO", replyToTarget);
+opButton(20, 1, "Resume", () => actOnSelected((qso) => automation.resume(qso.id)));
+opButton(20, "48%", "Complete", () => {
   const qso = selectedQso();
   if (qso) {
     handleQsoEvents(automation.complete(qso.id));
     scheduleAutomation();
   }
 });
-opButton(23, 1, "Abandon", () => {
+opButton(21, 1, "Abandon", () => {
   const qso = selectedQso();
   if (qso) {
     automation.abandon(qso.id);
@@ -369,17 +311,17 @@ opButton(23, 1, "Abandon", () => {
     scheduleAutomation();
   }
 });
-opButton(23, "48%", "Retry", () => actOnSelected((qso) => automation.resetAttempts(qso.id)));
-opButton(24, 1, "Prev step", () => actOnSelected((qso) => automation.previousStep(qso.id)));
-opButton(24, "48%", "Next step", () => actOnSelected((qso) => automation.nextStep(qso.id)));
-opButton(25, 1, "Up", () => moveSelected(-1));
-opButton(25, "48%", "Down", () => moveSelected(1));
+opButton(21, "48%", "Retry", () => actOnSelected((qso) => automation.resetAttempts(qso.id)));
+opButton(22, 1, "Prev step", () => actOnSelected((qso) => automation.previousStep(qso.id)));
+opButton(22, "48%", "Next step", () => actOnSelected((qso) => automation.nextStep(qso.id)));
+opButton(23, 1, "Up", () => moveSelected(-1));
+opButton(23, "48%", "Down", () => moveSelected(1));
 
 const logBox = blessed.log({
   top: "73%",
-  left: 0,
-  width: "100%",
-  bottom: 3,
+  left: "55%",
+  width: "45%",
+  height: "27%-3",
   border: { type: "line" },
   label: " log ",
   scrollable: true,
@@ -417,13 +359,14 @@ commandButtons.forEach((command, index) => {
     mouse: true,
     align: "center",
     content: command.label,
-    style: { fg: "white", focus: { bg: "blue" }, hover: { bg: "blue" } }
+    style: { fg: "white", focus: { bg: "blue", fg: "black" }, hover: { bg: "blue", fg: "black" } }
   });
   button.on("press", command.run);
 });
 
 screen.append(statusBar);
 screen.append(decodeList);
+screen.append(completedPanel);
 screen.append(qsoArea);
 screen.append(composePanel);
 screen.append(logBox);
@@ -433,23 +376,65 @@ screen.key(["C-c"], () => process.exit(0));
 screen.key(["tab"], () => screen.focusNext());
 screen.key(["S-tab"], () => screen.focusPrevious());
 
+let lastBandClickIndex = -1;
+let lastBandClickTime = 0;
 decodeList.on("select", (_item, index) => {
   const row = bandRows[index];
   if (!row || row.kind !== "decode") {
     return;
   }
   const record = row.decode;
+  const now = Date.now();
+  const doubleClick = index === lastBandClickIndex && now - lastBandClickTime < 500;
+  lastBandClickIndex = index;
+  lastBandClickTime = now;
+
+  // Single click: copy AF and the reply slot as a tuning aid.
   afInput.setValue(String(record.af));
-  const decodeSlot = record.ts % 30 === 0 ? "even" : "odd";
-  currentSlot = decodeSlot === "even" ? "odd" : "even";
+  currentSlot = oppositeSlot(slotFromTimestamp(record.ts));
   slotButton.setContent(`slot: ${currentSlot} (click to toggle)`);
-  messageInput.setValue(draftReply(record.message));
   updateAfWarning();
+  renderOccupancyPlots();
+
+  // Double click: set the target callsign to this message's sender.
+  if (doubleClick) {
+    const sender = senderOf(record.message);
+    if (sender) {
+      targetInput.setValue(sender);
+      appendLog(`target set to ${sender}`);
+    }
+  }
   screen.render();
 });
 
-decodeList.key(["r"], replyToSelectedDecode);
+// 'r' fills the target from the selected decode's sender, then replies.
+decodeList.key(["r"], () => {
+  const index = (decodeList as unknown as { selected: number }).selected;
+  const row = bandRows[index];
+  if (row && row.kind === "decode") {
+    const sender = senderOf(row.decode.message);
+    if (sender) {
+      targetInput.setValue(sender);
+    }
+  }
+  replyToTarget();
+});
 decodeList.key(["c"], callCq);
+
+// Replace blessed's default list wheel (which moves the selection and snaps the
+// view back to it) with a plain viewport scroll, so wheeling starts from where
+// you are looking — the bottom — rather than the stale selection.
+const bandScroll = decodeList as unknown as { scroll(offset: number): void };
+decodeList.removeAllListeners("element wheeldown");
+decodeList.removeAllListeners("element wheelup");
+decodeList.on("element wheeldown", () => {
+  bandScroll.scroll(3);
+  screen.render();
+});
+decodeList.on("element wheelup", () => {
+  bandScroll.scroll(-3);
+  screen.render();
+});
 
 function trackQsoSelection(): void {
   const index = (qsoList as unknown as { selected: number }).selected;
@@ -464,16 +449,47 @@ qsoList.key(["c"], callCq);
 qsoList.key(["u", "S-up"], () => moveSelected(-1));
 qsoList.key(["d", "S-down"], () => moveSelected(1));
 
-function draftReply(message: string): string {
-  const tokens = message.split(/\s+/);
-  const call = myCall || "MYCALL";
-  const grid = myGrid || "GRID";
-  if (tokens[0] === "CQ") {
-    const target = tokens[tokens.length - 2] ?? tokens[1];
-    return `${target} ${call} ${grid}`;
+function senderOf(message: string): string | null {
+  const parsed = parseFt8Message(message);
+  if (!parsed) {
+    return null;
   }
-  const target = tokens[1] ?? tokens[0];
-  return `${target} ${call} ${grid}`;
+  return parsed.type === "cq" ? parsed.call : parsed.from;
+}
+
+function gridFrom(message: string): string | null {
+  const parsed = parseFt8Message(message);
+  if (!parsed) {
+    return null;
+  }
+  if (parsed.type === "cq") {
+    return parsed.grid;
+  }
+  return parsed.payload.type === "grid" ? parsed.payload.grid : null;
+}
+
+function findLastDecodeFrom(call: string): DecodeRecord | null {
+  for (let index = decodes.length - 1; index >= 0; index--) {
+    if (senderOf(decodes[index]!.message) === call) {
+      return decodes[index]!;
+    }
+  }
+  return null;
+}
+
+// Each active QSO gets a stable colour, used to tint its decodes in Band
+// Activity and mark its row. Yellow is reserved for "replying to me".
+const QSO_PALETTE = ["cyan", "magenta", "green", "blue", "red", "white"];
+const qsoColors = new Map<string, string>();
+let nextQsoColor = 0;
+function colorForQso(qso: QsoRecord): string {
+  let color = qsoColors.get(qso.id);
+  if (!color) {
+    color = QSO_PALETTE[nextQsoColor % QSO_PALETTE.length]!;
+    nextQsoColor++;
+    qsoColors.set(qso.id, color);
+  }
+  return color;
 }
 
 function mentionsMyCall(message: string): boolean {
@@ -501,12 +517,30 @@ function pushBandSeparator(periodStart: number, youTx: boolean): void {
   lastBandPeriod = periodStart;
 }
 
+function decodeMarkup(message: string, line: string): string {
+  // Someone replying to me stays yellow, regardless of any QSO colour.
+  if (mentionsMyCall(message)) {
+    return `{black-fg}{yellow-bg}${line}{/yellow-bg}{/black-fg}`;
+  }
+  const sender = senderOf(message);
+  if (sender) {
+    const qso = automation.qsos.find(
+      (candidate) => candidate.kind === "standard" && candidate.theirCall === sender && candidate.status !== "complete"
+    );
+    if (qso) {
+      const color = colorForQso(qso);
+      return `{black-fg}{${color}-bg}${line}{/${color}-bg}{/black-fg}`;
+    }
+  }
+  return line;
+}
+
 function appendBandDecode(record: DecodeRecord): void {
   pushBandSeparator(Math.floor(record.ts / 15) * 15, false);
   bandRows.push({ kind: "decode", decode: record });
   const time = new Date(record.ts * 1000).toISOString().slice(11, 19);
   const line = `${time} ${String(record.snr).padStart(4)} ${String(record.af).padStart(5)}  ${record.message}`;
-  decodeList.addItem(mentionsMyCall(record.message) ? `{black-fg}{yellow-bg}${line}{/yellow-bg}{/black-fg}` : line);
+  decodeList.addItem(decodeMarkup(record.message, line));
   decodeList.scrollTo(bandRows.length);
 }
 
@@ -567,36 +601,35 @@ function callCq(): void {
   scheduleAutomation();
 }
 
-function replyToSelectedDecode(): void {
+function replyToTarget(): void {
   if (!ensureAutomationIdentity()) {
     return;
   }
-  const index = (decodeList as unknown as { selected: number }).selected;
-  const row = bandRows[index];
-  if (!row || row.kind !== "decode") {
-    appendLog("select a decoded CQ row first");
+  const call = targetInput.getValue().trim().toUpperCase();
+  if (!call) {
+    appendLog("enter a target callsign (or double-click a decode)");
     return;
   }
-  const record = row.decode;
-  const parsed = parseFt8Message(record.message);
-  if (!parsed || parsed.type !== "cq") {
-    appendLog("selected decode is not a CQ");
+  if (!/^[A-Z0-9/]{2,}$/.test(call)) {
+    appendLog(`'${call}' is not a valid callsign`);
     return;
   }
   const existing = automation.qsos.find(
-    (qso) => qso.kind === "standard" && qso.theirCall === parsed.call && qso.status !== "complete"
+    (qso) => qso.kind === "standard" && qso.theirCall === call && qso.status !== "complete"
   );
   if (existing) {
-    appendLog(`QSO already exists for ${parsed.call}`);
+    appendLog(`QSO already exists for ${call}`);
     selectQso(existing.id);
     return;
   }
-  const qso = automation.createReplyToCq(record, myCall, myGrid, "top");
-  if (!qso) {
-    appendLog("could not create reply QSO");
-    return;
-  }
+  // Best-guess reply slot and their grid from the most recent decode of them.
+  const last = findLastDecodeFrom(call);
+  const nextSlot = last ? oppositeSlot(slotFromTimestamp(last.ts)) : currentSlot;
+  const theirGrid = last ? gridFrom(last.message) : null;
+  const qso = automation.createReplyToCall(call, myCall, myGrid, nextSlot, theirGrid, "top");
+  colorForQso(qso);
   appendLog(`[qso] reply to ${qso.theirCall}`);
+  targetInput.clearValue();
   selectQso(qso.id);
   scheduleAutomation();
 }
@@ -637,15 +670,17 @@ function formatQsoRow(qso: QsoRecord, priority: number): string {
   const preview = messageForQso(qso) ?? "-";
   const lastRx = qso.rxMessages[qso.rxMessages.length - 1]?.message ?? "-";
   const note = qso.note ? ` (${qso.note})` : "";
-  const base = `${priority} ${qso.status} ${who} ${qso.step} att=${attempts} tx>${preview} rx>${lastRx}${note}`;
+  const color = colorForQso(qso);
+  const dot = `{${color}-fg}●{/${color}-fg}`;
+  const base = `${priority} ${qso.status} ${who} ${qso.step} att=${attempts} rx>${lastRx} tx>${preview}${note}`;
   switch (qso.status) {
     case "timed_out":
-      return `{red-fg}${base}{/red-fg}`;
+      return `${dot} {red-fg}${base}{/red-fg}`;
     case "paused":
     case "stopped":
-      return `{yellow-fg}${base}{/yellow-fg}`;
+      return `${dot} {yellow-fg}${base}{/yellow-fg}`;
     default:
-      return base;
+      return `${dot} ${base}`;
   }
 }
 
@@ -681,15 +716,20 @@ function renderQsoList(): void {
     }
   }
 
-  completedList.setItems(automation.qsos.filter((qso) => qso.status === "complete").map(formatCompletedRow));
+  renderCompleted();
 
   screen.render();
+}
+
+function renderCompleted(): void {
+  completedPanel.setItems(automation.qsos.filter((qso) => qso.status === "complete").map(formatCompletedRow));
 }
 
 function handleQsoEvents(events: QsoAutomationEvent[]): void {
   for (const event of events) {
     switch (event.type) {
       case "qso_created":
+        colorForQso(event.qso);
         appendLog(`[qso] created ${event.qso.theirCall ?? "CQ"}`);
         break;
       case "qso_updated":
