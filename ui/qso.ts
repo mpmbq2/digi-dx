@@ -95,6 +95,9 @@ export interface QsoLogEntry {
   receivedReport: string | null;
   txMessages: QsoMessageRecord[];
   rxMessages: QsoMessageRecord[];
+  // Operator-entered dial frequency in Hz at QSO time. Null when unset (e.g.
+  // CAT control is unavailable and no manual frequency was provided).
+  dialFreqHz?: number | null;
   reason: string;
 }
 
@@ -386,7 +389,7 @@ export class QsoAutomation {
     return qso;
   }
 
-  toLogEntry(qso: QsoRecord, reason: string): QsoLogEntry | null {
+  toLogEntry(qso: QsoRecord, reason: string, dialFreqHz: number | null = null): QsoLogEntry | null {
     if (!qso.theirCall) {
       return null;
     }
@@ -402,6 +405,7 @@ export class QsoAutomation {
       receivedReport: qso.receivedReport,
       txMessages: qso.txMessages,
       rxMessages: qso.rxMessages,
+      dialFreqHz,
       reason
     };
   }

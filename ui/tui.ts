@@ -1,6 +1,9 @@
 import blessed from "blessed";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { WebSocket } from "ws";
-import { appendQsoLog } from "./qso-log.js";
+import { appendQsoLog, readQsoLog } from "./qso-log.js";
+import { bandForMHz, buildAdif } from "./adif.js";
 import {
   findOccupiedAf,
   messageForQso,
@@ -44,6 +47,22 @@ let manualOverridePending = false;
 let latestTxState: "idle" | "pending" | "active" = "idle";
 let statusBase = "connecting...";
 const loggedQsoIds = new Set<string>();
+
+// Control/session state, tracked structurally from status updates so the
+// Start/Stop toggle and the auto-claim logic run off real state, not strings.
+let controlHeld = false;
+let controlMine = false;
+let sessionActive = false;
+
+// Operator-entered dial frequency (Hz). CAT control reports the wrong band on
+// this setup, so this manual value is what gets logged and exported. Null until
+// the operator sets it via the "freq…" command.
+let dialFreqHz: number | null = null;
+
+// Callsigns already in the QSO log — their decodes are greyed in Band Activity
+// so we don't call a station we have already worked. Seeded from the log file
+// at startup and extended as QSOs complete this session.
+const workedCalls = new Set<string>();
 
 // Slot survey: hold TX for one full receive cycle of our TX parity so the
 // (otherwise deaf) TX slot can be observed, then suggest a clear frequency.
@@ -337,18 +356,20 @@ const commandBar = blessed.box({
   label: " commands "
 });
 
-// One button per daemon command. Commands that need arguments (save) open a
-// dialog pre-filled from current status; the rest send immediately.
-const commandButtons: Array<{ label: string; run: () => void }> = [
-  { label: "claim", run: () => send({ type: "claim_control", ...(token ? { token } : {}) }) },
-  { label: "release", run: () => send({ type: "release_control" }) },
-  { label: "start", run: () => send({ type: "start_session" }) },
-  { label: "stop", run: () => send({ type: "stop_session" }) },
+// One button per daemon command. The Session button toggles start/stop and
+// auto-claims control; Release hands control back. Commands that need arguments
+// (save) open a dialog pre-filled from current status; the rest send at once.
+const commandButtons: Array<{ id?: string; label: string; run: () => void }> = [
+  { id: "session", label: "▶ start", run: toggleSession },
+  { label: "release", run: releaseControl },
   { label: "status", run: () => send({ type: "get_status" }) },
   { label: "config", run: () => send({ type: "get_config" }) },
   { label: "devices", run: () => send({ type: "list_audio_devices" }) },
+  { label: "freq…", run: openFreqDialog },
+  { label: "export…", run: openExportDialog },
   { label: "save…", run: openSaveDialog }
 ];
+let sessionButton: ReturnType<typeof blessed.button> | null = null;
 commandButtons.forEach((command, index) => {
   const button = blessed.button({
     parent: commandBar,
@@ -362,7 +383,56 @@ commandButtons.forEach((command, index) => {
     style: { fg: "white", focus: { bg: "blue", fg: "black" }, hover: { bg: "blue", fg: "black" } }
   });
   button.on("press", command.run);
+  if (command.id === "session") {
+    sessionButton = button;
+  }
 });
+renderSessionButton();
+
+// --- control workflow -----------------------------------------------------
+
+// Ensure we hold control before a state-changing command. Auto-claims when
+// control is free; refuses (with a friendly message) when another client holds
+// it. The daemon processes the claim before the command sent right after it, so
+// controlMine need not be updated yet for the follow-up command to succeed.
+function ensureControl(): boolean {
+  if (controlMine) {
+    return true;
+  }
+  if (controlHeld) {
+    appendLog("You do not have control (another client holds it)");
+    return false;
+  }
+  send({ type: "claim_control", ...(token ? { token } : {}) });
+  return true;
+}
+
+function toggleSession(): void {
+  if (!ensureControl()) {
+    return;
+  }
+  send({ type: sessionActive ? "stop_session" : "start_session" });
+}
+
+function releaseControl(): void {
+  if (!controlMine) {
+    appendLog(controlHeld ? "You do not have control (another client holds it)" : "control is not held");
+    return;
+  }
+  send({ type: "release_control" });
+}
+
+// Label/colour the Session toggle from the live session state: green ▶ start
+// when idle, red ■ stop while a session is running.
+function renderSessionButton(): void {
+  if (!sessionButton) {
+    return;
+  }
+  sessionButton.setContent(sessionActive ? "■ stop" : "▶ start");
+  sessionButton.style.bg = sessionActive ? "red" : "green";
+  sessionButton.style.fg = "black";
+  screen.render();
+}
 
 screen.append(statusBar);
 screen.append(decodeList);
@@ -531,6 +601,10 @@ function decodeMarkup(message: string, line: string): string {
       const color = colorForQso(qso);
       return `{black-fg}{${color}-bg}${line}{/${color}-bg}{/black-fg}`;
     }
+    // Already worked (in the log): grey it out so we don't call them again.
+    if (workedCalls.has(sender)) {
+      return `{grey-fg}${line}{/grey-fg}`;
+    }
   }
   return line;
 }
@@ -577,7 +651,10 @@ function clockSegment(): string {
 }
 
 function renderStatusBar(): void {
-  statusBar.setContent(`${statusBase}  ||  ${clockSegment()}`);
+  const qrg = dialFreqHz
+    ? `{green-fg}${(dialFreqHz / 1e6).toFixed(3)}MHz{/green-fg}`
+    : "{yellow-fg}unset{/yellow-fg}";
+  statusBar.setContent(`${statusBase}  ||  ${clockSegment()}  ||  QRG=${qrg}`);
   screen.render();
 }
 
@@ -754,14 +831,15 @@ async function logCompletedQso(qso: QsoRecord, reason: string): Promise<void> {
   if (loggedQsoIds.has(qso.id)) {
     return;
   }
-  const entry = automation.toLogEntry(qso, reason);
+  const entry = automation.toLogEntry(qso, reason, dialFreqHz);
   if (!entry) {
     return;
   }
   loggedQsoIds.add(qso.id);
   try {
     await appendQsoLog(entry);
-    appendLog(`[qso-log] wrote ${entry.theirCall}`);
+    workedCalls.add(entry.theirCall);
+    appendLog(`[qso-log] wrote ${entry.theirCall}${dialFreqHz ? ` @${(dialFreqHz / 1e6).toFixed(3)}MHz` : " (no freq set)"}`);
   } catch (error) {
     loggedQsoIds.delete(qso.id);
     appendLog(`[qso-log error] ${error instanceof Error ? error.message : String(error)}`);
@@ -1107,6 +1185,59 @@ function openSaveDialog(): void {
   );
 }
 
+// Operating (dial) frequency: entered manually because CAT reports the wrong
+// band on this setup. Stored in Hz; logged with each QSO and used for export.
+function openFreqDialog(): void {
+  openDialog(
+    "operating frequency",
+    [{ name: "mhz", label: "dial freq MHz (e.g. 14.074)", value: dialFreqHz ? (dialFreqHz / 1e6).toFixed(3) : "" }],
+    (values) => {
+      const mhz = Number(values.mhz);
+      if (!Number.isFinite(mhz) || mhz <= 0) {
+        appendLog("freq: enter a positive frequency in MHz (e.g. 14.074)");
+        return;
+      }
+      dialFreqHz = Math.round(mhz * 1e6);
+      const band = bandForMHz(mhz);
+      appendLog(`[freq] operating dial freq = ${mhz.toFixed(3)} MHz${band ? ` (${band})` : " (out of ham band?)"}`);
+      renderStatusBar();
+    }
+  );
+}
+
+function defaultExportPath(): string {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+  return join(process.cwd(), "data", `digi-dx-${stamp}.adi`);
+}
+
+function openExportDialog(): void {
+  openDialog(
+    "export ADIF",
+    [{ name: "path", label: "output .adi path", value: defaultExportPath() }],
+    (values) => {
+      if (!values.path) {
+        appendLog("export: output path is required");
+        return;
+      }
+      void exportAdif(values.path);
+    }
+  );
+}
+
+async function exportAdif(path: string): Promise<void> {
+  try {
+    const entries = await readQsoLog();
+    if (entries.length === 0) {
+      appendLog("[export] no logged QSOs to export");
+      return;
+    }
+    await writeFile(path, buildAdif(entries), "utf8");
+    appendLog(`[export] wrote ${entries.length} QSO${entries.length === 1 ? "" : "s"} to ${path}`);
+  } catch (error) {
+    appendLog(`[export error] ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 // --- websocket event handling ---------------------------------------------
 
 ws.on("open", () => {
@@ -1145,11 +1276,15 @@ function handleMessage(msg: Record<string, unknown>): void {
       if (device && typeof device.id === "number") {
         lastDeviceId = device.id;
       }
+      controlHeld = control.held === true;
+      controlMine = control.byThisClient === true;
+      sessionActive = session.active === true;
       statusBase =
         `{bold}active{/bold}=${session.active} device=${(session.device as { id?: number } | null)?.id ?? "-"} ` +
         `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
         `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`;
       updateTxState((tx.state as typeof latestTxState) ?? "idle");
+      renderSessionButton();
       renderStatusBar();
       break;
     }
@@ -1211,14 +1346,20 @@ function handleMessage(msg: Record<string, unknown>): void {
     case "log":
       appendLog(`[${msg.level}] ${msg.message}`);
       break;
-    case "error":
-      appendLog(`[error] ${msg.code}: ${msg.message}${msg.details ? ` ${JSON.stringify(msg.details)}` : ""}`);
+    case "error": {
+      const code = String(msg.code);
+      if (code === "CONTROL_REQUIRED" || code === "CONTROL_UNAVAILABLE") {
+        appendLog("You do not have control (another client holds it)");
+      } else {
+        appendLog(`[error] ${code}: ${msg.message}${msg.details ? ` ${JSON.stringify(msg.details)}` : ""}`);
+      }
       if (pendingAutomationTx) {
         // Do not count this as an attempt; leave the QSO active and retry later.
         pendingAutomationTx = null;
         scheduleAutomation();
       }
       break;
+    }
     case "config":
       appendLog(`[config] complete=${msg.complete} ${JSON.stringify(msg.session ?? msg.missing ?? "")}`);
       break;
@@ -1233,10 +1374,27 @@ function handleMessage(msg: Record<string, unknown>): void {
   }
 }
 
+// Seed the worked-callsign set from the persisted log so already-worked
+// stations are greyed in Band Activity from the first decode.
+async function loadWorkedCalls(): Promise<void> {
+  try {
+    const entries = await readQsoLog();
+    for (const entry of entries) {
+      if (entry.theirCall) {
+        workedCalls.add(entry.theirCall.toUpperCase());
+      }
+    }
+    appendLog(`[qso-log] ${workedCalls.size} worked callsign(s) loaded`);
+  } catch (error) {
+    appendLog(`[qso-log error] ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 setInterval(() => {
   renderOccupancyPlots();
   renderStatusBar();
 }, 500);
+void loadWorkedCalls();
 renderOccupancyPlots();
 renderQsoList();
 screen.render();
