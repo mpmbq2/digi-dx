@@ -3,6 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { WebSocket } from "ws";
 import { appendQsoLog, readQsoLog } from "./qso-log.js";
+import { readTuiState, writeTuiState } from "./tui-state.js";
 import { bandForMHz, buildAdif } from "./adif.js";
 import {
   findOccupiedAf,
@@ -117,7 +118,7 @@ const decodeList = blessed.list({
   width: "55%",
   height: "48%-3",
   border: { type: "line" },
-  label: " band activity (click a row to draft a reply) ",
+  label: " band activity (dbl-click starts QSO, r=reply) ",
   mouse: true,
   keys: true,
   vi: true,
@@ -205,11 +206,18 @@ const afInput = blessed.textbox({
   border: { type: "line" },
   inputOnFocus: true,
   mouse: true,
+  keys: true,
+  style: { focus: { border: { fg: "cyan" } } },
   value: "1000"
+});
+afInput.on("click", () => {
+  focusComposeInput(afInput);
+  return false;
 });
 afInput.on("submit", () => {
   updateAfWarning();
   renderOccupancyPlots();
+  scheduleAutomation();
   screen.render();
 });
 
@@ -268,7 +276,13 @@ const targetInput = blessed.textbox({
   height: 3,
   border: { type: "line" },
   inputOnFocus: true,
-  mouse: true
+  mouse: true,
+  keys: true,
+  style: { focus: { border: { fg: "cyan" } } }
+});
+targetInput.on("click", () => {
+  focusComposeInput(targetInput);
+  return false;
 });
 
 const cancelButton = blessed.button({
@@ -459,33 +473,21 @@ decodeList.on("select", (_item, index) => {
   lastBandClickIndex = index;
   lastBandClickTime = now;
 
-  // Single click: copy AF and the reply slot as a tuning aid.
-  afInput.setValue(String(record.af));
-  currentSlot = oppositeSlot(slotFromTimestamp(record.ts));
-  slotButton.setContent(`slot: ${currentSlot} (click to toggle)`);
-  updateAfWarning();
-  renderOccupancyPlots();
-
-  // Double click: set the target callsign to this message's sender.
+  // Double click: start a reply QSO for this message's sender. Do not touch the
+  // operator's AF field; a double click arrives as two list selections.
   if (doubleClick) {
-    const sender = senderOf(record.message);
-    if (sender) {
-      targetInput.setValue(sender);
-      appendLog(`target set to ${sender}`);
-    }
+    replyToDecode(record);
   }
   screen.render();
 });
 
-// 'r' fills the target from the selected decode's sender, then replies.
+// 'r' replies to the selected decode's sender, or falls back to the target box.
 decodeList.key(["r"], () => {
   const index = (decodeList as unknown as { selected: number }).selected;
   const row = bandRows[index];
   if (row && row.kind === "decode") {
-    const sender = senderOf(row.decode.message);
-    if (sender) {
-      targetInput.setValue(sender);
-    }
+    replyToDecode(row.decode);
+    return;
   }
   replyToTarget();
 });
@@ -536,6 +538,15 @@ function gridFrom(message: string): string | null {
     return parsed.grid;
   }
   return parsed.payload.type === "grid" ? parsed.payload.grid : null;
+}
+
+function replyToDecode(record: DecodeRecord): void {
+  const sender = senderOf(record.message);
+  if (!sender) {
+    appendLog("selected decode has no sender callsign");
+    return;
+  }
+  replyToCall(sender, oppositeSlot(slotFromTimestamp(record.ts)), gridFrom(record.message));
 }
 
 function findLastDecodeFrom(call: string): DecodeRecord | null {
@@ -658,6 +669,20 @@ function renderStatusBar(): void {
   screen.render();
 }
 
+function setDialFreqHz(value: number | null): void {
+  dialFreqHz = value;
+  renderStatusBar();
+  void persistTuiState();
+}
+
+async function persistTuiState(): Promise<void> {
+  try {
+    await writeTuiState({ dialFreqHz });
+  } catch (error) {
+    appendLog(`[state error] ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 // --- qso automation helpers ----------------------------------------------
 
 function ensureAutomationIdentity(): boolean {
@@ -687,23 +712,29 @@ function replyToTarget(): void {
     appendLog("enter a target callsign (or double-click a decode)");
     return;
   }
-  if (!/^[A-Z0-9/]{2,}$/.test(call)) {
-    appendLog(`'${call}' is not a valid callsign`);
+  // Best-guess reply slot and their grid from the most recent decode of them.
+  const last = findLastDecodeFrom(call);
+  replyToCall(call, last ? oppositeSlot(slotFromTimestamp(last.ts)) : currentSlot, last ? gridFrom(last.message) : null);
+}
+
+function replyToCall(call: string, nextSlot: TxSlot, theirGrid: string | null): void {
+  if (!ensureAutomationIdentity()) {
+    return;
+  }
+  const normalizedCall = call.trim().toUpperCase();
+  if (!/^[A-Z0-9/]{2,}$/.test(normalizedCall)) {
+    appendLog(`'${normalizedCall}' is not a valid callsign`);
     return;
   }
   const existing = automation.qsos.find(
-    (qso) => qso.kind === "standard" && qso.theirCall === call && qso.status !== "complete"
+    (qso) => qso.kind === "standard" && qso.theirCall === normalizedCall && qso.status !== "complete"
   );
   if (existing) {
-    appendLog(`QSO already exists for ${call}`);
+    appendLog(`QSO already exists for ${normalizedCall}`);
     selectQso(existing.id);
     return;
   }
-  // Best-guess reply slot and their grid from the most recent decode of them.
-  const last = findLastDecodeFrom(call);
-  const nextSlot = last ? oppositeSlot(slotFromTimestamp(last.ts)) : currentSlot;
-  const theirGrid = last ? gridFrom(last.message) : null;
-  const qso = automation.createReplyToCall(call, myCall, myGrid, nextSlot, theirGrid, "top");
+  const qso = automation.createReplyToCall(normalizedCall, myCall, myGrid, nextSlot, theirGrid, "top");
   colorForQso(qso);
   appendLog(`[qso] reply to ${qso.theirCall}`);
   targetInput.clearValue();
@@ -1144,14 +1175,54 @@ function openDialog(
   // Enter advances to the next field; from the last field it moves to OK.
   inputs.forEach((input, index) => {
     input.on("submit", () => {
-      (inputs[index + 1] ?? ok).focus();
+      focusDialogField(inputs[index + 1] ?? ok);
       screen.render();
     });
   });
 
   screen.key("escape", onEsc);
-  (inputs[0] ?? ok).focus();
+  focusDialogField(inputs[0] ?? ok);
   screen.render();
+}
+
+type ReadingTextbox = blessed.Widgets.TextboxElement & { _reading?: boolean };
+type InputTrapCandidate = blessed.Widgets.BlessedElement & {
+  _reading?: boolean;
+  options?: { inputOnFocus?: boolean };
+};
+
+function focusComposeInput(input: blessed.Widgets.TextboxElement): void {
+  const reader = input as ReadingTextbox;
+  if (screen.focused !== input) {
+    focusFieldWithoutInputTrap(input);
+  }
+  if (!reader._reading) {
+    input.readInput();
+  }
+  screen.render();
+}
+
+function focusDialogField(field: blessed.Widgets.BlessedElement): void {
+  focusFieldWithoutInputTrap(field);
+}
+
+// Focus a field, defeating blessed's inputOnFocus "focus trap": a textbox that
+// is still reading rewinds focus back to itself on blur, which can instantly
+// blur the field we are trying to focus. Disabling inputOnFocus on the mid-read
+// textbox while we take focus stops the rewind; we restore it after.
+function focusFieldWithoutInputTrap(field: blessed.Widgets.BlessedElement): void {
+  if (screen.focused === field) {
+    return;
+  }
+  const trapped = screen.focused as unknown as { _reading?: boolean; options?: { inputOnFocus?: boolean } } | undefined;
+  const breakTrap = !!(trapped && trapped._reading && trapped.options && trapped.options.inputOnFocus);
+  if (breakTrap) {
+    (trapped as InputTrapCandidate).options!.inputOnFocus = false;
+  }
+  field.focus();
+  if (breakTrap) {
+    (trapped as InputTrapCandidate).options!.inputOnFocus = true;
+  }
 }
 
 function openSaveDialog(): void {
@@ -1197,10 +1268,9 @@ function openFreqDialog(): void {
         appendLog("freq: enter a positive frequency in MHz (e.g. 14.074)");
         return;
       }
-      dialFreqHz = Math.round(mhz * 1e6);
+      setDialFreqHz(Math.round(mhz * 1e6));
       const band = bandForMHz(mhz);
       appendLog(`[freq] operating dial freq = ${mhz.toFixed(3)} MHz${band ? ` (${band})` : " (out of ham band?)"}`);
-      renderStatusBar();
     }
   );
 }
@@ -1231,8 +1301,12 @@ async function exportAdif(path: string): Promise<void> {
       appendLog("[export] no logged QSOs to export");
       return;
     }
+    const missingFreqCount = entries.filter((entry) => entry.dialFreqHz == null).length;
     await writeFile(path, buildAdif(entries), "utf8");
-    appendLog(`[export] wrote ${entries.length} QSO${entries.length === 1 ? "" : "s"} to ${path}`);
+    appendLog(
+      `[export] wrote ${entries.length} QSO${entries.length === 1 ? "" : "s"} to ${path}` +
+        (missingFreqCount > 0 ? ` (${missingFreqCount} without freq)` : "")
+    );
   } catch (error) {
     appendLog(`[export error] ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1390,10 +1464,35 @@ async function loadWorkedCalls(): Promise<void> {
   }
 }
 
+async function loadStoredDialFreq(): Promise<void> {
+  try {
+    const state = await readTuiState();
+    if (state.dialFreqHz != null) {
+      dialFreqHz = state.dialFreqHz;
+      appendLog(`[freq] restored dial freq = ${(dialFreqHz / 1e6).toFixed(3)} MHz`);
+      renderStatusBar();
+      return;
+    }
+
+    const entries = await readQsoLog();
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const loggedFreq = entries[index]!.dialFreqHz;
+      if (loggedFreq != null) {
+        setDialFreqHz(loggedFreq);
+        appendLog(`[freq] restored last logged dial freq = ${(loggedFreq / 1e6).toFixed(3)} MHz`);
+        return;
+      }
+    }
+  } catch (error) {
+    appendLog(`[state error] ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 setInterval(() => {
   renderOccupancyPlots();
   renderStatusBar();
 }, 500);
+void loadStoredDialFreq();
 void loadWorkedCalls();
 renderOccupancyPlots();
 renderQsoList();
