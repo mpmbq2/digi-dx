@@ -54,6 +54,7 @@ const loggedQsoIds = new Set<string>();
 let controlHeld = false;
 let controlMine = false;
 let sessionActive = false;
+let configComplete = false;
 
 // Operator-entered dial frequency (Hz). CAT control reports the wrong band on
 // this setup, so this manual value is what gets logged and exported. Null until
@@ -422,6 +423,10 @@ function toggleSession(): void {
   if (!ensureControl()) {
     return;
   }
+  if (!sessionActive && !configComplete) {
+    appendLog("Complete station config first (command: save)");
+    return;
+  }
   send(sessionActive ? { type: "stop_session" } : { type: "start_session" });
 }
 
@@ -439,8 +444,8 @@ function renderSessionButton(): void {
   if (!sessionButton) {
     return;
   }
-  sessionButton.setContent(sessionActive ? "■ stop" : "▶ start");
-  sessionButton.style.bg = sessionActive ? "red" : "green";
+  sessionButton.setContent(sessionActive ? "■ stop" : configComplete ? "▶ start" : "▶ setup first");
+  sessionButton.style.bg = sessionActive ? "red" : configComplete ? "green" : "yellow";
   sessionButton.style.fg = "black";
   screen.render();
 }
@@ -1248,6 +1253,8 @@ function openSaveDialog(): void {
           cat: { mode: values.catMode, port: values.catPort ? Number(values.catPort) : 4532 }
         }
       });
+      configComplete = true;
+      renderSessionButton();
       appendLog(`[save] device=${deviceId} ${values.callsign} ${values.grid} ${values.catMode}`);
     }
   );
@@ -1313,6 +1320,7 @@ async function exportAdif(path: string): Promise<void> {
 
 client.on("open", () => {
   appendLog(`connected to ${url}`);
+  send({ type: "get_config" });
   decodeList.focus();
   screen.render();
 });
@@ -1409,7 +1417,18 @@ client.on("daemonError", (msg) => {
 });
 
 client.on("config", (msg) => {
+  configComplete = msg.complete;
+  if (msg.session?.callsign) {
+    myCall = msg.session.callsign;
+  }
+  if (msg.session?.grid) {
+    myGrid = msg.session.grid;
+  }
+  if (msg.session?.device?.id != null) {
+    lastDeviceId = msg.session.device.id;
+  }
   appendLog(`[config] complete=${msg.complete} ${JSON.stringify(msg.session ?? msg.missing ?? "")}`);
+  renderSessionButton();
 });
 
 client.on("audio_devices", (msg) => {

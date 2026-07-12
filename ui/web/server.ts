@@ -34,7 +34,7 @@ import {
   senderOf,
   type AnnotateContext
 } from "./view-model.js";
-import type { CommandMessage, LogLineView, StateMessage, TxState } from "./protocol.js";
+import type { CommandMessage, LogLineView, SetupView, StateMessage, TxState } from "./protocol.js";
 
 let daemonUrl = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8788";
 let token = process.env.DIGI_DX_AUTH_TOKEN;
@@ -62,6 +62,9 @@ let controlHeld = false;
 let controlMine = false;
 let sessionActive = false;
 let catConnected = false;
+let configComplete = false;
+let configMissing: string[] = [];
+let setupDevices: SetupView["devices"] = [];
 
 let latestTxState: TxState = "idle";
 let pendingAutomationTx: AutomationTx | null = null;
@@ -134,7 +137,11 @@ function connectDaemon(): void {
   });
   daemonClient = client;
 
-  client.on("open", () => appendLog("info", `connected to daemon ${daemonUrl}`));
+  client.on("open", () => {
+    appendLog("info", `connected to daemon ${daemonUrl}`);
+    daemonSend({ type: "get_config" });
+    daemonSend({ type: "list_audio_devices" });
+  });
   client.on("close", () => {
     controlHeld = false;
     controlMine = false;
@@ -214,7 +221,27 @@ function connectDaemon(): void {
     }
   });
 
-  client.on("config", (msg) => appendLog("info", `[config] complete=${msg.complete}`));
+  client.on("config", (msg) => {
+    configComplete = msg.complete;
+    configMissing = msg.missing ?? [];
+    if (msg.session?.callsign) {
+      myCall = msg.session.callsign;
+    }
+    if (msg.session?.grid) {
+      myGrid = msg.session.grid;
+    }
+    appendLog("info", `[config] complete=${msg.complete}`);
+    broadcastState();
+  });
+
+  client.on("audio_devices", (msg) => {
+    setupDevices = msg.devices.map((device) => ({
+      id: device.id,
+      name: device.name,
+      defaultSampleRate: device.defaultSampleRate ?? null
+    }));
+    broadcastState();
+  });
 
   client.connect();
 }
@@ -677,7 +704,31 @@ function handleCommand(message: CommandMessage): void {
       if (!ensureControl()) {
         return;
       }
+      if (message.action === "start" && !configComplete) {
+        appendLog("warn", "complete station setup before starting a session");
+        broadcastState();
+        return;
+      }
       daemonSend(message.action === "start" ? { type: "start_session" } : { type: "stop_session" });
+      break;
+    case "saveSetup":
+      if (!ensureControl()) {
+        return;
+      }
+      if (sessionActive) {
+        appendLog("warn", "cannot save setup while a session is active");
+        return;
+      }
+      daemonSend({
+        type: "save_config",
+        session: {
+          mode: "FT8",
+          device: { id: message.deviceId },
+          callsign: message.callsign,
+          grid: message.grid,
+          cat: { mode: message.catMode, port: message.catPort }
+        }
+      });
       break;
     case "releaseControl":
       if (!controlMine) {
@@ -721,6 +772,11 @@ function buildState(): StateMessage {
       sessionActive,
       controlHeld,
       controlMine
+    },
+    setup: {
+      complete: configComplete,
+      missing: configMissing,
+      devices: setupDevices
     },
     now: {
       ...deriveTxCard(latestTxState, displayAutomationTx),

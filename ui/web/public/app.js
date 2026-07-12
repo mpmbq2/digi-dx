@@ -11,6 +11,7 @@
   ];
 
   const refs = {
+    setupOverlay: byId("setup-overlay"),
     connStatus: byId("conn-status"),
     stationCall: byId("station-call"),
     stationGrid: byId("station-grid"),
@@ -72,6 +73,7 @@
   let rosterSort = "time";
   let logOpen = false;
   let draggingSlot = null;
+  let setupRefs = null;
   const collapsedQsos = new Set();
   const expandedCompleted = new Set();
 
@@ -257,6 +259,7 @@
   function render() {
     renderConnection();
     renderStation();
+    renderSetup();
     renderClockAndNow();
     renderAf();
     renderQsos();
@@ -293,6 +296,156 @@
     if (document.activeElement !== input) {
       input.value = value ?? "";
     }
+  }
+
+  // First-run station setup: a blocking overlay shown until the daemon reports a
+  // complete session config. Built once, then only its device list and hint are
+  // refreshed so it never clobbers what the operator is typing.
+  function renderSetup() {
+    if (!state) {
+      return;
+    }
+    const setup = state.setup;
+    if (!setup || setup.complete) {
+      refs.setupOverlay.hidden = true;
+      return;
+    }
+    buildSetupForm();
+    refreshSetupDevices(setup.devices || []);
+    refs.setupOverlay.hidden = false;
+  }
+
+  function buildSetupForm() {
+    if (setupRefs) {
+      return;
+    }
+    const card = document.createElement("div");
+    card.className = "setup-card";
+
+    const title = document.createElement("h2");
+    title.className = "setup-title";
+    title.textContent = "Station setup";
+    const sub = document.createElement("p");
+    sub.className = "setup-sub";
+    sub.textContent = "Enter your station details to start operating. Saved to the daemon config.";
+    card.append(title, sub);
+
+    const call = setupField(card, "Callsign", "N0CALL");
+    const grid = setupField(card, "Grid", "FN31");
+
+    const device = setupSelect(card, "Audio device");
+    const catMode = setupSelect(card, "CAT mode");
+    for (const mode of ["rigctld", "dummy"]) {
+      const opt = document.createElement("option");
+      opt.value = mode;
+      opt.textContent = mode;
+      catMode.append(opt);
+    }
+
+    const catPort = setupField(card, "CAT port", "4532");
+    catPort.value = "4532";
+
+    const hint = document.createElement("p");
+    hint.className = "setup-hint";
+    const save = document.createElement("button");
+    save.className = "setup-save";
+    save.textContent = "Save & continue";
+    card.append(hint, save);
+
+    setupRefs = { call, grid, device, catMode, catPort, hint, save };
+    save.addEventListener("click", submitSetup);
+    refs.setupOverlay.append(card);
+
+    // Prefill call/grid from anything the daemon already knows.
+    if (state && state.station) {
+      if (state.station.call) {
+        call.value = state.station.call;
+      }
+      if (state.station.grid) {
+        grid.value = state.station.grid;
+      }
+    }
+  }
+
+  function setupField(card, label, placeholder) {
+    const row = document.createElement("label");
+    row.className = "setup-row";
+    const span = document.createElement("span");
+    span.textContent = label;
+    const input = document.createElement("input");
+    input.className = "setup-input";
+    input.type = "text";
+    input.spellcheck = false;
+    input.autocomplete = "off";
+    if (placeholder) {
+      input.placeholder = placeholder;
+    }
+    row.append(span, input);
+    card.append(row);
+    return input;
+  }
+
+  function setupSelect(card, label) {
+    const row = document.createElement("label");
+    row.className = "setup-row";
+    const span = document.createElement("span");
+    span.textContent = label;
+    const select = document.createElement("select");
+    select.className = "setup-input";
+    row.append(span, select);
+    card.append(row);
+    return select;
+  }
+
+  function refreshSetupDevices(devices) {
+    const select = setupRefs.device;
+    if (document.activeElement === select) {
+      return;
+    }
+    const signature = devices.map((d) => `${d.id}:${d.name}`).join("|");
+    if (select.dataset.signature === signature) {
+      return;
+    }
+    select.dataset.signature = signature;
+    const previous = select.value;
+    select.textContent = "";
+    if (devices.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No audio devices found";
+      select.append(opt);
+    }
+    for (const device of devices) {
+      const opt = document.createElement("option");
+      opt.value = String(device.id);
+      const rate = device.defaultSampleRate ? ` (${device.defaultSampleRate} Hz)` : "";
+      opt.textContent = `${device.id}: ${device.name}${rate}`;
+      select.append(opt);
+    }
+    if (previous) {
+      select.value = previous;
+    }
+  }
+
+  function submitSetup() {
+    const callsign = setupRefs.call.value.trim().toUpperCase();
+    const grid = setupRefs.grid.value.trim().toUpperCase();
+    const deviceId = Number(setupRefs.device.value);
+    const catMode = setupRefs.catMode.value;
+    const catPort = Number(setupRefs.catPort.value);
+
+    const problems = [];
+    if (!callsign) problems.push("callsign");
+    if (!grid) problems.push("grid");
+    if (!setupRefs.device.value || !Number.isInteger(deviceId)) problems.push("audio device");
+    if (!Number.isInteger(catPort) || catPort < 1 || catPort > 65535) problems.push("CAT port");
+    if (problems.length > 0) {
+      setupRefs.hint.textContent = `Please provide: ${problems.join(", ")}`;
+      return;
+    }
+
+    setupRefs.hint.textContent = "Saving…";
+    send({ cmd: "saveSetup", callsign, grid, deviceId, catMode, catPort });
   }
 
   function renderClockAndNow() {

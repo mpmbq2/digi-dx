@@ -26,6 +26,18 @@ export interface StationView {
   controlMine: boolean;
 }
 
+export interface SetupDeviceView {
+  id: number;
+  name: string;
+  defaultSampleRate: number | null;
+}
+
+export interface SetupView {
+  complete: boolean;
+  missing: string[];
+  devices: SetupDeviceView[];
+}
+
 export interface NowView {
   txState: TxState;
   txEnabled: boolean;
@@ -96,6 +108,7 @@ export interface StateMessage {
   serverNow: number;
   cycle: { parity: TxSlot };
   station: StationView;
+  setup: SetupView;
   now: NowView;
   af: { value: number; slot: TxSlot };
   qsos: {
@@ -131,4 +144,5 @@ export type CommandMessage =
   | { type: "command"; cmd: "txEnable"; enabled: boolean }
   | { type: "command"; cmd: "haltTx" }
   | { type: "command"; cmd: "session"; action: "start" | "stop" }
+  | { type: "command"; cmd: "saveSetup"; callsign: string; grid: string; deviceId: number; catMode: "rigctld" | "dummy"; catPort: number }
   | { type: "command"; cmd: "releaseControl" };
