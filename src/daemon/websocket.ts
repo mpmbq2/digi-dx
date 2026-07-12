@@ -30,7 +30,7 @@ export interface DaemonWebSocketServer {
 
 export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): DaemonWebSocketServer {
   const server = new WebSocketServer({
-    port: options.port ?? 8787,
+    port: options.port ?? 8788,
     host: options.host ?? "0.0.0.0"
   });
   const clients = new Set<WebSocket>();

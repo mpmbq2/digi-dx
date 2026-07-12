@@ -1,7 +1,7 @@
 import readline from "node:readline";
 import { WebSocket } from "ws";
 
-const url = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8787";
+const url = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8788";
 const token = process.env.DIGI_DX_AUTH_TOKEN;
 
 const ws = new WebSocket(url);

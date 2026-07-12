@@ -2,7 +2,7 @@ import { Engine } from "./daemon/engine.js";
 import { createDaemonWebSocketServer } from "./daemon/websocket.js";
 import { resolveConfigPath } from "./daemon/config.js";
 
-const port = Number(process.env.DIGI_DX_PORT ?? 8787);
+const port = Number(process.env.DIGI_DX_PORT ?? 8788);
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("DIGI_DX_PORT must be an integer from 1 to 65535");
 }
