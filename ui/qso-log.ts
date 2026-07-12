@@ -1,6 +1,6 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { QsoLogEntry } from "./qso.js";
+import type { QsoLogEntry } from "../core/qso.js";
 
 const defaultLogPath = join(process.cwd(), "data", "qso-log.jsonl");
 

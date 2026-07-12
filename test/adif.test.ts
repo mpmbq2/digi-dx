@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { bandForMHz, buildAdif, entryToAdif } from "../ui/adif.js";
 import { appendQsoLog, readQsoLog } from "../ui/qso-log.js";
-import type { QsoLogEntry } from "../ui/qso.js";
+import type { QsoLogEntry } from "../core/qso.js";
 
 function entry(overrides: Partial<QsoLogEntry> = {}): QsoLogEntry {
   return {

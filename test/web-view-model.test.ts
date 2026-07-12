@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { QsoAutomation, type DecodeRecord } from "../ui/qso.js";
+import { QsoAutomation, type DecodeRecord } from "../core/qso.js";
 import {
   annotateDecode,
   buildActiveQsoView,

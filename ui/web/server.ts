@@ -19,7 +19,7 @@ import {
   type QsoAutomationEvent,
   type QsoRecord,
   type TxSlot
-} from "../qso.js";
+} from "../../core/qso.js";
 import {
   annotateDecode,
   buildActiveQsoView,

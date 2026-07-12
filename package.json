@@ -8,6 +8,7 @@
     "dev": "DIGI_DX_CONFIG_PATH=./data/config.json tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.ui.json",
     "ui": "tsx ui/cli.ts",
     "tui": "tsx ui/tui.ts",
     "web": "tsx ui/web/server.ts"

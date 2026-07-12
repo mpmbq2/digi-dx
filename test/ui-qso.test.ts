@@ -14,7 +14,7 @@ import {
   suggestClearAf,
   type AutomationTx,
   type DecodeRecord
-} from "../ui/qso.js";
+} from "../core/qso.js";
 
 describe("FT8 QSO parser", () => {
   it("parses CQ, reports, roger reports, and terminal messages", () => {

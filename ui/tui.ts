@@ -20,7 +20,7 @@ import {
   type QsoAutomationEvent,
   type QsoRecord,
   type TxSlot
-} from "./qso.js";
+} from "../core/qso.js";
 
 const url = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8788";
 const token = process.env.DIGI_DX_AUTH_TOKEN;

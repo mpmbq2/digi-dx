@@ -1,4 +1,4 @@
-import type { QsoLogEntry } from "./qso.js";
+import type { QsoLogEntry } from "../core/qso.js";
 
 // Amateur band edges (MHz) used to derive the ADIF BAND tag from a dial
 // frequency. Ranges are inclusive of the lower edge and exclusive of the upper.

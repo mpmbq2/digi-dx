@@ -3,7 +3,7 @@
 // pushes a StateMessage view-model; the browser sends CommandMessages. Keep
 // these types in sync with the runtime shapes app.js reads/writes.
 
-import type { QsoStep, TxSlot } from "../qso.js";
+import type { QsoStep, TxSlot } from "../../core/qso.js";
 
 export type TxState = "idle" | "pending" | "active";
 
