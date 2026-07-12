@@ -7,7 +7,8 @@ export interface TxStateEvents {
 }
 
 export interface TxStateOptions {
-  writeLine: (line: string) => Promise<void> | void;
+  transmit: (intent: TxIntent) => Promise<void> | void;
+  cancelTransmit: () => Promise<void> | void;
   now?: () => number;
   stopTimeoutMs?: number;
 }
@@ -76,9 +77,8 @@ export class TxState extends EventEmitter<TxStateEvents> {
   }
 
   private async forward(intent: TxIntent): Promise<void> {
-    const slot = intent.slot === "even" ? "E" : "O";
     try {
-      await this.options.writeLine(`${intent.af}${slot} ${intent.message}`);
+      await this.options.transmit(intent);
     } catch (error) {
       throw new DaemonError("TX_FAILED", "failed to write transmit command", {
         message: error instanceof Error ? error.message : String(error)
@@ -88,7 +88,7 @@ export class TxState extends EventEmitter<TxStateEvents> {
 
   private async writeStop(): Promise<void> {
     try {
-      await this.options.writeLine("STOP");
+      await this.options.cancelTransmit();
     } catch (error) {
       throw new DaemonError("TX_FAILED", "failed to write STOP command", {
         message: error instanceof Error ? error.message : String(error)

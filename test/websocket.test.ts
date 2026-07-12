@@ -62,6 +62,10 @@ class FakeEngine extends EventEmitter<EngineEvents> implements EngineApi {
     };
     this.emit("status");
   }
+
+  async listAudioDevices(): Promise<never[]> {
+    return [];
+  }
 }
 
 const servers: DaemonWebSocketServer[] = [];

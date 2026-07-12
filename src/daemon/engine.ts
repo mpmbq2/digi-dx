@@ -1,11 +1,11 @@
-import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
-import dgram, { type Socket as UdpSocket } from "node:dgram";
 import { EventEmitter } from "node:events";
-import net from "node:net";
-import readline from "node:readline";
 import type { SessionConfig } from "./config.js";
-import { listAudioDevices } from "./audio-devices.js";
-import type { BroadcastEvent, DaemonStatus, DecodeEvent, TxEvent, TxIntent, TxStatus } from "./protocol.js";
+import {
+  driverDecodeToEvent,
+  driverTxToEvent,
+  type EngineDriver
+} from "./engine-driver.js";
+import type { BroadcastEvent, DaemonStatus, TxIntent, TxStatus } from "./protocol.js";
 import { DaemonError } from "./protocol.js";
 import { TxState } from "./tx-state.js";
 
@@ -27,11 +27,7 @@ export interface EngineEvents {
 }
 
 export interface EngineOptions {
-  ft8catPath?: string;
-  ft8modemPath?: string;
-  rigctldPath?: string;
-  verifyAudioDevice?: boolean;
-  stopTimeoutMs?: number;
+  driver: EngineDriver;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -41,6 +37,7 @@ export interface EngineApi extends EventEmitter<EngineEvents> {
   stop(): Promise<void>;
   transmit(intent: TxIntent): Promise<void>;
   cancelTransmit(): Promise<void>;
+  listAudioDevices(): ReturnType<EngineDriver["listAudioDevices"]>;
 }
 
 export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
@@ -49,29 +46,16 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
   private catConnected = false;
   private freq: number | null = null;
   private ptt = false;
-  private child: ChildProcessWithoutNullStreams | null = null;
-  private dummyRig: ChildProcess | null = null;
-  private udp: UdpSocket | null = null;
-  private stoppingByRequest = false;
-  private stdoutRl: readline.Interface | null = null;
-  private stderrRl: readline.Interface | null = null;
   private txState: TxState;
-  private readonly ft8catPath: string;
-  private readonly ft8modemPath: string;
-  private readonly rigctldPath: string;
-  private readonly verifyAudioDevice: boolean;
-  private readonly stopTimeoutMs: number;
+  private readonly driver: EngineDriver;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
 
-  constructor(options: EngineOptions = {}) {
+  constructor(options: EngineOptions) {
     super();
-    this.ft8catPath = options.ft8catPath ?? process.env.DIGI_DX_FT8CAT_PATH ?? "ft8cat";
-    this.ft8modemPath = options.ft8modemPath ?? process.env.DIGI_DX_FT8MODEM_PATH ?? "ft8modem";
-    this.rigctldPath = options.rigctldPath ?? process.env.DIGI_DX_RIGCTLD_PATH ?? "rigctld";
-    this.verifyAudioDevice = options.verifyAudioDevice ?? true;
-    this.stopTimeoutMs = options.stopTimeoutMs ?? 5000;
+    this.driver = options.driver;
     this.logger = options.logger ?? console;
     this.txState = this.createTxState();
+    this.bindDriverEvents();
   }
 
   snapshot(): EngineSnapshot {
@@ -95,16 +79,18 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
     this.emit("status");
 
     try {
-      await this.verifySoundDevice(session);
-      await this.prepareCat(session);
-      const udpPort = await this.bindUdp();
-      this.spawnFt8cat(session, udpPort);
+      await this.driver.start(session);
       this.state = "active";
       this.catConnected = true;
       this.emit("event", { type: "log", level: "info", message: `Session started on device ${session.device.id}` });
       this.emit("status");
     } catch (error) {
-      await this.cleanupAfterStop();
+      this.resetLocalState();
+      try {
+        await this.driver.stop();
+      } catch {
+        // Driver may have failed before spawning.
+      }
       this.state = "inactive";
       this.session = null;
       this.emit("status");
@@ -122,20 +108,18 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
       throw new DaemonError("NO_ACTIVE_SESSION", "no active session");
     }
 
-    this.stoppingByRequest = true;
     this.state = "stopping";
     this.emit("status");
-    await this.terminateChildTree(this.child);
-    await this.cleanupAfterStop();
+    await this.driver.stop();
+    this.resetLocalState();
     this.state = "inactive";
     this.session = null;
-    this.stoppingByRequest = false;
     this.emit("event", { type: "log", level: "info", message: "Session stopped" });
     this.emit("status");
   }
 
   async transmit(intent: TxIntent): Promise<void> {
-    if (this.state !== "active" || !this.child) {
+    if (this.state !== "active") {
       throw new DaemonError("NO_ACTIVE_SESSION", "no active session");
     }
     await this.txState.transmit(intent);
@@ -143,7 +127,7 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
   }
 
   async cancelTransmit(): Promise<void> {
-    if (this.state !== "active" || !this.child) {
+    if (this.state !== "active") {
       throw new DaemonError("NO_ACTIVE_SESSION", "no active session");
     }
     await this.txState.cancel();
@@ -151,204 +135,51 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
     this.emit("status");
   }
 
+  async listAudioDevices(): ReturnType<EngineDriver["listAudioDevices"]> {
+    return this.driver.listAudioDevices();
+  }
+
   private createTxState(): TxState {
     const txState = new TxState({
-      writeLine: (line) => {
-        if (!this.child?.stdin.writable) {
-          throw new Error("engine stdin is not writable");
-        }
-        this.child.stdin.write(`${line}\n`);
-      }
+      transmit: (intent) => this.driver.transmit(intent),
+      cancelTransmit: () => this.driver.cancelTransmit()
     });
     txState.on("txUpdate", (event) => this.emit("event", event));
     return txState;
   }
 
-  private async verifySoundDevice(session: SessionConfig): Promise<void> {
-    if (!this.verifyAudioDevice) {
-      return;
-    }
-
-    const devices = await listAudioDevices(this.ft8modemPath);
-    const discovered = devices.find((device) => device.id === session.device.id);
-    if (!discovered) {
-      throw new DaemonError("SOUND_DEVICE_UNAVAILABLE", `sound device ${session.device.id} is unavailable`, {
-        deviceId: session.device.id
-      });
-    }
-
-    if (session.device.name && discovered.name !== session.device.name) {
-      const message = `Saved device name '${session.device.name}' does not match discovered device '${discovered.name}'`;
-      this.logger.warn(message);
-      this.emit("event", { type: "log", level: "warn", message });
-    }
-  }
-
-  private async prepareCat(session: SessionConfig): Promise<void> {
-    if (session.cat.mode === "rigctld") {
-      const ok = await canConnect("127.0.0.1", session.cat.port, 1000);
-      if (!ok) {
-        throw new DaemonError("CAT_FAILED", `rigctld is not accepting connections on port ${session.cat.port}`);
-      }
-      return;
-    }
-
-    const occupied = await canConnect("127.0.0.1", session.cat.port, 250);
-    if (occupied) {
-      throw new DaemonError("CAT_PORT_UNAVAILABLE", `CAT port ${session.cat.port} is already in use`);
-    }
-
-    this.dummyRig = spawn(this.rigctldPath, ["-m", "1", "-t", String(session.cat.port)], {
-      detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"]
+  private bindDriverEvents(): void {
+    this.driver.on("decode", (decode) => this.emit("event", driverDecodeToEvent(decode)));
+    this.driver.on("tx", (tx) => this.emit("event", driverTxToEvent(tx)));
+    this.driver.on("freq", (freq) => {
+      this.freq = freq;
+      this.emit("status");
     });
-
-    this.dummyRig.on("error", (error) => {
-      this.logger.error(`dummy rigctld failed: ${error.message}`);
-    });
-
-    const ready = await waitForConnect("127.0.0.1", session.cat.port, 5000);
-    if (!ready) {
-      throw new DaemonError("CAT_FAILED", `dummy rigctld did not become ready on port ${session.cat.port}`);
-    }
-  }
-
-  private async bindUdp(): Promise<number> {
-    const socket = dgram.createSocket("udp4");
-    this.udp = socket;
-    socket.on("message", (message) => this.handleUdpMessage(message));
-
-    try {
-      await new Promise<void>((resolve, reject) => {
-        socket.once("error", reject);
-        socket.bind(0, "127.0.0.1", () => {
-          socket.off("error", reject);
-          resolve();
-        });
-      });
-    } catch (error) {
-      throw new DaemonError("UDP_BIND_FAILED", "failed to bind internal UDP listener", {
-        message: error instanceof Error ? error.message : String(error)
-      });
-    }
-
-    const address = socket.address();
-    if (typeof address === "string") {
-      throw new DaemonError("UDP_BIND_FAILED", "unexpected UDP address");
-    }
-    return address.port;
-  }
-
-  private spawnFt8cat(session: SessionConfig, udpPort: number): void {
-    const args = [
-      "-A",
-      `127.0.0.1:${udpPort}`,
-      "-u",
-      "-p",
-      String(session.cat.port),
-      this.ft8modemPath,
-      session.mode,
-      String(session.device.id)
-    ];
-
-    const child = spawn(this.ft8catPath, args, {
-      detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "pipe"]
-    }) as ChildProcessWithoutNullStreams;
-
-    this.child = child;
-    this.stdoutRl = readline.createInterface({ input: child.stdout });
-    this.stderrRl = readline.createInterface({ input: child.stderr });
-    this.stdoutRl.on("line", (line) => this.handleEngineLine(line));
-    this.stderrRl.on("line", (line) => this.handleEngineDiagnostic(line));
-
-    child.once("error", (error) => {
-      this.emit("error", new DaemonError("ENGINE_START_FAILED", "failed to spawn ft8cat", { message: error.message }));
-    });
-
-    child.once("exit", () => {
-      void this.handleChildExit();
-    });
-  }
-
-  private handleEngineLine(line: string): void {
-    const txMatch = /^TX:\s*([01])\b/.exec(line.trim());
-    if (txMatch) {
-      const active = txMatch[1] === "1";
+    this.driver.on("ptt", (active) => {
       this.txState.markEngineTx(active);
       this.ptt = active;
       this.emit("status");
-      return;
-    }
-
-    const faMatch = /^FA:\s*(\d+)/.exec(line.trim());
-    if (faMatch) {
-      this.freq = Number(faMatch[1]);
+    });
+    this.driver.on("crash", async () => {
+      this.resetLocalState();
+      try {
+        await this.driver.stop();
+      } catch {
+        // Driver already exited.
+      }
+      this.state = "inactive";
+      this.session = null;
+      const error = new DaemonError("PROCESS_CRASHED", "ft8cat exited unexpectedly");
+      this.emit("error", error);
       this.emit("status");
-    }
+    });
   }
 
-  private handleEngineDiagnostic(line: string): void {
-    if (line.trim()) {
-      this.logger.info(line);
-    }
-  }
-
-  private handleUdpMessage(message: Buffer): void {
-    const parsed = parseInternalUdpLine(message.toString("utf8"));
-    if (!parsed) {
-      this.logger.warn(`dropping malformed ft8cat UDP line: ${message.toString("utf8").trim()}`);
-      return;
-    }
-    this.emit("event", parsed);
-  }
-
-  private async handleChildExit(): Promise<void> {
-    if (this.stoppingByRequest) {
-      return;
-    }
-
-    await this.cleanupAfterStop();
-    this.state = "inactive";
-    this.session = null;
-    const error = new DaemonError("PROCESS_CRASHED", "ft8cat exited unexpectedly");
-    this.emit("error", error);
-    this.emit("status");
-  }
-
-  private async cleanupAfterStop(): Promise<void> {
-    this.stdoutRl?.close();
-    this.stderrRl?.close();
-    this.stdoutRl = null;
-    this.stderrRl = null;
-    this.child = null;
+  private resetLocalState(): void {
     this.catConnected = false;
     this.freq = null;
     this.ptt = false;
     this.txState.clear();
-
-    if (this.udp) {
-      this.udp.close();
-      this.udp = null;
-    }
-
-    if (this.dummyRig) {
-      await this.terminateChildTree(this.dummyRig);
-      this.dummyRig = null;
-    }
-  }
-
-  private async terminateChildTree(child: ChildProcess | null): Promise<void> {
-    if (!child || child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
-      return;
-    }
-
-    signalProcessGroup(child, "SIGTERM");
-    const exited = await waitForExit(child, this.stopTimeoutMs);
-    if (!exited) {
-      signalProcessGroup(child, "SIGKILL");
-      await waitForExit(child, 1000);
-    }
   }
 }
 
@@ -370,120 +201,4 @@ export function statusFromSnapshot(snapshot: EngineSnapshot, control: DaemonStat
     tx: snapshot.tx,
     control
   };
-}
-
-// Real `ft8cat -A -u` lines follow the same layout as `-a` ALL.TXT-style
-// output, only with an integer unix timestamp instead of a yymmdd_hhmmss
-// field. Captured example (from a live session, non-`-u` timestamp):
-//   260702_151115   144.174 Tx FT8      0  0.0 1000 CQ N1MPM FN42
-//   260703_031600   144.174 Rx FT8     10 -0.6 2024 WM8Q DL0EO -17
-// Fields are whitespace-padded for alignment, and some Rx lines carry extra
-// trailing decoder-pass metadata (e.g. "? a1") that we keep as part of the
-// message text; Phase 1 does not parse FT8 message grammar.
-export function parseInternalUdpLine(line: string): DecodeEvent | TxEvent | null {
-  const parts = line.trim().split(/\s+/);
-  if (parts.length < 7) {
-    return null;
-  }
-
-  const [ts, freq, direction, mode, snr, dt, af, ...rest] = parts;
-  if (!/^\d{10}$/.test(ts)) {
-    return null;
-  }
-  if (!/^\d+(?:\.\d+)?$/.test(freq)) {
-    return null;
-  }
-  if (direction !== "Rx" && direction !== "Tx") {
-    return null;
-  }
-  if (mode !== "FT8" && mode !== "FT4") {
-    return null;
-  }
-  if (!/^-?\d+$/.test(snr) || !/^[+-]?\d+(?:\.\d+)?$/.test(dt) || !/^\d+$/.test(af)) {
-    return null;
-  }
-
-  const message = rest.join(" ").trim().toUpperCase();
-  if (!message) {
-    return null;
-  }
-
-  if (direction === "Rx") {
-    return {
-      type: "decode",
-      ts: Number(ts),
-      snr: Number(snr),
-      dt: Number(dt),
-      af: Number(af),
-      mode,
-      message
-    };
-  }
-
-  return {
-    type: "tx",
-    ts: Number(ts),
-    af: Number(af),
-    mode,
-    message
-  };
-}
-
-function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.pid === undefined) {
-    return;
-  }
-
-  try {
-    process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
-  } catch {
-    try {
-      child.kill(signal);
-    } catch {
-      // The process may already be gone.
-    }
-  }
-}
-
-function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve(true);
-  }
-
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      child.off("exit", onExit);
-      resolve(false);
-    }, timeoutMs);
-    const onExit = () => {
-      clearTimeout(timeout);
-      resolve(true);
-    };
-    child.once("exit", onExit);
-  });
-}
-
-function canConnect(host: string, port: number, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port });
-    const done = (ok: boolean) => {
-      socket.removeAllListeners();
-      socket.destroy();
-      resolve(ok);
-    };
-    socket.setTimeout(timeoutMs, () => done(false));
-    socket.once("connect", () => done(true));
-    socket.once("error", () => done(false));
-  });
-}
-
-async function waitForConnect(host: string, port: number, timeoutMs: number): Promise<boolean> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (await canConnect(host, port, 250)) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  return false;
 }

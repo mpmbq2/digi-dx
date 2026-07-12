@@ -25,7 +25,11 @@ export const errorCodes = [
   "UDP_BIND_FAILED",
   "ENGINE_START_FAILED",
   "PROCESS_CRASHED",
-  "TX_FAILED"
+  "TX_FAILED",
+  // Engine provisioning / startup (binary-path resolution, arch, manifest).
+  "ENGINE_ARCH_UNSUPPORTED",
+  "ENGINE_MANIFEST_INVALID",
+  "ENGINE_MANIFEST_ARCH_MISMATCH"
 ] as const;
 
 export type ErrorCode = (typeof errorCodes)[number];

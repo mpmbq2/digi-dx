@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseInternalUdpLine } from "../src/daemon/engine.js";
+import { parseInternalUdpLine } from "../src/daemon/ft8-udp-parse.js";
 
 describe("parseInternalUdpLine", () => {
   // Fixtures below are real lines from a live `ft8cat -a` ALL.TXT capture,

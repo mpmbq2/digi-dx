@@ -3,3 +3,6 @@ dist/
 data/
 coverage/
 *.log
+vendor/engine/*/
+vendor/engine/manifest.json
+!vendor/engine/.gitkeep
