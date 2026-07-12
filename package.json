@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "DIGI_DX_CONFIG_PATH=./data/config.json tsx src/index.ts",
-    "start": "node dist/index.js",
+    "start": "node dist/src/index.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.ui.json",
     "ui": "tsx ui/cli.ts",

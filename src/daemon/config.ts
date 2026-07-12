@@ -2,20 +2,9 @@ import { constants } from "node:fs";
 import { access, mkdir, open, readFile, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 import { DaemonError } from "./protocol.js";
+import type { SessionConfig } from "../../core/protocol.js";
 
-export interface SessionConfig {
-  mode: "FT8";
-  device: {
-    id: number;
-    name?: string;
-  };
-  callsign: string;
-  grid: string;
-  cat: {
-    mode: "rigctld" | "dummy";
-    port: number;
-  };
-}
+export type { SessionConfig };
 
 export interface ConfigFile {
   session: SessionConfig;
