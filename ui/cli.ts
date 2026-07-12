@@ -1,99 +1,84 @@
 import readline from "node:readline";
-import { WebSocket } from "ws";
+import { DaemonClient } from "../core/daemon-client.js";
+import type { DaemonCommand, DaemonStatus } from "../core/protocol.js";
 
 const url = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8788";
 const token = process.env.DIGI_DX_AUTH_TOKEN;
 
-const ws = new WebSocket(url);
-let idCounter = 1;
+const client = new DaemonClient({ url, token, logger: log });
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: "digi-dx> " });
 rl.pause();
 
-function send(command: Record<string, unknown>): void {
-  if (ws.readyState !== WebSocket.OPEN) {
+function send(command: DaemonCommand): void {
+  if (!client.send(command)) {
     log("not connected yet");
-    return;
   }
-  const id = String(idCounter++);
-  ws.send(JSON.stringify({ id, ...command }));
 }
 
 function log(line: string): void {
   console.log(line);
 }
 
-ws.on("open", () => {
+client.on("open", () => {
   log(`connected to ${url}`);
   printHelp();
   rl.resume();
   rl.prompt();
 });
 
-ws.on("error", (error) => {
-  log(`[connection error] ${error.message}`);
-});
-
-ws.on("close", () => {
+client.on("close", () => {
   log("connection closed");
   process.exit(0);
 });
 
-ws.on("message", (raw) => {
-  const msg = JSON.parse(raw.toString());
-  renderEvent(msg);
+client.on("status", (msg) => {
+  renderStatus(msg);
+  rl.prompt();
+});
+client.on("decode", (msg) => {
+  log(`[decode] snr=${msg.snr} dt=${msg.dt} af=${msg.af} ${msg.message}`);
+  rl.prompt();
+});
+client.on("tx", (msg) => {
+  log(`[tx] af=${msg.af} ${msg.message}`);
+  rl.prompt();
+});
+client.on("tx_update", (msg) => {
+  log(`[tx_update] state=${msg.state} af=${msg.af ?? "-"} slot=${msg.slot ?? "-"} msg=${msg.message ?? "-"}`);
+  rl.prompt();
+});
+client.on("log", (msg) => {
+  log(`[${msg.level}] ${msg.message}`);
+  rl.prompt();
+});
+client.on("error", (msg) => {
+  log(`[error] ${msg.code}: ${msg.message}${msg.details ? ` ${JSON.stringify(msg.details)}` : ""}`);
+  rl.prompt();
+});
+client.on("config", (msg) => {
+  log(`[config] complete=${msg.complete} ${JSON.stringify(msg.session ?? msg.missing ?? "")}`);
+  rl.prompt();
+});
+client.on("audio_devices", (msg) => {
+  log("[audio_devices]");
+  for (const device of msg.devices) {
+    log(`  ${device.id}: ${device.name} (rate=${device.defaultSampleRate})`);
+  }
   rl.prompt();
 });
 
-function renderEvent(msg: Record<string, unknown>): void {
-  switch (msg.type) {
-    case "status": {
-      const session = msg.session as Record<string, unknown>;
-      const tx = msg.tx as Record<string, unknown>;
-      const control = msg.control as Record<string, unknown>;
-      log(
-        `[status] active=${session.active} device=${(session.device as { id?: number } | null)?.id ?? "-"} ` +
-          `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} ` +
-          `call=${session.callsign ?? "-"} grid=${session.grid ?? "-"} | ` +
-          `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"} msg=${tx.message ?? "-"} | ` +
-          `control held=${control.held} mine=${control.byThisClient}`
-      );
-      break;
-    }
-    case "decode": {
-      log(`[decode] snr=${msg.snr} dt=${msg.dt} af=${msg.af} ${msg.message}`);
-      break;
-    }
-    case "tx": {
-      log(`[tx] af=${msg.af} ${msg.message}`);
-      break;
-    }
-    case "tx_update": {
-      log(`[tx_update] state=${msg.state} af=${msg.af ?? "-"} slot=${msg.slot ?? "-"} msg=${msg.message ?? "-"}`);
-      break;
-    }
-    case "log": {
-      log(`[${msg.level}] ${msg.message}`);
-      break;
-    }
-    case "error": {
-      log(`[error] ${msg.code}: ${msg.message}${msg.details ? ` ${JSON.stringify(msg.details)}` : ""}`);
-      break;
-    }
-    case "config": {
-      log(`[config] complete=${msg.complete} ${JSON.stringify(msg.session ?? msg.missing ?? "")}`);
-      break;
-    }
-    case "audio_devices": {
-      log("[audio_devices]");
-      for (const device of msg.devices as Array<Record<string, unknown>>) {
-        log(`  ${device.id}: ${device.name} (rate=${device.defaultSampleRate})`);
-      }
-      break;
-    }
-    default:
-      log(`[${String(msg.type)}] ${JSON.stringify(msg)}`);
-  }
+client.connect();
+
+function renderStatus(msg: DaemonStatus): void {
+  const { session, tx, control } = msg;
+  log(
+    `[status] active=${session.active} device=${session.device?.id ?? "-"} ` +
+      `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} ` +
+      `call=${session.callsign ?? "-"} grid=${session.grid ?? "-"} | ` +
+      `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"} msg=${tx.message ?? "-"} | ` +
+      `control held=${control.held} mine=${control.byThisClient}`
+  );
 }
 
 function printHelp(): void {
@@ -131,7 +116,9 @@ rl.on("line", (line) => {
       send({ type: "list_audio_devices" });
       break;
     case "claim":
-      send({ type: "claim_control", ...(token ? { token } : {}) });
+      if (!client.claimControl()) {
+        log("not connected yet");
+      }
       break;
     case "release":
       send({ type: "release_control" });
@@ -200,7 +187,7 @@ rl.on("line", (line) => {
     }
     case "quit":
     case "exit":
-      ws.close();
+      client.close();
       return;
     default:
       log(`unknown command '${cmd}', type 'help' for a list`);
@@ -210,5 +197,5 @@ rl.on("line", (line) => {
 });
 
 rl.on("close", () => {
-  ws.close();
+  client.close();
 });
