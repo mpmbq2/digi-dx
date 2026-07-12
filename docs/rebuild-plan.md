@@ -228,8 +228,10 @@ W-numbers are stable IDs carried from the review; execution order is top-to-bott
 (`W1 → W4 → W2 → W5/W6`).
 
 ### W1 — `core/` foundation *(do first; foundation for the rest)*
-1. Create `core/`; move `ui/qso.ts` -> `core/qso.ts`; move `ui/web/view-model.ts` ->
-   `core/view-model.ts`. Update imports.
+1. Create `core/`; move `ui/qso.ts` -> `core/qso.ts`; update imports. **(Done.)**
+   `ui/web/view-model.ts` is **deferred to W2**: it is currently web-only and bound to
+   the browser contract in `ui/web/protocol.ts`, so moving it now would point
+   `core/ -> ui/web/` (wrong direction). It relocates once it is UI-agnostic in W2.
 2. Establish `core/protocol.ts` as the single source of truth: lift the client-facing
    message types + command union out of `src/daemon/protocol.ts` (the daemon re-exports
    them). Delete `ui/web/protocol.ts`'s duplicated shapes and the inline `msg.x as T`
@@ -258,6 +260,8 @@ W-numbers are stable IDs carried from the review; execution order is top-to-bott
 3. Reduce `tui.ts` to blessed rendering of `ControllerState` + input dispatch.
 4. Add unit tests for the controller (scheduler timing with an injected clock, survey,
    control-claim, QSO event/logging) — the logic that is untestable today.
+5. Move `ui/web/view-model.ts` -> `core/view-model.ts` once it renders from
+   `ControllerState` and is UI-agnostic (the TUI can render from it too) — the W1 deferral.
 - Closes: **#3** (untestable TUI logic), **#4** (duplicated orchestration), **#2/#8**
   (web server size/coverage), **#10** (`messageForQso` side-effect — move report
   derivation out of the render path into the controller).
