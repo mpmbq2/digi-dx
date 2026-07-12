@@ -1,7 +1,8 @@
 import blessed from "blessed";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { WebSocket } from "ws";
+import { DaemonClient } from "../core/daemon-client.js";
+import type { DaemonCommand } from "../core/protocol.js";
 import { appendQsoLog, readQsoLog } from "./qso-log.js";
 import { readTuiState, writeTuiState } from "./tui-state.js";
 import { bandForMHz, buildAdif } from "./adif.js";
@@ -36,7 +37,6 @@ let lastBandPeriod: number | null = null;
 
 let myCall = "";
 let myGrid = "";
-let idCounter = 1;
 
 // --- automation state -----------------------------------------------------
 
@@ -80,15 +80,12 @@ const PLOT_WIDTH = 24;
 // Last device id seen in a status update, used to pre-fill the save dialog.
 let lastDeviceId: number | null = null;
 
-const ws = new WebSocket(url);
+const client = new DaemonClient({ url, token, logger: appendLog });
 
-function send(command: Record<string, unknown>): void {
-  if (ws.readyState !== WebSocket.OPEN) {
+function send(command: DaemonCommand): void {
+  if (!client.send(command)) {
     appendLog("not connected yet");
-    return;
   }
-  const id = String(idCounter++);
-  ws.send(JSON.stringify({ id, ...command }));
 }
 
 // --- screen and widgets --------------------------------------------------
@@ -425,7 +422,7 @@ function toggleSession(): void {
   if (!ensureControl()) {
     return;
   }
-  send({ type: sessionActive ? "stop_session" : "start_session" });
+  send(sessionActive ? { type: "stop_session" } : { type: "start_session" });
 }
 
 function releaseControl(): void {
@@ -1314,139 +1311,113 @@ async function exportAdif(path: string): Promise<void> {
 
 // --- websocket event handling ---------------------------------------------
 
-ws.on("open", () => {
+client.on("open", () => {
   appendLog(`connected to ${url}`);
   decodeList.focus();
   screen.render();
 });
 
-ws.on("error", (error) => {
-  appendLog(`[connection error] ${error.message}`);
-});
-
-ws.on("close", () => {
+client.on("close", () => {
   appendLog("connection closed");
   screen.render();
 });
 
-ws.on("message", (raw) => {
-  const msg = JSON.parse(raw.toString());
-  handleMessage(msg);
+client.on("status", (msg) => {
+  const { session, tx, control } = msg;
+  if (session.callsign !== null) {
+    myCall = session.callsign;
+  }
+  if (session.grid !== null) {
+    myGrid = session.grid;
+  }
+  if (session.device) {
+    lastDeviceId = session.device.id;
+  }
+  controlHeld = control.held;
+  controlMine = control.byThisClient;
+  sessionActive = session.active;
+  statusBase =
+    `{bold}active{/bold}=${session.active} device=${session.device?.id ?? "-"} ` +
+    `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
+    `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`;
+  updateTxState(tx.state);
+  renderSessionButton();
+  renderStatusBar();
 });
 
-function handleMessage(msg: Record<string, unknown>): void {
-  switch (msg.type) {
-    case "status": {
-      const session = msg.session as Record<string, unknown>;
-      const tx = msg.tx as Record<string, unknown>;
-      const control = msg.control as Record<string, unknown>;
-      if (typeof session.callsign === "string") {
-        myCall = session.callsign;
-      }
-      if (typeof session.grid === "string") {
-        myGrid = session.grid;
-      }
-      const device = session.device as { id?: number } | null;
-      if (device && typeof device.id === "number") {
-        lastDeviceId = device.id;
-      }
-      controlHeld = control.held === true;
-      controlMine = control.byThisClient === true;
-      sessionActive = session.active === true;
-      statusBase =
-        `{bold}active{/bold}=${session.active} device=${(session.device as { id?: number } | null)?.id ?? "-"} ` +
-        `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
-        `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`;
-      updateTxState((tx.state as typeof latestTxState) ?? "idle");
-      renderSessionButton();
-      renderStatusBar();
-      break;
-    }
-    case "decode": {
-      const record: DecodeRecord = {
-        ts: msg.ts as number,
-        snr: msg.snr as number,
-        dt: msg.dt as number,
-        af: msg.af as number,
-        message: msg.message as string
-      };
-      decodes.push(record);
-      appendBandDecode(record);
-      screen.render();
+client.on("decode", (msg) => {
+  const record: DecodeRecord = { ts: msg.ts, snr: msg.snr, dt: msg.dt, af: msg.af, message: msg.message };
+  decodes.push(record);
+  appendBandDecode(record);
+  screen.render();
 
-      // Occupied-frequency info and the per-slot plots depend on decodes.
-      updateAfWarning();
-      renderOccupancyPlots();
+  // Occupied-frequency info and the per-slot plots depend on decodes.
+  updateAfWarning();
+  renderOccupancyPlots();
 
-      // Only touch the scheduler when a decode actually advances a QSO. An
-      // unrelated decode must not re-arm (or re-fire) the active transmission,
-      // e.g. it must not keep re-triggering CQ while we wait for a reply.
-      const events = automation.handleDecode(record, myCall, myGrid);
-      if (events.length > 0) {
-        handleQsoEvents(events);
-        // A live QSO beats surveying: if a caller just answered, stop holding.
-        cancelSurvey("answering caller");
-        scheduleAutomation();
-      }
-      break;
-    }
-    case "tx": {
-      appendLog(`[tx] af=${msg.af} ${msg.message}`);
-      appendBandTx(msg.ts as number, msg.af as number, msg.message as string);
-      if (manualOverridePending) {
-        manualOverridePending = false;
-        pendingAutomationTx = null;
-        scheduleAutomation();
-        break;
-      }
-      const result = automation.confirmTransmission(pendingAutomationTx, {
-        ts: msg.ts as number,
-        af: msg.af as number,
-        message: msg.message as string
-      });
-      if (result.matched) {
-        pendingAutomationTx = null;
-      }
-      if (result.events.length > 0) {
-        handleQsoEvents(result.events);
-      }
-      scheduleAutomation();
-      break;
-    }
-    case "tx_update":
-      appendLog(`[tx_update] state=${msg.state} af=${msg.af ?? "-"} slot=${msg.slot ?? "-"} msg=${msg.message ?? "-"}`);
-      updateTxState((msg.state as typeof latestTxState) ?? latestTxState);
-      break;
-    case "log":
-      appendLog(`[${msg.level}] ${msg.message}`);
-      break;
-    case "error": {
-      const code = String(msg.code);
-      if (code === "CONTROL_REQUIRED" || code === "CONTROL_UNAVAILABLE") {
-        appendLog("You do not have control (another client holds it)");
-      } else {
-        appendLog(`[error] ${code}: ${msg.message}${msg.details ? ` ${JSON.stringify(msg.details)}` : ""}`);
-      }
-      if (pendingAutomationTx) {
-        // Do not count this as an attempt; leave the QSO active and retry later.
-        pendingAutomationTx = null;
-        scheduleAutomation();
-      }
-      break;
-    }
-    case "config":
-      appendLog(`[config] complete=${msg.complete} ${JSON.stringify(msg.session ?? msg.missing ?? "")}`);
-      break;
-    case "audio_devices":
-      appendLog("[audio_devices]");
-      for (const device of msg.devices as Array<Record<string, unknown>>) {
-        appendLog(`  ${device.id}: ${device.name} (rate=${device.defaultSampleRate})`);
-      }
-      break;
-    default:
-      appendLog(`[${String(msg.type)}] ${JSON.stringify(msg)}`);
+  // Only touch the scheduler when a decode actually advances a QSO. An
+  // unrelated decode must not re-arm (or re-fire) the active transmission,
+  // e.g. it must not keep re-triggering CQ while we wait for a reply.
+  const events = automation.handleDecode(record, myCall, myGrid);
+  if (events.length > 0) {
+    handleQsoEvents(events);
+    // A live QSO beats surveying: if a caller just answered, stop holding.
+    cancelSurvey("answering caller");
+    scheduleAutomation();
   }
-}
+});
+
+client.on("tx", (msg) => {
+  appendLog(`[tx] af=${msg.af} ${msg.message}`);
+  appendBandTx(msg.ts, msg.af, msg.message);
+  if (manualOverridePending) {
+    manualOverridePending = false;
+    pendingAutomationTx = null;
+    scheduleAutomation();
+    return;
+  }
+  const result = automation.confirmTransmission(pendingAutomationTx, { ts: msg.ts, af: msg.af, message: msg.message });
+  if (result.matched) {
+    pendingAutomationTx = null;
+  }
+  if (result.events.length > 0) {
+    handleQsoEvents(result.events);
+  }
+  scheduleAutomation();
+});
+
+client.on("tx_update", (msg) => {
+  appendLog(`[tx_update] state=${msg.state} af=${msg.af ?? "-"} slot=${msg.slot ?? "-"} msg=${msg.message ?? "-"}`);
+  updateTxState(msg.state);
+});
+
+client.on("log", (msg) => {
+  appendLog(`[${msg.level}] ${msg.message}`);
+});
+
+client.on("daemonError", (msg) => {
+  if (msg.code === "CONTROL_REQUIRED" || msg.code === "CONTROL_UNAVAILABLE") {
+    appendLog("You do not have control (another client holds it)");
+  } else {
+    appendLog(`[error] ${msg.code}: ${msg.message}${msg.details ? ` ${JSON.stringify(msg.details)}` : ""}`);
+  }
+  if (pendingAutomationTx) {
+    // Do not count this as an attempt; leave the QSO active and retry later.
+    pendingAutomationTx = null;
+    scheduleAutomation();
+  }
+});
+
+client.on("config", (msg) => {
+  appendLog(`[config] complete=${msg.complete} ${JSON.stringify(msg.session ?? msg.missing ?? "")}`);
+});
+
+client.on("audio_devices", (msg) => {
+  appendLog("[audio_devices]");
+  for (const device of msg.devices) {
+    appendLog(`  ${device.id}: ${device.name} (rate=${device.defaultSampleRate})`);
+  }
+});
 
 // Seed the worked-callsign set from the persisted log so already-worked
 // stations are greyed in Band Activity from the first decode.
@@ -1497,3 +1468,4 @@ void loadWorkedCalls();
 renderOccupancyPlots();
 renderQsoList();
 screen.render();
+client.connect();
