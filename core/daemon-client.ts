@@ -29,7 +29,9 @@ export interface DaemonClientEvents {
   tx: [TxEvent];
   tx_update: [TxUpdateEvent];
   log: [LogEvent];
-  error: [ErrorMessage];
+  // Named daemonError, not error: Node's EventEmitter throws when an "error"
+  // event is emitted with no listener attached.
+  daemonError: [ErrorMessage];
   config: [ConfigMessage];
   audio_devices: [AudioDevicesMessage];
 }
@@ -137,7 +139,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         this.emit("log", message as LogEvent);
         break;
       case "error":
-        this.emit("error", message as ErrorMessage);
+        this.emit("daemonError", message as ErrorMessage);
         break;
       case "config":
         this.emit("config", message as ConfigMessage);

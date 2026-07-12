@@ -4,6 +4,8 @@ import { extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
+import { DaemonClient } from "../../core/daemon-client.js";
+import type { DaemonCommand } from "../../core/protocol.js";
 import { appendQsoLog, readQsoLog } from "../qso-log.js";
 import { readTuiState, writeTuiState } from "../tui-state.js";
 import { bandForMHz } from "../adif.js";
@@ -51,7 +53,6 @@ export interface WebUiServerOptions {
 
 const decodes: DecodeRecord[] = [];
 const automation = new QsoAutomation();
-let idCounter = 1;
 
 let myCall = "";
 let myGrid = "";
@@ -113,150 +114,109 @@ function appendLog(level: LogLineView["level"], text: string): void {
 
 // --- daemon connection -----------------------------------------------------
 
-let daemon: WebSocket | null = null;
-let reconnectTimer: NodeJS.Timeout | null = null;
-let shuttingDown = false;
+let daemonClient: DaemonClient | null = null;
 let controlClaimPending = false;
 
-function daemonSend(command: Record<string, unknown>): boolean {
-  if (!daemon || daemon.readyState !== WebSocket.OPEN) {
+function daemonSend(command: DaemonCommand): boolean {
+  if (!daemonClient || !daemonClient.send(command)) {
     appendLog("warn", "daemon not connected");
     return false;
   }
-  const id = String(idCounter++);
-  daemon.send(JSON.stringify({ id, ...command }));
   return true;
 }
 
 function connectDaemon(): void {
-  shuttingDown = false;
-  const socket = new WebSocket(daemonUrl);
-  daemon = socket;
-
-  socket.on("open", () => appendLog("info", `connected to daemon ${daemonUrl}`));
-  socket.on("message", (raw: RawData) => {
-    try {
-      handleDaemonMessage(JSON.parse(raw.toString()) as Record<string, unknown>);
-    } catch (error) {
-      appendLog("error", `bad daemon message: ${error instanceof Error ? error.message : String(error)}`);
-    }
+  const client = new DaemonClient({
+    url: daemonUrl,
+    token,
+    reconnectMs: 2000,
+    logger: (message) => appendLog("error", message)
   });
-  socket.on("error", (error: Error) => appendLog("error", `daemon connection error: ${error.message}`));
-  socket.on("close", () => {
-    if (daemon === socket) {
-      daemon = null;
-    }
-    if (shuttingDown) {
-      return;
-    }
+  daemonClient = client;
+
+  client.on("open", () => appendLog("info", `connected to daemon ${daemonUrl}`));
+  client.on("close", () => {
     controlHeld = false;
     controlMine = false;
     controlClaimPending = false;
     sessionActive = false;
     latestTxState = "idle";
     appendLog("warn", "daemon connection closed; retrying in 2s");
-    if (!reconnectTimer) {
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connectDaemon();
-      }, 2000);
+  });
+
+  client.on("status", (msg) => {
+    const { session, tx, control } = msg;
+    const hadControl = controlMine;
+    if (session.callsign !== null) {
+      myCall = session.callsign;
+    }
+    if (session.grid !== null) {
+      myGrid = session.grid;
+    }
+    controlHeld = control.held;
+    controlMine = control.byThisClient;
+    if (controlMine || !controlHeld) {
+      controlClaimPending = false;
+    }
+    sessionActive = session.active;
+    catConnected = session.catConnected;
+    updateTxState(tx.state);
+    if (!hadControl && controlMine) {
+      scheduleAutomation();
+    }
+    broadcastState();
+  });
+
+  client.on("decode", (msg) => {
+    const record: DecodeRecord = { ts: msg.ts, snr: msg.snr, dt: msg.dt, af: msg.af, message: msg.message };
+    decodes.push(record);
+    if (decodes.length > 2000) {
+      decodes.splice(0, decodes.length - 2000);
+    }
+    const events = automation.handleDecode(record, myCall, myGrid);
+    if (events.length > 0) {
+      handleQsoEvents(events);
+      cancelSurvey("answering caller");
+      scheduleAutomation();
+    }
+    broadcastState();
+  });
+
+  client.on("tx", (msg) => {
+    appendLog("tx", `[tx] af=${msg.af} ${msg.message}`);
+    const result = automation.confirmTransmission(pendingAutomationTx, { ts: msg.ts, af: msg.af, message: msg.message });
+    if (result.matched) {
+      activeAutomationTx = pendingAutomationTx;
+      pendingAutomationTx = null;
+    }
+    if (result.events.length > 0) {
+      handleQsoEvents(result.events);
+    }
+    scheduleAutomation();
+  });
+
+  client.on("tx_update", (msg) => updateTxState(msg.state));
+
+  client.on("log", (msg) => appendLog(msg.level, `[daemon] ${msg.message}`));
+
+  client.on("daemonError", (msg) => {
+    if (msg.code === "CONTROL_REQUIRED" || msg.code === "CONTROL_UNAVAILABLE") {
+      controlClaimPending = false;
+      appendLog("warn", "control is held by another client");
+    } else {
+      appendLog("error", `[error] ${msg.code}: ${msg.message}`);
+    }
+    if (pendingAutomationTx) {
+      pendingAutomationTx = null;
+      activeAutomationTx = null;
+      scheduledAutomationTx = null;
+      scheduleAutomation();
     }
   });
-}
 
-function handleDaemonMessage(msg: Record<string, unknown>): void {
-  switch (msg.type) {
-    case "status": {
-      const session = msg.session as Record<string, unknown>;
-      const tx = msg.tx as Record<string, unknown>;
-      const control = msg.control as Record<string, unknown>;
-      const hadControl = controlMine;
-      if (typeof session.callsign === "string") {
-        myCall = session.callsign;
-      }
-      if (typeof session.grid === "string") {
-        myGrid = session.grid;
-      }
-      controlHeld = control.held === true;
-      controlMine = control.byThisClient === true;
-      if (controlMine || !controlHeld) {
-        controlClaimPending = false;
-      }
-      sessionActive = session.active === true;
-      catConnected = session.catConnected === true;
-      updateTxState((tx.state as TxState) ?? "idle");
-      if (!hadControl && controlMine) {
-        scheduleAutomation();
-      }
-      broadcastState();
-      break;
-    }
-    case "decode": {
-      const record: DecodeRecord = {
-        ts: msg.ts as number,
-        snr: msg.snr as number,
-        dt: msg.dt as number,
-        af: msg.af as number,
-        message: msg.message as string
-      };
-      decodes.push(record);
-      if (decodes.length > 2000) {
-        decodes.splice(0, decodes.length - 2000);
-      }
-      const events = automation.handleDecode(record, myCall, myGrid);
-      if (events.length > 0) {
-        handleQsoEvents(events);
-        cancelSurvey("answering caller");
-        scheduleAutomation();
-      }
-      broadcastState();
-      break;
-    }
-    case "tx": {
-      appendLog("tx", `[tx] af=${msg.af} ${msg.message}`);
-      const result = automation.confirmTransmission(pendingAutomationTx, {
-        ts: msg.ts as number,
-        af: msg.af as number,
-        message: msg.message as string
-      });
-      if (result.matched) {
-        activeAutomationTx = pendingAutomationTx;
-        pendingAutomationTx = null;
-      }
-      if (result.events.length > 0) {
-        handleQsoEvents(result.events);
-      }
-      scheduleAutomation();
-      break;
-    }
-    case "tx_update":
-      updateTxState((msg.state as TxState) ?? latestTxState);
-      break;
-    case "log":
-      appendLog((msg.level as LogLineView["level"]) ?? "info", `[daemon] ${String(msg.message)}`);
-      break;
-    case "error": {
-      const code = String(msg.code);
-      if (code === "CONTROL_REQUIRED" || code === "CONTROL_UNAVAILABLE") {
-        controlClaimPending = false;
-        appendLog("warn", "control is held by another client");
-      } else {
-        appendLog("error", `[error] ${code}: ${String(msg.message)}`);
-      }
-      if (pendingAutomationTx) {
-        pendingAutomationTx = null;
-        activeAutomationTx = null;
-        scheduledAutomationTx = null;
-        scheduleAutomation();
-      }
-      break;
-    }
-    case "config":
-      appendLog("info", `[config] complete=${msg.complete}`);
-      break;
-    default:
-      break;
-  }
+  client.on("config", (msg) => appendLog("info", `[config] complete=${msg.complete}`));
+
+  client.connect();
 }
 
 // --- QSO event handling / logging ------------------------------------------
@@ -717,7 +677,7 @@ function handleCommand(message: CommandMessage): void {
       if (!ensureControl()) {
         return;
       }
-      daemonSend({ type: message.action === "start" ? "start_session" : "stop_session" });
+      daemonSend(message.action === "start" ? { type: "start_session" } : { type: "stop_session" });
       break;
     case "releaseControl":
       if (!controlMine) {
@@ -887,7 +847,6 @@ let started = false;
 function resetControllerState(): void {
   decodes.splice(0);
   automation.qsos.splice(0);
-  idCounter = 1;
   myCall = "";
   myGrid = "";
   dialFreqHz = null;
@@ -942,24 +901,19 @@ export async function startWebUiServer(options: WebUiServerOptions = {}): Promis
 }
 
 export async function closeWebUiServer(): Promise<void> {
-  shuttingDown = true;
   started = false;
   clearAutomationTimer();
   if (surveyTimer) {
     clearTimeout(surveyTimer);
     surveyTimer = null;
   }
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
   if (broadcastInterval) {
     clearInterval(broadcastInterval);
     broadcastInterval = null;
   }
-  if (daemon) {
-    daemon.close();
-    daemon = null;
+  if (daemonClient) {
+    daemonClient.close();
+    daemonClient = null;
   }
   for (const client of clients) {
     client.close();

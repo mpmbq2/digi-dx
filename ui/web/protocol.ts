@@ -4,8 +4,10 @@
 // these types in sync with the runtime shapes app.js reads/writes.
 
 import type { QsoStep, TxSlot } from "../../core/qso.js";
+import type { TxPublicState } from "../../core/protocol.js";
 
-export type TxState = "idle" | "pending" | "active";
+// Aliased from the daemon contract so the browser view shares core's TX state.
+export type TxState = TxPublicState;
 
 // How a decoded/heard station is coloured in the band panel and rosters.
 //  - "reply"  : the message mentions our callsign (someone answering us)

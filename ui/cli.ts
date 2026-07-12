@@ -52,7 +52,7 @@ client.on("log", (msg) => {
   log(`[${msg.level}] ${msg.message}`);
   rl.prompt();
 });
-client.on("error", (msg) => {
+client.on("daemonError", (msg) => {
   log(`[error] ${msg.code}: ${msg.message}${msg.details ? ` ${JSON.stringify(msg.details)}` : ""}`);
   rl.prompt();
 });
