@@ -4,7 +4,7 @@ type: feat
 date: 2026-07-12
 topic: engine-backend
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: requirements-only
+artifact_readiness: implementation-ready
 product_contract_source: ce-brainstorm
 execution: code
 ---
@@ -15,7 +15,8 @@ execution: code
 
 - **Objective:** Deliver the Engine backend track so brother/dad can self-install Digi-Dx on their own Linux box, operate FT8 out of the box once their radio is wired, and future engine swaps stay possible through a stable driver boundary.
 - **Product authority:** `STRATEGY.md` Engine backend track — turnkey now, swappable later.
-- **Open blockers:** Prebuilt vs compile-on-device strategy for multi-arch binaries; fresh-install friction is unvalidated until walked on real hardware.
+- **Stop conditions:** Do not start install-script work until U1–U3 (driver seam + fake-driver tests) are complete and `npm test` passes. Do not claim install success without a manual smoke walk on at least one supported arch (x86_64 first, then Pi when available).
+- **Product Contract preservation:** unchanged — planning resolves former open blockers below under Planning Contract assumptions and KTDs.
 
 ## Product Contract
 
@@ -144,6 +145,12 @@ flowchart TB
 - Multi-operator concurrent control.
 - Replacing the FT8 decoder algorithm itself (still relies on existing engine binaries).
 
+**Deferred to Follow-Up Work**
+
+- W1/W2 rebuild-plan items (`core/` protocol unification, `OperatorController` extraction) — parallel tracks, not prerequisites for engine backend.
+- Prebuilt binary release pipeline (GitHub releases / CI matrix builds) — optional fast path after compile-on-device install works.
+- W5 security hardening and W6 daemon correctness fixes from `docs/rebuild-plan.md`.
+
 ### Dependencies / Assumptions
 
 - `docs/rebuild-plan.md` §3.1 `EngineDriver` interface stub is the starting point for the seam design.
@@ -152,19 +159,336 @@ flowchart TB
 - Fresh end-to-end install has not been attempted — assumed friction points may differ from reality.
 - Operators have a Linux environment capable of running Node 20 and building or receiving engine binaries.
 
-### Outstanding Questions
-
-**Deferred to Planning**
-
-- Prebuilt per-arch binary bundles vs compile-on-device during install — trade-off between Pi install time and release-pipeline maintenance.
-- Where install script lives and how it integrates with existing npm scripts.
-- Binary licensing and redistribution constraints for `wsjtx-utils` / `jt9` bundles.
-- Whether install should pin engine binary versions or track latest compatible releases.
-
 ### Sources / Research
 
 - `STRATEGY.md` — Engine backend track definition and out-of-box first QSO metric.
 - `docs/rebuild-plan.md` — W4 sequencing rationale, `EngineDriver` interface stub, migration notes.
-- `docs/digi-dx-design-doc.md` — multi-stage Docker build notes (informative for binary bundling strategy, even though Docker install is out of scope).
+- `docs/digi-dx-design-doc.md` — engine stack composition, multi-arch build notes, wsjtx-utils tarball layout.
 - `src/daemon/engine.ts` — current monolithic subprocess implementation to extract.
-- Grounding dossier: `/tmp/compound-engineering/ce-brainstorm/engine-backend/grounding.md`
+- `test/engine-parser.test.ts`, `test/websocket.test.ts` — existing parser coverage and `FakeEngine` websocket pattern.
+
+---
+
+## Planning Contract
+
+### Sequencing
+
+Two phases, strict order:
+
+1. **Driver seam (U1–U3)** — extract interface and subprocess adapter, refactor `Engine`, add fake-driver tests. Gate for phase 2.
+2. **Turnkey install (U4–U7)** — binary resolution, install script, unified launch, UI first-run setup.
+
+### Key Technical Decisions
+
+- **KTD1 — Interface shape from rebuild plan.** Implement `EngineDriver` per `docs/rebuild-plan.md` §3.1: evented decode/tx/freq/ptt/crash; lifecycle methods `start`, `stop`, `transmit`, `cancelTransmit`, `listAudioDevices`. Driver event payloads map to existing `DecodeEvent` / `TxEvent` at the Engine boundary.
+- **KTD2 — TxState stays in Engine; grammar moves to driver.** Refactor `TxState` to call `driver.transmit(intent)` and `driver.cancelTransmit()` instead of writing stdin lines. Slot-switch waiting logic remains in `TxState`.
+- **KTD3 — Parser and subprocess code live in the driver module.** Move `parseInternalUdpLine`, spawn/teardown, UDP bind, stdout parsing, and dummy-`rigctld` handling from `engine.ts` into `ft8-cat-modem-driver.ts`. Keep `parseInternalUdpLine` exported from a stable module path so `test/engine-parser.test.ts` imports change minimally.
+- **KTD4 — Binary layout under `vendor/engine/`.** Install populates `vendor/engine/<arch>/bin/` (gitignored) with `ft8cat`, `ft8modem`, `rigctld`, and wsjtx-utils decode binaries (`jt9`, `ft8code`, `ft4code`). A manifest file `vendor/engine/manifest.json` records arch, versions, and paths. Env overrides (`DIGI_DX_FT8CAT_PATH`, etc.) remain and take precedence over vendor paths.
+- **KTD5 — Compile-on-device for v1 install.** The install script builds `ft8modem`/`ft8cat` from source (as documented in `docs/digi-dx-design-doc.md`) and fetches wsjtx-utils binaries for the detected arch. Prebuilt tarball fast path is deferred to follow-up work once compile path is validated on x86_64 and aarch64.
+- **KTD6 — npm script surface.** `npm run install-engine` runs the install script. `npm run digi -- --ui tui|web` starts daemon + selected UI (replaces remembering separate `dev`/`tui`/`web` commands for operators).
+- **KTD7 — First-run uses config completeness.** Both UIs detect incomplete session config via existing `loadConfig` completeness (`config.ts` `missing`/`complete` fields) and block session start until the operator saves callsign, grid, device, and CAT settings through the UI.
+
+### High-Level Technical Design
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant WS as websocket.ts
+  participant Eng as Engine
+  participant Tx as TxState
+  participant Drv as Ft8CatModemDriver
+  participant Sub as ft8cat/ft8modem
+
+  Client->>WS: start_session
+  WS->>Eng: start(session)
+  Eng->>Drv: start(session)
+  Drv->>Sub: spawn + UDP bind
+  Drv-->>Eng: decode / tx / freq / ptt events
+  Eng-->>WS: status + broadcast events
+
+  Client->>WS: transmit
+  WS->>Eng: transmit(intent)
+  Eng->>Tx: transmit(intent)
+  Tx->>Drv: transmit(intent)
+  Drv->>Sub: stdin line
+```
+
+```mermaid
+flowchart LR
+  subgraph install["install-engine"]
+    Detect["detect arch\nx86_64 | aarch64"]
+    Build["build ft8modem/ft8cat"]
+    Fetch["fetch wsjtx-utils\nfor arch"]
+    Write["write manifest.json"]
+  end
+  subgraph runtime["runtime"]
+    Manifest["vendor/engine/manifest.json"]
+    Driver["Ft8CatModemDriver"]
+  end
+  Detect --> Build --> Fetch --> Write --> Manifest --> Driver
+```
+
+### Assumptions
+
+- Operators run install on Debian/Ubuntu-derived Linux with `apt` for build dependencies (gcc, cmake, libasound2-dev, etc.).
+- wsjtx-utils redistribution for bundled decode binaries is acceptable for private/ham use; document source and license in install output.
+- Node/npm dependencies (`npm install`) are separate from engine install — document both steps in README.
+- Manual install smoke on real hardware is the acceptance gate for R9 until automated integration tests against real audio exist.
+
+### Open Questions
+
+**Deferred to implementation**
+
+- Exact wsjtx-utils tarball URL/version pin — resolve when writing `install-engine.sh`.
+- Whether `ft8cat` source build is bundled in v1 install or only `ft8modem` with `ft8cat` fetched separately — follow upstream KK5JY repo layout discovered during U5.
+
+---
+
+## Implementation Units
+
+### U1. EngineDriver interface and binary path types
+
+**Goal:** Define the driver contract and shared path-resolution types without changing runtime behavior.
+
+**Requirements:** R1 (partial), R2 (partial)
+
+**Dependencies:** none
+
+**Files:**
+- Create `src/daemon/engine-driver.ts`
+- Create `src/daemon/engine-binary-paths.ts`
+
+**Approach:** Port interface and event types from `docs/rebuild-plan.md` §3.1. Add `EngineBinaryPaths` (ft8cat, ft8modem, rigctld) and `resolveEngineBinaryPaths()` that reads env overrides, then `vendor/engine/manifest.json`, then PATH defaults. Export driver event-to-protocol mappers as pure functions for unit testing.
+
+**Patterns to follow:** EventEmitter usage in `src/daemon/engine.ts`; env override pattern already in `Engine` constructor.
+
+**Test scenarios:**
+- `resolveEngineBinaryPaths` prefers env override over manifest over default command name.
+- `resolveEngineBinaryPaths` throws or returns clear error when manifest arch mismatches host.
+- Driver event mapper converts a sample `DriverDecode` to `DecodeEvent` matching `test/engine-parser.test.ts` fixtures.
+
+**Verification:** Types compile under `npm run build`; new unit tests pass.
+
+---
+
+### U2. Ft8CatModemDriver extraction
+
+**Goal:** Move all subprocess engine knowledge out of `engine.ts` into the driver adapter.
+
+**Requirements:** R1, R2, R3 (driver side)
+
+**Dependencies:** U1
+
+**Files:**
+- Create `src/daemon/ft8-cat-modem-driver.ts`
+- Create `src/daemon/ft8-udp-parse.ts` (move `parseInternalUdpLine` here)
+- Modify `src/daemon/audio-devices.ts` (accept explicit ft8modem path; keep `parseFt8modemHelp` tests)
+- Modify `test/engine-parser.test.ts` (import from `ft8-udp-parse.js`)
+
+**Approach:** Lift spawn args, stdin writes for transmit/stop, stdout `TX:`/`FA:` handling, UDP listener, dummy `rigctld`, and device verification from `engine.ts`. Driver `start()` owns CAT readiness identical to today's `prepareCat`. Driver `transmit`/`cancelTransmit` encode `<af><E|O> msg` and `STOP`. `listAudioDevices()` delegates to existing `listAudioDevices()` with resolved ft8modem path.
+
+**Execution note:** Move `parseInternalUdpLine` first with tests green, then extract subprocess logic — reduces diff risk.
+
+**Patterns to follow:** Current `engine.ts` spawn/teardown (`detached`, process-group signals, `stopTimeoutMs`).
+
+**Test scenarios:**
+- Driver unit test with mocked child process: `start` emits no crash; stdout `TX: 1` emits `ptt: true`.
+- UDP fixture line produces `decode` event matching existing parser test vectors.
+- `transmit` writes expected stdin line for even/odd slot intents.
+- `stop` sends SIGTERM to process group and clears handles.
+- Dummy-rig path: when `cat.mode === "none"`, driver spawns rigctld on configured port.
+
+**Verification:** Parser tests pass unchanged behavior; new driver tests pass; no WebSocket behavior change yet.
+
+---
+
+### U3. Engine refactor and fake-driver tests
+
+**Goal:** Engine depends on injected `EngineDriver`; prove state machine is engine-agnostic.
+
+**Requirements:** R1, R3, R4, R5
+
+**Dependencies:** U2
+
+**Files:**
+- Modify `src/daemon/engine.ts`
+- Modify `src/daemon/tx-state.ts` (replace `writeLine` with driver transmit hooks)
+- Modify `src/index.ts` (inject `Ft8CatModemDriver`)
+- Modify `src/daemon/websocket.ts` (optional: delegate `listAudioDevices` through engine)
+- Create `test/engine-driver.test.ts`
+- Modify `test/websocket.test.ts` if `Engine` constructor signature changes
+
+**Approach:** Engine constructor accepts `EngineDriver`. On `start`, delegate to driver and subscribe to driver events, mapping to existing `BroadcastEvent` and snapshot fields (`freq`, `ptt`, `catConnected`). Refactor `TxState` to accept async transmit/cancel functions. On driver `crash`, emit `PROCESS_CRASHED` as today. Add `FakeEngineDriver` in tests (no subprocess) covering start/stop/transmit/cancel and synthetic decode events.
+
+**Execution note:** Covers AE4 — implement fake-driver lifecycle test before merging.
+
+**Patterns to follow:** `FakeEngine` in `test/websocket.test.ts` for websocket isolation; rebuild-plan migration notes §3.1.
+
+**Test scenarios:**
+- Covers AE4. Engine + fake driver: start → active state; inject decode event → `event` emitted; transmit → driver `transmit` called; stop → inactive.
+- Driver crash event → Engine emits `PROCESS_CRASHED` and returns to inactive.
+- Slot-switch: transmit on even then odd cancels prior slot via driver `cancelTransmit` path.
+- Existing `test/websocket.test.ts` suite passes without modification to protocol expectations.
+
+**Verification:** Full `npm test` green; `npm run build` green; manual `npm run dev` + client connect still works on author's machine with system binaries.
+
+---
+
+### U4. Engine binary manifest and path wiring
+
+**Goal:** Wire installed binaries into `Ft8CatModemDriver` through manifest resolution.
+
+**Requirements:** R7 (partial)
+
+**Dependencies:** U3
+
+**Files:**
+- Modify `src/daemon/engine-binary-paths.ts`
+- Modify `src/index.ts`
+- Create `vendor/engine/.gitkeep` and gitignore entries for `vendor/engine/*/`
+
+**Approach:** After install, `vendor/engine/manifest.json` lists absolute or repo-relative bin paths per tool. `resolveEngineBinaryPaths()` loads manifest when present. `index.ts` passes resolved paths into `Ft8CatModemDriver` options. Document manifest schema in install script comments.
+
+**Test scenarios:**
+- Manifest present with all bins → resolver returns those paths.
+- Missing manifest → falls back to env/PATH (dev machine compatibility).
+- Corrupt manifest JSON → actionable error at daemon startup.
+
+**Verification:** Unit tests for resolver; daemon starts using manifest paths when file exists.
+
+---
+
+### U5. Install script (`install-engine`)
+
+**Goal:** Single command provisions engine stack for x86_64 and aarch64 Linux.
+
+**Requirements:** R6, R7, R9 (partial)
+
+**Dependencies:** U4
+
+**Files:**
+- Create `scripts/install-engine.sh`
+- Create `scripts/engine-versions.env` (pinned upstream refs)
+- Modify `package.json` (`install-engine` script)
+- Modify `.gitignore`
+- Modify `README.md` or `docs/install.md` (operator steps: clone → npm install → install-engine)
+
+**Approach:** Bash script detects `uname -m`, installs apt build deps, clones/builds ft8modem (and ft8cat if separate), downloads wsjtx-utils arch-specific decode binaries into `vendor/engine/<arch>/bin/`, copies or links `rigctld` from `libhamlib-utils` or builds minimal rigctld, writes `manifest.json`, verifies each binary runs `-h` or `--version`. Idempotent: re-run safe. Fail fast with readable errors.
+
+**Execution note:** Prefer install/runtime smoke verification over unit coverage for this unit.
+
+**Test scenarios:**
+- Covers AE3 (partial). On x86_64 dev machine: run install → manifest exists → each binary executable.
+- Unsupported arch (e.g., armv7) exits with clear message.
+- Re-run install does not corrupt existing manifest.
+
+**Verification:** Author runs install on x86_64; `npm run digi -- --ui web` starts daemon using vendor binaries without manual PATH setup.
+
+---
+
+### U6. Unified launch command
+
+**Goal:** Second operator command starts daemon + UI via flag.
+
+**Requirements:** R8
+
+**Dependencies:** U3 (daemon stable)
+
+**Files:**
+- Create `scripts/digi-dx.ts` (or shell wrapper)
+- Modify `package.json` (`digi` script)
+
+**Approach:** Parse `--ui tui|web` (default `web` or `tui` — pick `web` for remote Pi headless + browser from laptop). Spawn daemon child (tsx `src/index.ts` with `DIGI_DX_CONFIG_PATH=./data/config.json`), then spawn UI process. Forward SIGINT/SIGTERM to both. Print listening URLs.
+
+**Test scenarios:**
+- `--ui web` starts without crash when engine binaries present.
+- `--ui tui` starts without crash in CI-less smoke (manual).
+- Unknown `--ui` value prints usage and exits non-zero.
+
+**Verification:** Manual smoke: launch command brings up daemon and UI; client connects.
+
+---
+
+### U7. UI first-run station setup
+
+**Goal:** Incomplete config prompts operator through UI before first session.
+
+**Requirements:** R10, R9 (config path)
+
+**Dependencies:** U6
+
+**Files:**
+- Modify `ui/tui.ts` (gate session start on config completeness)
+- Modify `ui/web/server.ts` and `ui/web/public/app.js` (setup panel when config incomplete)
+- Modify `src/daemon/config.ts` only if completeness checks need extension
+
+**Approach:** On connect, client loads config via existing `get_config` / config message. If `complete === false`, show setup form (callsign, grid, audio device picker from `list_audio_devices`, CAT mode/port). Save via existing config save path. Only enable Start Session when complete. TUI already has a save form — unify gating so session start is blocked until complete.
+
+**Patterns to follow:** TUI save form around lines handling callsign/grid/device; `ConfigLoadResult.missing` from `config.ts`.
+
+**Test scenarios:**
+- Covers AE2 (partial). Incomplete config → UI shows setup; session start disabled.
+- Complete config saved → session start enabled.
+- Web UI setup saves config and persists across reconnect.
+
+**Verification:** Manual walkthrough on fresh `data/config.json`; aligns with AE1 when radio wired.
+
+---
+
+## Verification Contract
+
+| Gate | Command | Applies to |
+|---|---|---|
+| Unit tests | `npm test` | U1–U4, U3 parser/driver |
+| Daemon build | `npm run build` | U1–U4 |
+| UI typecheck | `npm run typecheck` | U6–U7 |
+| Install smoke | `npm run install-engine` on clean x86_64 Linux | U5 |
+| Launch smoke | `npm run digi -- --ui web` after install | U6 |
+| End-to-end QSO smoke | Manual: install → launch → configure → session → decode + TX on wired radio | U5–U7, AE1 |
+
+---
+
+## Definition of Done
+
+**Global**
+
+- U1–U3 merged with fake-driver tests and full `npm test` / `npm run build` green.
+- U4–U6 merged; author validated install + launch on x86_64 without preinstalled ft8cat/ft8modem on PATH.
+- U7 merged; fresh config triggers UI setup before session start in both TUI and web.
+- Outward WebSocket protocol unchanged — no client contract updates required.
+- Operator docs list clone → `npm install` → `npm run install-engine` → `npm run digi -- --ui <tui|web>` flow.
+
+**Per-unit**
+
+- **U1:** Interface + path resolver tested; no runtime behavior change.
+- **U2:** Subprocess logic lives only in driver module; parser tests pass.
+- **U3:** AE4 satisfied; websocket tests pass; manual dev session works.
+- **U4:** Manifest wiring tested; vendor dir gitignored.
+- **U5:** Install produces working binaries + manifest on x86_64; aarch64 code path present (Pi validation when hardware available).
+- **U6:** Launch command documented and smoke-tested.
+- **U7:** R10 satisfied for both UIs.
+
+**Explicitly not required for this plan's DoD**
+
+- Pi hardware validation (track as follow-up smoke once brother/dad hardware confirmed).
+- Prebuilt release tarballs or CI binary matrix.
+- Docker packaging.
+
+---
+
+## Risk Analysis & Mitigation
+
+| Risk | Mitigation |
+|---|---|
+| Pi compile takes too long or fails on aarch64 | Document apt deps; test aarch64 in install script logic early; defer prebuilt fast path if compile blocks brother/dad |
+| wsjtx-utils licensing/redistribution | Ship decode binaries as fetched artifacts with license note; do not commit binaries to git |
+| Driver extraction regressions | Keep parser tests; fake-driver tests; run existing websocket tests unchanged |
+| UI first-run incomplete on web only | U7 requires both TUI and web before DoD |
+| Install idempotency breaks dev machines | Env overrides and missing-manifest PATH fallback preserve author workflow |
+
+---
+
+## Documentation Plan
+
+- Add `docs/install.md` (or README section): prerequisites, install-engine, launch, first-run setup, troubleshooting (audio group, CAT port).
+- Note radio wiring boundary: install proves engine stack; decodes require correct audio/CAT.
