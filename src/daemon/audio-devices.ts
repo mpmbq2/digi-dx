@@ -1,16 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { DaemonError } from "./protocol.js";
+import type { AudioDevice } from "../../core/protocol.js";
+
+export type { AudioDevice };
 
 const execFileAsync = promisify(execFile);
-
-export interface AudioDevice {
-  id: number;
-  name: string;
-  inputs: number;
-  outputs: number;
-  defaultSampleRate: number | null;
-}
 
 export function resolveFt8modemPath(env: NodeJS.ProcessEnv = process.env): string {
   return env.DIGI_DX_FT8MODEM_PATH || "ft8modem";

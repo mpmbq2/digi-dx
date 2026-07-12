@@ -127,3 +127,56 @@ export interface ErrorMessage {
   message: string;
   details?: unknown;
 }
+
+// --- audio + config messages -----------------------------------------------
+
+export interface AudioDevice {
+  id: number;
+  name: string;
+  inputs: number;
+  outputs: number;
+  defaultSampleRate: number | null;
+}
+
+export interface ConfigMessage {
+  type: "config";
+  id?: CommandId;
+  session: SessionConfig | null;
+  complete: boolean;
+  missing?: string[];
+  invalid?: boolean;
+  error?: string;
+}
+
+export interface AudioDevicesMessage {
+  type: "audio_devices";
+  id?: CommandId;
+  devices: AudioDevice[];
+}
+
+// Every message the daemon can push to a client, discriminated by `type`.
+export type ServerMessage =
+  | DaemonStatus
+  | DecodeEvent
+  | TxEvent
+  | TxUpdateEvent
+  | LogEvent
+  | ErrorMessage
+  | ConfigMessage
+  | AudioDevicesMessage;
+
+// --- client -> daemon commands ---------------------------------------------
+
+// The commands a client can send. The transport tags each with an `id`; the
+// daemon validates `session` shapes, so they stay loosely typed here.
+export type DaemonCommand =
+  | { type: "claim_control"; token?: string }
+  | { type: "release_control" }
+  | { type: "get_status" }
+  | { type: "get_config" }
+  | { type: "list_audio_devices" }
+  | { type: "save_config"; session: unknown }
+  | { type: "start_session"; session?: unknown }
+  | { type: "stop_session" }
+  | { type: "transmit"; af: number; slot: TxSlot; message: string }
+  | { type: "cancel_transmit" };
