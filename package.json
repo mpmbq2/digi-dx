@@ -1,0 +1,33 @@
+{
+  "name": "digi-dx",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "DIGI_DX_CONFIG_PATH=./data/config.json tsx src/index.ts",
+    "start": "node dist/src/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.ui.json",
+    "install-engine": "bash scripts/install-engine.sh",
+    "digi": "tsx scripts/digi-dx.ts",
+    "ui": "tsx ui/cli.ts",
+    "tui": "tsx ui/tui.ts",
+    "web": "tsx ui/web/server.ts"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/blessed": "^0.1.27",
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.9"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Digi-DX · Operate</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app">
+    <!-- LEFT RAIL -->
+    <aside class="rail">
+      <div class="brand">
+        <div class="brand-mark">D</div>
+        <div class="brand-text">
+          <span class="brand-name">Digi-DX</span>
+          <span class="brand-status" id="conn-status">● connecting…</span>
+        </div>
+      </div>
+
+      <div class="station-card">
+        <label class="station-row"><span>Station</span><input id="station-call" spellcheck="false" autocomplete="off"></label>
+        <label class="station-row"><span>Grid</span><input id="station-grid" spellcheck="false" autocomplete="off"></label>
+        <label class="station-row"><span>Dial</span><input id="station-dial" spellcheck="false" autocomplete="off" placeholder="14.074"></label>
+        <div class="station-divider"></div>
+        <div class="station-row"><span>Cycle</span><span class="station-val accent-blue" id="cycle-value">—</span></div>
+        <div class="station-row"><span>Radio</span><span class="station-val" id="radio-cat">—</span></div>
+      </div>
+
+      <span class="rail-label">WORKSPACE</span>
+      <nav class="rail-nav">
+        <div class="nav-item active">◉ Operate</div>
+        <div class="nav-item" title="Not in this workspace yet">▤ Log book</div>
+        <div class="nav-item" title="Not in this workspace yet">⚙ Config</div>
+        <div class="nav-item" title="Not in this workspace yet">🎚 Devices</div>
+      </nav>
+      <div class="rail-spacer"></div>
+      <button class="session-btn" id="session-btn">▶ start session</button>
+      <button class="release-btn" id="release-btn">release control</button>
+      <div class="tx-indicator" id="tx-indicator">● TX idle</div>
+    </aside>
+
+    <!-- CONTENT -->
+    <main class="content">
+
+      <!-- GLOBAL AF SPECTRUM PICKER -->
+      <section class="af-picker">
+        <div class="af-control">
+          <span class="af-title">◆ AUDIO FREQ · GLOBAL</span>
+          <div class="af-stepper">
+            <button id="af-minus" title="−25 Hz">−</button>
+            <div class="af-readout"><span id="af-value">1000</span><span class="af-hz">Hz</span></div>
+            <button id="af-plus" title="+25 Hz">+</button>
+          </div>
+          <span class="af-hint">TX marker on the <b id="af-slot-label">even</b> lane</span>
+        </div>
+        <div class="af-lanes">
+          <div class="af-lane-row">
+            <span class="af-lane-name" id="af-even-name">EVEN</span>
+            <div class="af-lane" id="af-even-lane" data-slot="even"></div>
+          </div>
+          <div class="af-lane-row">
+            <span class="af-lane-name" id="af-odd-name">ODD</span>
+            <div class="af-lane" id="af-odd-lane" data-slot="odd"></div>
+          </div>
+          <div class="af-ticks" id="af-ticks"></div>
+        </div>
+      </section>
+
+      <!-- MAIN: two columns -->
+      <div class="main-cols">
+
+        <!-- LEFT: ACTIVE + COMPLETED QSOS -->
+        <div class="col-left">
+          <section class="panel qso-panel">
+            <div class="panel-head">
+              <span class="panel-title">Active QSOs</span>
+              <span class="panel-sub">top of list wins next TX</span>
+            </div>
+            <div class="panel-body">
+              <div class="cq-card">
+                <button class="cq-play" id="cq-call" title="Call CQ">▶</button>
+                <div class="cq-text"><span class="cq-title" id="cq-title">Call CQ</span><span class="cq-sub" id="cq-sub">auto-stacks replies below</span></div>
+                <span class="spacer"></span>
+                <div class="slot-toggle" id="cq-slot-toggle">
+                  <span data-slot="even">EVEN</span><span data-slot="odd">ODD</span>
+                </div>
+                <button class="survey-btn" id="survey-btn">⟳ Survey</button>
+              </div>
+              <div id="active-qsos"></div>
+              <div class="empty-hint" id="active-empty">No active QSOs — Call CQ or double-click a station.</div>
+            </div>
+          </section>
+
+          <section class="panel completed-panel">
+            <div class="panel-head sm">
+              <span class="panel-title sm">Completed QSOs</span>
+              <span class="pill-count" id="completed-count">0</span>
+              <span class="spacer"></span>
+              <span class="panel-sub">tap a row to expand</span>
+            </div>
+            <div class="panel-body" id="completed-list"></div>
+          </section>
+        </div>
+
+        <!-- RIGHT: NOW / TX STATUS + BAND ACTIVITY -->
+        <div class="col-right">
+          <section class="now-card" id="now-card">
+            <div class="now-row">
+              <span class="now-dot" id="now-dot"></span>
+              <span class="now-label" id="now-label">TX IDLE</span>
+              <span class="now-meta" id="now-meta"></span>
+              <span class="spacer"></span>
+              <button class="tx-switch" id="tx-switch" title="Enable transmit. Toggling off lets the current TX finish, then stops.">
+                <span class="switch-track" id="switch-track"><span class="switch-knob" id="switch-knob"></span></span>
+                <span class="switch-label" id="switch-label">TX Enabled</span>
+              </button>
+              <button class="halt-btn" id="halt-btn" title="Stop transmitting immediately.">⏸ Halt TX</button>
+            </div>
+            <div class="now-row">
+              <span class="now-verb" id="now-verb">WOULD SEND</span>
+              <div class="now-msg" id="now-msg">—</div>
+            </div>
+            <div class="now-row">
+              <span class="now-verb">CYCLE</span>
+              <div class="now-cycle">
+                <div class="now-cycle-window" id="now-cycle-window"></div>
+                <div class="now-cycle-fill" id="now-cycle-fill"></div>
+                <div class="now-cycle-playhead" id="now-cycle-playhead"></div>
+              </div>
+              <span class="now-cycle-text" id="now-cycle-text">0.0s / 15.0s</span>
+            </div>
+          </section>
+
+          <section class="panel band-panel">
+            <div class="panel-head">
+              <span class="panel-title">Band activity</span>
+              <div class="sort-group">
+                <span class="sort-label">SORT</span>
+                <button class="sort-btn active" id="sort-time" data-sort="time">Time</button>
+                <button class="sort-btn" id="sort-dist" data-sort="dist">Dist</button>
+                <button class="sort-btn" id="sort-snr" data-sort="snr">SNR</button>
+              </div>
+            </div>
+            <div class="band-cols">
+              <div class="stream-col">
+                <div class="col-head">STREAM</div>
+                <div class="col-body" id="stream-list"></div>
+              </div>
+              <div class="roster-col">
+                <div class="col-head"><span class="dot even"></span>EVEN ROSTER</div>
+                <div class="col-body" id="roster-even"></div>
+              </div>
+              <div class="roster-col">
+                <div class="col-head"><span class="dot odd"></span>ODD ROSTER</div>
+                <div class="col-body" id="roster-odd"></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <!-- FOOTER LOG -->
+      <section class="log-bar" id="log-bar">
+        <div class="log-head" id="log-toggle">
+          <span class="log-title">Activity log</span>
+          <span class="log-peek" id="log-peek"></span>
+          <span class="spacer"></span>
+          <span class="log-chevron" id="log-chevron">▸ show</span>
+        </div>
+        <div class="log-lines" id="log-lines"></div>
+      </section>
+    </main>
+  </div>
+  <div class="setup-overlay" id="setup-overlay" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>
