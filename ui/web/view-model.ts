@@ -5,6 +5,7 @@
 
 import {
   messageForQso,
+  oppositeSlot,
   parseFt8Message,
   slotFromTimestamp,
   type AutomationTx,
@@ -12,9 +13,13 @@ import {
   type QsoRecord,
   type TxSlot
 } from "../../core/qso.js";
+import { FT8_SLOT_MS, type SlotClock } from "../../core/slot-clock.js";
+
+const SLOT_SECONDS = FT8_SLOT_MS / 1000;
 import type {
   ActiveQsoView,
   CompletedQsoView,
+  CycleView,
   DecodeKind,
   DecodeView,
   NowView,
@@ -89,6 +94,11 @@ export function annotateDecode(record: DecodeRecord, ctx: AnnotateContext): Deco
     message: record.message,
     from,
     grid: gridFrom(record.message),
+    // Slot parity and cycle start are pure functions of the decode's own
+    // timestamp, and decode timestamps are already in the clock's base -- so
+    // these stay correct at any scale, and the browser never has to compute them.
+    slot: slotFromTimestamp(record.ts),
+    cycleStart: Math.floor(record.ts / SLOT_SECONDS) * SLOT_SECONDS,
     kind,
     ...(color ? { color } : {})
   };
@@ -238,6 +248,28 @@ export function deriveTxCard(
     message: pending?.intent.message ?? null,
     af: pending?.intent.af ?? null,
     slot: pending?.intent.slot ?? null
+  };
+}
+
+// The browser holds no clock of its own, so the server hands it a parity plus the
+// wall instant of the next boundary. Everything scale-shaped is resolved here,
+// where core/slot-clock.ts is importable and the test suite can reach it.
+export function buildCycleView(
+  clock: SlotClock | null,
+  wallNowMs: number,
+  virtualNowMs: number
+): CycleView {
+  const parity = cycleParity(virtualNowMs);
+  if (!clock) {
+    return { parity, nextBoundaryWallMs: null, slotWallMs: null, slotSeconds: null };
+  }
+  // The next boundary is always the start of the opposite parity's slot.
+  const virtualSeconds = clock.secondsUntilSlot(oppositeSlot(parity));
+  return {
+    parity,
+    nextBoundaryWallMs: wallNowMs + clock.toWallMs(virtualSeconds * 1000),
+    slotWallMs: clock.toWallMs(clock.spec.slotMs),
+    slotSeconds: clock.spec.slotMs / 1000
   };
 }
 

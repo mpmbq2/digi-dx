@@ -2,6 +2,7 @@ import { once } from "node:events";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import { closeWebUiServer, startWebUiServer, webUiHttpServer } from "../ui/web/server.js";
+import { FT8_SLOT_MS, realtimeClockSpec } from "../core/slot-clock.js";
 
 const daemonServers: WebSocketServer[] = [];
 const browserSockets: WebSocket[] = [];
@@ -160,10 +161,16 @@ async function startMockDaemon(): Promise<MockDaemon> {
   };
 }
 
-function sendStatus(socket: WebSocket, control: { held: boolean; byThisClient: boolean }): void {
+function sendStatus(
+  socket: WebSocket,
+  control: { held: boolean; byThisClient: boolean },
+  clock = realtimeClockSpec()
+): void {
   socket.send(
     JSON.stringify({
       type: "status",
+      engine: "ft8cat",
+      clock,
       session: {
         active: true,
         mode: "FT8",

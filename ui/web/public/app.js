@@ -452,11 +452,28 @@
     if (!state) {
       return;
     }
+    // The browser does no slot arithmetic. The server publishes the parity and
+    // the wall instant of the next boundary, already corrected for whatever
+    // rate the engine is running at; we only count down to it, against our own
+    // clock corrected for skew against the server's. No scale factor and no
+    // 15-second constant live here -- this file has no build step and no test
+    // coverage, which makes it the worst possible home for that math.
     const nowMs = Date.now() + clockSkewMs;
-    const elapsed = (nowMs / 1000) % 15;
-    const remaining = Math.max(0, 15 - elapsed);
-    const parity = slotFromTimestamp(Math.floor(nowMs / 1000));
-    refs.cycleValue.textContent = `${parity.toUpperCase()} · t-${remaining.toFixed(1)}`;
+    const { parity, nextBoundaryWallMs, slotWallMs, slotSeconds } = state.cycle;
+
+    // Position within the slot, measured in wall time against a wall deadline --
+    // then reported in FT8 seconds, because an operator reasons in 15-second
+    // cycles no matter what rate the engine happens to be running at.
+    let cycleFraction = 0;
+    let remainingSeconds = null;
+    if (nextBoundaryWallMs !== null && slotWallMs) {
+      const remainingWallMs = Math.max(0, nextBoundaryWallMs - nowMs);
+      cycleFraction = clamp(1 - remainingWallMs / slotWallMs, 0, 1);
+      remainingSeconds = (remainingWallMs / slotWallMs) * slotSeconds;
+    }
+
+    const countdown = remainingSeconds === null ? "--" : `t-${remainingSeconds.toFixed(1)}`;
+    refs.cycleValue.textContent = `${parity.toUpperCase()} · ${countdown}`;
 
     const activeQso = state.qsos.active[0] ?? null;
     const message = state.now.message ?? activeQso?.nextTx ?? "No TX queued";
@@ -479,14 +496,18 @@
     refs.switchLabel.textContent = state.now.txEnabled ? "TX Enabled" : "TX Disabled";
     refs.haltBtn.textContent = state.now.txEnabled ? "⏸ Halt TX" : "▶ Resume TX";
 
-    const pct = clamp((elapsed / 15) * 100, 0, 100);
+    const pct = cycleFraction * 100;
+    const elapsedSeconds = slotSeconds === null ? null : cycleFraction * slotSeconds;
     refs.nowCycleWindow.style.background = `${visual.accent}14`;
     refs.nowCycleWindow.style.borderRight = `1px dashed ${visual.accent}55`;
     refs.nowCycleFill.style.width = `${pct}%`;
     refs.nowCycleFill.style.background = visual.live ? visual.accent : "#3a4355";
     refs.nowCycleFill.style.boxShadow = visual.live ? `0 0 10px ${visual.accent}aa` : "";
     refs.nowCyclePlayhead.style.left = `${pct}%`;
-    refs.nowCycleText.textContent = `${elapsed.toFixed(1)}s / 15.0s`;
+    refs.nowCycleText.textContent =
+      elapsedSeconds === null
+        ? "awaiting slot clock"
+        : `${elapsedSeconds.toFixed(1)}s / ${slotSeconds.toFixed(1)}s`;
 
     refs.txIndicator.textContent = visual.indicator;
     refs.txIndicator.classList.toggle("active", visual.key === "active");
@@ -578,9 +599,7 @@
     label.classList.toggle("tx", txLane);
     label.textContent = txLane ? `${slot.toUpperCase()} <` : slot.toUpperCase();
 
-    const recent = state.decodes
-      .filter((decode) => slotFromTimestamp(decode.ts) === slot)
-      .slice(-80);
+    const recent = state.decodes.filter((decode) => decode.slot === slot).slice(-80);
     for (const decode of recent) {
       const win = document.createElement("div");
       const color = decodeColor(decode);
@@ -809,12 +828,12 @@
     const rows = [...state.decodes].reverse();
     let previousCycle = null;
     for (const decode of rows) {
-      const cycle = Math.floor(decode.ts / 15) * 15;
+      const cycle = decode.cycleStart;
       if (cycle !== previousCycle) {
         previousCycle = cycle;
         const divider = document.createElement("div");
         divider.className = "cycle-divider";
-        divider.textContent = `${time(cycle)} ${slotFromTimestamp(cycle).toUpperCase()} CYCLE`;
+        divider.textContent = `${time(cycle)} ${decode.slot.toUpperCase()} CYCLE`;
         refs.streamList.append(divider);
       }
       refs.streamList.append(renderDecodeRow(decode));
@@ -1034,9 +1053,6 @@
     });
   }
 
-  function slotFromTimestamp(ts) {
-    return Math.floor(ts / 15) % 2 === 0 ? "even" : "odd";
-  }
 
   function distanceLabel(fromGrid, toGrid) {
     const miles = distanceMiles(fromGrid, toGrid);
