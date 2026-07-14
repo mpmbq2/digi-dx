@@ -10,5 +10,11 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["core/**/*.ts", "ui/**/*.ts"]
+  "include": [
+    "core/**/*.ts",
+    "ui/**/*.ts",
+    "scripts/smoke.ts",
+    "scripts/smoke-assert.ts",
+    "scripts/smoke-independence.ts"
+  ]
 }

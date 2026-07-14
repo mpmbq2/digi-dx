@@ -61,6 +61,47 @@ describe("web UI server", () => {
     await mockDaemon.nextCommand((message) => message.type === "cancel_transmit");
   });
 
+  it("headless demo claims control and starts a session without a browser", async () => {
+    const mockDaemon = await startMockDaemon({
+      initial: { active: false, callsign: null, grid: null },
+      afterClaim: { active: false, callsign: null, grid: null },
+      onCommand(command, sendStatus) {
+        if (command.type === "start_session") {
+          sendStatus(
+            { held: true, byThisClient: true },
+            {
+              active: true,
+              callsign: "QQ0DEMO",
+              grid: "FN42",
+              engine: "simulated"
+            }
+          );
+        }
+      }
+    });
+    await startWebUiServer({
+      daemonUrl: mockDaemon.url,
+      webPort: 0,
+      webHost: "127.0.0.1",
+      headless: { demo: true }
+    });
+
+    await mockDaemon.nextCommand((message) => message.type === "claim_control");
+    await mockDaemon.nextCommand((message) => message.type === "start_session" && message.demo === true);
+
+    const browser = await connectBrowser(webUrl());
+    const state = await nextBrowserState(
+      browser,
+      (message) => message.station.call === "QQ0DEMO" && message.station.sessionActive === true
+    );
+    expect(state.station).toMatchObject({
+      call: "QQ0DEMO",
+      grid: "FN42",
+      sessionActive: true,
+      demo: true
+    });
+  });
+
   it("lets the operator change the CQ transmit slot before and during CQ", async () => {
     const mockDaemon = await startMockDaemon();
     await startWebUiServer({
@@ -116,7 +157,21 @@ interface MockDaemon {
   nextCommand: (predicate: (message: Record<string, unknown>) => boolean) => Promise<Record<string, unknown>>;
 }
 
-async function startMockDaemon(): Promise<MockDaemon> {
+interface MockStatusOverrides {
+  active?: boolean;
+  callsign?: string | null;
+  grid?: string | null;
+  engine?: string;
+}
+
+async function startMockDaemon(options?: {
+  initial?: MockStatusOverrides;
+  afterClaim?: MockStatusOverrides;
+  onCommand?: (
+    command: Record<string, unknown>,
+    sendStatus: (control: { held: boolean; byThisClient: boolean }, overrides?: MockStatusOverrides) => void
+  ) => void;
+}): Promise<MockDaemon> {
   const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
   daemonServers.push(server);
   await once(server, "listening");
@@ -129,6 +184,14 @@ async function startMockDaemon(): Promise<MockDaemon> {
   const commands: Array<Record<string, unknown>> = [];
   const waiters: Array<() => void> = [];
 
+  const sendStatusTo = (
+    socket: WebSocket,
+    control: { held: boolean; byThisClient: boolean },
+    overrides: MockStatusOverrides = {}
+  ): void => {
+    sendStatus(socket, control, realtimeClockSpec(), overrides);
+  };
+
   server.on("connection", (socket) => {
     daemonClient = socket;
     socket.on("message", (raw) => {
@@ -138,10 +201,11 @@ async function startMockDaemon(): Promise<MockDaemon> {
         waiter();
       }
       if (command.type === "claim_control") {
-        sendStatus(socket, { held: true, byThisClient: true });
+        sendStatusTo(socket, { held: true, byThisClient: true }, options?.afterClaim);
       }
+      options?.onCommand?.(command, (control, overrides) => sendStatusTo(socket, control, overrides));
     });
-    sendStatus(socket, { held: false, byThisClient: false });
+    sendStatusTo(socket, { held: false, byThisClient: false }, options?.initial);
   });
 
   return {
@@ -164,22 +228,23 @@ async function startMockDaemon(): Promise<MockDaemon> {
 function sendStatus(
   socket: WebSocket,
   control: { held: boolean; byThisClient: boolean },
-  clock = realtimeClockSpec()
+  clock = realtimeClockSpec(),
+  overrides: MockStatusOverrides = {}
 ): void {
   socket.send(
     JSON.stringify({
       type: "status",
-      engine: "ft8cat",
+      engine: overrides.engine ?? "ft8cat",
       clock,
       session: {
-        active: true,
+        active: overrides.active ?? true,
         mode: "FT8",
         device: null,
         catConnected: true,
         freq: null,
         ptt: false,
-        callsign: "N1MPM",
-        grid: "FN33"
+        callsign: overrides.callsign === undefined ? "N1MPM" : overrides.callsign,
+        grid: overrides.grid === undefined ? "FN33" : overrides.grid
       },
       tx: { state: "idle", af: null, slot: null, message: null },
       control

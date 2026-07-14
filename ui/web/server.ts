@@ -47,6 +47,12 @@ export interface WebUiServerOptions {
   token?: string;
   webPort?: number;
   webHost?: string;
+  /**
+   * Headless-start path for verification (no browser). When `demo` is set,
+   * after connecting to the daemon the server claims control and starts a demo
+   * session, then resolves only once the session is live and automation can run.
+   */
+  headless?: { demo?: boolean };
 }
 
 // --- controller state ------------------------------------------------------
@@ -1038,6 +1044,47 @@ function resetControllerState(): void {
   logLines.splice(0);
 }
 
+async function waitUntil(
+  predicate: () => boolean,
+  label: string,
+  timeoutMs: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`headless: timed out waiting for ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/**
+ * Claim control and start a demo session with no browser messages.
+ * The smoke harness uses this so it drives the same QsoAutomation path as the UI.
+ */
+async function bootstrapHeadlessDemo(): Promise<void> {
+  await waitUntil(() => daemonClient?.connected === true, "daemon connection", 15_000);
+
+  if (!controlMine) {
+    if (!daemonSend({ type: "claim_control", ...(token ? { token } : {}) })) {
+      throw new Error("headless: failed to send claim_control");
+    }
+    await waitUntil(() => controlMine, "control claim", 10_000);
+  }
+
+  if (!sessionActive) {
+    appendLog("info", "[demo] headless: starting on the simulated engine — nothing is transmitted");
+    if (!daemonSend({ type: "start_session", demo: true })) {
+      throw new Error("headless: failed to send start_session");
+    }
+    await waitUntil(
+      () => sessionActive && Boolean(myCall) && Boolean(myGrid) && clock !== null,
+      "demo session",
+      15_000
+    );
+  }
+}
+
 export async function startWebUiServer(options: WebUiServerOptions = {}): Promise<void> {
   if (started) {
     return;
@@ -1058,6 +1105,10 @@ export async function startWebUiServer(options: WebUiServerOptions = {}): Promis
 
   // Keep the cycle clock and countdowns live in the browser.
   broadcastInterval = setInterval(broadcastState, 500);
+
+  if (options.headless?.demo) {
+    await bootstrapHeadlessDemo();
+  }
 
   const address = httpServer.address();
   const port = typeof address === "object" && address ? address.port : webPort;
@@ -1086,6 +1137,10 @@ export async function closeWebUiServer(): Promise<void> {
   }
   clients.clear();
   await new Promise<void>((resolve, reject) => {
+    // Force-drop keep-alives so headless smoke can exit without waiting on idle sockets.
+    if (typeof httpServer.closeAllConnections === "function") {
+      httpServer.closeAllConnections();
+    }
     httpServer.close((error) => {
       if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
         reject(error);
