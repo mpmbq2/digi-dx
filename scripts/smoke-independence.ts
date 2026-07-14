@@ -10,6 +10,10 @@ export const INDEPENDENCE_WATCHED_PATHS = [
   "src/daemon/sim-station.ts",
   "src/daemon/simulated-driver.ts",
   "test/sim-station.test.ts",
+  // Client automation + logging that decide whether a green smoke is trustworthy.
+  "core/qso.ts",
+  "ui/web/server.ts",
+  "ui/qso-log.ts",
   "scripts/smoke.ts",
   "scripts/smoke-ui.ts",
   "scripts/smoke-ui-countdown.ts",
@@ -19,7 +23,7 @@ export const INDEPENDENCE_WATCHED_PATHS = [
 
 export const NO_MERGE_BASE_MESSAGE = "cannot establish independence: no merge base.";
 export const NOT_INDEPENDENT_BANNER =
-  "not-independent-confirmation: this run touched simulator sequencing, conformance tests, or smoke scripts — a green result is not independent confirmation.";
+  "not-independent-confirmation: this run touched simulator sequencing, conformance tests, client automation, or smoke scripts — a green result is not independent confirmation.";
 
 export interface IndependenceInput {
   /** Null when git cannot resolve a merge base (shallow/detached). */
@@ -124,4 +128,23 @@ export async function checkIndependenceFromGit(cwd: string): Promise<Independenc
   }
   const changedPaths = await collectChangedPaths(cwd, mergeBase);
   return evaluateIndependence({ mergeBase, changedPaths });
+}
+
+/** Print R17 disclosure to stderr; on GitHub Actions also emit a warning annotation. */
+export function reportIndependenceBanner(result: IndependenceResult): void {
+  if (!result.banner) {
+    return;
+  }
+  console.warn(result.banner);
+  if (result.touchedWatched.length > 0) {
+    console.warn(`  touched: ${result.touchedWatched.join(", ")}`);
+  }
+  if (process.env.GITHUB_ACTIONS === "true") {
+    const detail =
+      result.touchedWatched.length > 0
+        ? `${result.banner} Touched: ${result.touchedWatched.join(", ")}`
+        : result.banner;
+    // Surface on the Checks UI so a phone reviewer cannot miss a soft disclosure.
+    console.warn(`::warning title=smoke independence::${detail}`);
+  }
 }

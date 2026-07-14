@@ -6,7 +6,7 @@ import { createConnection } from "node:net";
 import { qsoLogPathFor } from "../ui/qso-log.js";
 import { closeWebUiServer, startWebUiServer } from "../ui/web/server.js";
 import { assertExpectedDemoQso, SmokeFailure, waitForDemoQsoEntry } from "./smoke-assert.js";
-import { checkIndependenceFromGit } from "./smoke-independence.js";
+import { checkIndependenceFromGit, reportIndependenceBanner } from "./smoke-independence.js";
 import { maxUsableScale } from "../core/slot-clock.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -113,10 +113,7 @@ export async function runSmoke(options: SmokeRunOptions = {}): Promise<void> {
       fail(independence.reason ?? "independence check failed");
     }
     if (independence.banner) {
-      console.warn(independence.banner);
-      if (independence.touchedWatched.length > 0) {
-        console.warn(`  touched: ${independence.touchedWatched.join(", ")}`);
-      }
+      reportIndependenceBanner(independence);
     } else {
       console.log("independence: clean (no watched paths in committed range or working tree)");
     }

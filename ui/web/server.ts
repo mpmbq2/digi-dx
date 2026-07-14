@@ -1098,8 +1098,17 @@ export async function startWebUiServer(options: WebUiServerOptions = {}): Promis
   await loadPersistedState();
   connectDaemon();
 
-  await new Promise<void>((resolve) => {
-    httpServer.listen(webPort, webHost, () => resolve());
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      httpServer.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      httpServer.off("error", onError);
+      resolve();
+    };
+    httpServer.once("error", onError);
+    httpServer.listen(webPort, webHost, onListening);
   });
   started = true;
 

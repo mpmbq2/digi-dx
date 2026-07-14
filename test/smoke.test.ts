@@ -31,7 +31,7 @@ describe("smoke independence (R17)", () => {
   it("banners when a watched path is in the changed set", () => {
     const result = evaluateIndependence({
       mergeBase: "abc123",
-      changedPaths: ["ui/web/server.ts", "src/daemon/sim-station.ts", "README.md"]
+      changedPaths: ["docs/install.md", "src/daemon/sim-station.ts", "README.md"]
     });
     expect(result.ok).toBe(true);
     expect(result.banner).toBe(NOT_INDEPENDENT_BANNER);
@@ -56,10 +56,19 @@ describe("smoke independence (R17)", () => {
     expect(result.banner).toBe(NOT_INDEPENDENT_BANNER);
   });
 
+  it("banners when client automation paths change", () => {
+    const result = evaluateIndependence({
+      mergeBase: "abc123",
+      changedPaths: ["core/qso.ts", "ui/web/server.ts", "ui/qso-log.ts"]
+    });
+    expect(result.banner).toBe(NOT_INDEPENDENT_BANNER);
+    expect(result.touchedWatched).toEqual(["core/qso.ts", "ui/qso-log.ts", "ui/web/server.ts"]);
+  });
+
   it("produces no banner when watched paths are untouched", () => {
     const result = evaluateIndependence({
       mergeBase: "abc123",
-      changedPaths: ["ui/web/server.ts", "docs/install.md"]
+      changedPaths: ["docs/install.md", "docs/protocol.md"]
     });
     expect(result.ok).toBe(true);
     expect(result.banner).toBeNull();
