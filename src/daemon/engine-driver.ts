@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { SessionConfig } from "./config.js";
-import type { TxIntent } from "./protocol.js";
+import type { EngineKind, SlotClockSpec, TxIntent } from "./protocol.js";
 import type { AudioDevice } from "./audio-devices.js";
 import type { DecodeEvent, TxEvent } from "./protocol.js";
 
@@ -29,6 +29,13 @@ export interface EngineDriverEvents {
 }
 
 export interface EngineDriver extends EventEmitter<EngineDriverEvents> {
+  // Which engine is behind the seam. The daemon publishes this so clients can
+  // label demo mode and route the QSO log away from the operator's real one.
+  readonly kind: EngineKind;
+  // The driver owns the time base: only it knows whether time is scaled. The
+  // real driver reports a wall-anchored, scale-1 clock, which makes virtual
+  // time identical to wall time and leaves the live path unchanged.
+  clock(): SlotClockSpec;
   start(session: SessionConfig): Promise<void>;
   stop(): Promise<void>;
   transmit(intent: TxIntent): Promise<void>;

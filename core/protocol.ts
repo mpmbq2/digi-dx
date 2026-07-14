@@ -38,6 +38,20 @@ export type CommandId = string | number;
 export type TxSlot = "even" | "odd";
 export type TxPublicState = "idle" | "pending" | "active";
 
+// Which engine is behind the driver seam. Clients read this to label demo mode
+// and to keep simulated QSOs out of the operator's real log.
+export type EngineKind = "ft8cat" | "simulated";
+
+// The slot clock the daemon publishes. Clients derive every slot-dependent
+// behavior from it -- countdowns, TX windows, and automated transmit
+// scheduling -- rather than reading their own wall clock. A custom client
+// should not have to reimplement FT8 slot math to be correct.
+//
+// Defined in core/slot-clock.ts, which also owns the arithmetic; re-exported
+// here because it is part of the wire contract.
+import type { SlotClockSpec } from "./slot-clock.js";
+export type { SlotClockSpec };
+
 // Persisted session configuration. Lives here (not in src/daemon/config.ts)
 // because it is part of the wire contract: `status` carries `device`, and
 // `save_config`/`start_session` carry a full `session`. The daemon's config
@@ -72,6 +86,10 @@ export interface TxStatus {
 export interface DaemonStatus {
   type: "status";
   id?: CommandId;
+  // The engine behind the seam, and the clock it runs on. Both are properties
+  // of the driver, so they are reported whether or not a session is active.
+  engine: EngineKind;
+  clock: SlotClockSpec;
   session: {
     active: boolean;
     mode: "FT8" | null;

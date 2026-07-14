@@ -1,10 +1,11 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
+import { FT8_SLOT_MS, realtimeClockSpec } from "../core/slot-clock.js";
 import type { SessionConfig } from "../src/daemon/config.js";
-import { Engine } from "../src/daemon/engine.js";
+import { Engine, statusFromSnapshot } from "../src/daemon/engine.js";
 import type { DriverDecode, EngineDriver, EngineDriverEvents } from "../src/daemon/engine-driver.js";
 import type { AudioDevice } from "../src/daemon/audio-devices.js";
-import type { TxIntent } from "../src/daemon/protocol.js";
+import type { EngineKind, SlotClockSpec, TxIntent } from "../src/daemon/protocol.js";
 
 class FakeEngineDriver extends EventEmitter<EngineDriverEvents> implements EngineDriver {
   started = false;
@@ -12,6 +13,18 @@ class FakeEngineDriver extends EventEmitter<EngineDriverEvents> implements Engin
   transmitted: TxIntent[] = [];
   cancelCount = 0;
   session: SessionConfig | null = null;
+  readonly kind: EngineKind;
+  private readonly spec: SlotClockSpec;
+
+  constructor(kind: EngineKind = "ft8cat", spec: SlotClockSpec = realtimeClockSpec()) {
+    super();
+    this.kind = kind;
+    this.spec = spec;
+  }
+
+  clock(): SlotClockSpec {
+    return this.spec;
+  }
 
   async start(session: SessionConfig): Promise<void> {
     this.started = true;
@@ -119,6 +132,58 @@ describe("Engine with fake driver", () => {
 
     expect(engine.snapshot().state).toBe("inactive");
     expect(errors[0]).toMatchObject({ code: "PROCESS_CRASHED" });
+  });
+
+  it("publishes the driver's kind and clock on the wire status", async () => {
+    const driver = new FakeEngineDriver();
+    const engine = new Engine({ driver });
+    await engine.start(session);
+
+    const status = statusFromSnapshot(engine.snapshot(), { held: false, byThisClient: false });
+    expect(status.engine).toBe("ft8cat");
+    expect(status.clock).toEqual({ epochMs: 0, anchorWallMs: 0, slotMs: FT8_SLOT_MS, scale: 1 });
+  });
+
+  it("reports a scaled driver's clock unchanged", async () => {
+    const spec: SlotClockSpec = {
+      epochMs: 1_783_000_000_000,
+      anchorWallMs: 1_000_000,
+      slotMs: FT8_SLOT_MS,
+      scale: 20
+    };
+    const driver = new FakeEngineDriver("simulated", spec);
+    const engine = new Engine({ driver });
+    await engine.start(session);
+
+    const status = statusFromSnapshot(engine.snapshot(), { held: false, byThisClient: false });
+    expect(status.engine).toBe("simulated");
+    expect(status.clock).toEqual(spec);
+  });
+
+  it("stamps tx_update in the driver's time base, in seconds not milliseconds", async () => {
+    // TxStateOptions.now is unix seconds; SlotClock.now() is virtual
+    // milliseconds. Wiring the clock straight through would multiply every
+    // tx_update timestamp by a thousand, silently, on the wire.
+    const spec: SlotClockSpec = {
+      epochMs: 1_783_000_000_000,
+      anchorWallMs: Date.now(),
+      slotMs: FT8_SLOT_MS,
+      scale: 20
+    };
+    const driver = new FakeEngineDriver("simulated", spec);
+    const engine = new Engine({ driver });
+    const events: Array<{ type: string; ts: number }> = [];
+    engine.on("event", (event) => events.push(event as { type: string; ts: number }));
+
+    await engine.start(session);
+    await engine.transmit({ af: 1400, slot: "even", message: "CQ N1MPM FN33" });
+
+    const update = events.find((event) => event.type === "tx_update");
+    expect(update).toBeDefined();
+    // Virtual epoch is ~1.783e12 ms, i.e. ~1.783e9 seconds. A milliseconds leak
+    // would be three orders of magnitude larger than any plausible unix second.
+    expect(update?.ts).toBeGreaterThan(1_700_000_000);
+    expect(update?.ts).toBeLessThan(2_000_000_000);
   });
 
   it("cancels opposite-slot transmit via driver cancelTransmit", async () => {

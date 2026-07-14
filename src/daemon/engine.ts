@@ -1,11 +1,19 @@
 import { EventEmitter } from "node:events";
+import { SlotClock } from "../../core/slot-clock.js";
 import type { SessionConfig } from "./config.js";
 import {
   driverDecodeToEvent,
   driverTxToEvent,
   type EngineDriver
 } from "./engine-driver.js";
-import type { BroadcastEvent, DaemonStatus, TxIntent, TxStatus } from "./protocol.js";
+import type {
+  BroadcastEvent,
+  DaemonStatus,
+  EngineKind,
+  SlotClockSpec,
+  TxIntent,
+  TxStatus
+} from "./protocol.js";
 import { DaemonError } from "./protocol.js";
 import { TxState } from "./tx-state.js";
 
@@ -18,6 +26,8 @@ export interface EngineSnapshot {
   freq: number | null;
   ptt: boolean;
   tx: TxStatus;
+  engine: EngineKind;
+  clock: SlotClockSpec;
 }
 
 export interface EngineEvents {
@@ -47,6 +57,7 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
   private freq: number | null = null;
   private ptt = false;
   private txState: TxState;
+  private clock: SlotClock;
   private readonly driver: EngineDriver;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
 
@@ -54,6 +65,7 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
     super();
     this.driver = options.driver;
     this.logger = options.logger ?? console;
+    this.clock = new SlotClock(this.driver.clock());
     this.txState = this.createTxState();
     this.bindDriverEvents();
   }
@@ -65,7 +77,9 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
       catConnected: this.catConnected,
       freq: this.freq,
       ptt: this.ptt,
-      tx: this.txState.snapshot()
+      tx: this.txState.snapshot(),
+      engine: this.driver.kind,
+      clock: this.clock.spec
     };
   }
 
@@ -80,6 +94,9 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
 
     try {
       await this.driver.start(session);
+      // Re-read the clock: a driver may only anchor its time base once started.
+      // The TxState closure reads this field, so reassigning re-bases it too.
+      this.clock = new SlotClock(this.driver.clock());
       this.state = "active";
       this.catConnected = true;
       this.emit("event", { type: "log", level: "info", message: `Session started on device ${session.device.id}` });
@@ -142,7 +159,12 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
   private createTxState(): TxState {
     const txState = new TxState({
       transmit: (intent) => this.driver.transmit(intent),
-      cancelTransmit: () => this.driver.cancelTransmit()
+      cancelTransmit: () => this.driver.cancelTransmit(),
+      // TxStateOptions.now is in unix SECONDS (tx_update.ts matches
+      // DecodeEvent.ts on the wire), while SlotClock.now() is virtual
+      // MILLISECONDS. Passing the clock straight through would multiply every
+      // tx_update timestamp by a thousand, silently, on the wire.
+      now: () => Math.floor(this.clock.now() / 1000)
     });
     txState.on("txUpdate", (event) => this.emit("event", event));
     return txState;
@@ -188,6 +210,8 @@ export function statusFromSnapshot(snapshot: EngineSnapshot, control: DaemonStat
   return {
     ...(id === undefined ? {} : { id }),
     type: "status",
+    engine: snapshot.engine,
+    clock: snapshot.clock,
     session: {
       active: snapshot.state !== "inactive",
       mode: session?.mode ?? null,
