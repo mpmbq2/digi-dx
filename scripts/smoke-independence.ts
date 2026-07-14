@@ -11,6 +11,8 @@ export const INDEPENDENCE_WATCHED_PATHS = [
   "src/daemon/simulated-driver.ts",
   "test/sim-station.test.ts",
   "scripts/smoke.ts",
+  "scripts/smoke-ui.ts",
+  "scripts/smoke-ui-countdown.ts",
   "scripts/smoke-independence.ts",
   "scripts/smoke-assert.ts"
 ] as const;

@@ -13,6 +13,11 @@ import {
   classifyWatchedChanges,
   evaluateIndependence
 } from "../scripts/smoke-independence.js";
+import {
+  assertCountdownAgrees,
+  expectedFt8CountdownSeconds,
+  parseCycleCountdown
+} from "../scripts/smoke-ui-countdown.js";
 import type { QsoLogEntry } from "../core/qso.js";
 
 describe("smoke independence (R17)", () => {
@@ -34,8 +39,16 @@ describe("smoke independence (R17)", () => {
   });
 
   it("banners when smoke scripts themselves change", () => {
-    const touched = classifyWatchedChanges(["scripts/smoke.ts", "scripts/smoke-independence.ts"]);
-    expect(touched).toEqual(["scripts/smoke-independence.ts", "scripts/smoke.ts"]);
+    const touched = classifyWatchedChanges([
+      "scripts/smoke.ts",
+      "scripts/smoke-ui.ts",
+      "scripts/smoke-independence.ts"
+    ]);
+    expect(touched).toEqual([
+      "scripts/smoke-independence.ts",
+      "scripts/smoke-ui.ts",
+      "scripts/smoke.ts"
+    ]);
     const result = evaluateIndependence({
       mergeBase: "abc123",
       changedPaths: touched
@@ -84,6 +97,59 @@ describe("smoke demo-log wait (AE4)", () => {
         myCall: "N1MPM"
       })
     ).toThrow(SmokeFailure);
+  });
+});
+
+describe("smoke-ui countdown (AE1)", () => {
+  it("parses the cycle display text", () => {
+    expect(parseCycleCountdown("EVEN · t-12.3")).toEqual({
+      parity: "even",
+      remainingSeconds: 12.3
+    });
+    expect(parseCycleCountdown("ODD · t-0.5")).toEqual({
+      parity: "odd",
+      remainingSeconds: 0.5
+    });
+    expect(parseCycleCountdown("--")).toBeNull();
+  });
+
+  it("recomputes FT8 countdown from the published wall deadline", () => {
+    const cycle = {
+      parity: "even" as const,
+      nextBoundaryWallMs: 1_000_750,
+      slotWallMs: 750,
+      slotSeconds: 15
+    };
+    // Halfway through a scaled slot → 7.5 FT8 seconds remaining.
+    expect(expectedFt8CountdownSeconds(cycle, 1_000_375)).toBe(7.5);
+  });
+
+  it("accepts a display that matches the published clock", () => {
+    const cycle = {
+      parity: "odd" as const,
+      nextBoundaryWallMs: 2_000_000,
+      slotWallMs: 750,
+      slotSeconds: 15
+    };
+    const nowMs = 2_000_000 - 375;
+    expect(() =>
+      assertCountdownAgrees("ODD · t-7.5", cycle, { nowMs, toleranceFt8Seconds: 0.1 })
+    ).not.toThrow();
+  });
+
+  it("rejects a desynchronized countdown", () => {
+    const cycle = {
+      parity: "even" as const,
+      nextBoundaryWallMs: 1_000_750,
+      slotWallMs: 750,
+      slotSeconds: 15
+    };
+    expect(() =>
+      assertCountdownAgrees("EVEN · t-1.0", cycle, {
+        nowMs: 1_000_375,
+        toleranceFt8Seconds: 0.5
+      })
+    ).toThrow(/disagrees with published clock/);
   });
 });
 
