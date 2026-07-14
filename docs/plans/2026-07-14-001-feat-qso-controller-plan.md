@@ -15,7 +15,7 @@ execution: code
 
 - **Objective:** Split `core/qso.ts`'s single-file grammar/state-machine/registry bundle into independently testable modules, and give the operator a real choice of how competing active QSOs are prioritized for transmission — today's "top of the list always wins" plus a recency-aware policy that lets a fresh reply on a lower-priority QSO transmit ahead of a leader that has gone silent, with a per-QSO manual pin as an escape hatch.
 - **Authority:** Product Contract governs behavior. Planning Contract governs implementation. Where they conflict, the Product Contract wins and the conflict is surfaced, not resolved silently.
-- **Execution profile:** Four units in dependency order — correctness fixes first (so the split doesn't carry a known bug forward), then the mechanical module split, then the new scheduler, then wiring it into the automation surface and both clients.
+- **Execution profile:** Five units in dependency order — correctness fixes first (so the split doesn't carry a known bug forward), then the mechanical module split, then the new scheduler, then wiring it into the registry's automation surface, then exposing it in both clients.
 - **Stop conditions:** Stop and surface if any existing `test/ui-qso.test.ts` scenario changes behavior under the default (strict-priority) policy — this plan is additive to today's automation, not a behavior change to it.
 - **Tail ownership:** Implementer runs the Verification Contract gates. This plan's module split is a prerequisite for `docs/rebuild-plan.md`'s W2 (`OperatorController` extraction), not a replacement for it — W2 still owns pulling scheduling/timing orchestration out of `ui/web/server.ts` and `ui/tui.ts` into `core/controller.ts`.
 
@@ -36,7 +36,7 @@ This is a real, common situation, not a rare edge case: FT8 pileups routinely ha
 Separately, while reading the current implementation for this plan, two things surfaced that belong in the same pass because they sit on the same code path this plan is restructuring:
 
 1. `handleDecode`'s cold-start guard excludes a bare `"73"` from spawning a new QSO when no existing QSO matches, but not `"rrr"`/`"rr73"` — a directed `RRR`/`RR73` with no matching QSO today creates a phantom QSO sitting at the final step with no grid and no report. This is a latent correctness bug that a scheduler-visibility change would otherwise paper over (a phantom QSO would just look like one more row competing for a slot).
-2. `messageForQso` has a side effect — it writes `qso.sentReport` while formatting the outgoing message. `nextTransmission` currently calls it once, on the one QSO it already selected, so the side effect is harmless today. A scheduler that must inspect *readiness* across every active QSO to decide who transmits next would call it once per candidate, stamping `sentReport` on QSOs that don't even transmit this slot. This has to be fixed before the scheduler is introduced, not after.
+2. `messageForQso` has a side effect — it writes `qso.sentReport` while formatting the outgoing message. This is not a latent risk the scheduler would introduce: it is already live. `ui/web/view-model.ts:213` calls `messageForQso(qso)` for every non-complete active QSO on every `broadcastState()` (dozens of call sites in `ui/web/server.ts`), and `ui/tui.ts:811`'s `formatQsoRow` (called per-row on every TUI refresh) does the same. Both already stamp `sentReport` on QSOs that have never transmitted anything, on every render tick, today. A scheduler that inspects readiness across every active QSO would do the same thing `nextTransmission` already effectively does via these render paths — it doesn't create the bug, but it does mean the bug can no longer be left alone: this plan is what finally forces `previewMessage`/`commitOutgoingMessage` to exist, and both existing render call sites must move onto `previewMessage` in the same units that introduce it, not later.
 
 ### Key Decisions
 
@@ -50,7 +50,7 @@ Separately, while reading the current implementation for this plan, two things s
 
 **The split is a precursor to `docs/rebuild-plan.md`'s W2, deliberately scoped narrower than it.** W2 extracts `OperatorController` — the scheduler-timer wiring, slot-clock integration, and survey/control-claim logic currently duplicated across `ui/web/server.ts` and `ui/tui.ts`. This plan only reorganizes `core/qso.ts` itself and adds the scheduler primitive `OperatorController` will eventually depend on. `ui/web/server.ts` and `ui/tui.ts` are touched here only at the two call sites that construct `QsoAutomation` and render QSO rows — not restructured. Trying to do both in one plan would conflate a scheduling-policy decision with an orchestration-extraction decision that has its own, larger scope already recorded in `docs/rebuild-plan.md`.
 
-**Module boundary follows the four concerns, not file-size convenience.** `core/qso.ts` (785 lines) already implicitly separates into: pure grammar (`parseFt8Message`, `parseDirectedPayload`, callsign/grid predicates, `formatReport`), a pure per-QSO transition function (`advanceFromDirected`, `stepForIncomingPayload`, `messageForQso`, `stepRank`), an ordered collection with CRUD (`QsoAutomation`'s `qsos` array, `makeQso`/`insertQso`/`findQso`/`move`), and transmit selection (`nextTransmission`). Each becomes its own module so each can be unit-tested and swapped independently — the scheduler in particular needs to be testable with synthetic `QsoRecord[]` fixtures, without needing a live `QsoAutomation` instance or the FT8 grammar at all.
+**Module boundary follows the four concerns, not file-size convenience.** `core/qso.ts` (784 lines) already implicitly separates into: pure grammar (`parseFt8Message`, `parseDirectedPayload`, callsign/grid predicates, `formatReport`), a pure per-QSO transition function (`advanceFromDirected`, `stepForIncomingPayload`, `messageForQso`, `stepRank`), an ordered collection with CRUD (`QsoAutomation`'s `qsos` array, `makeQso`/`insertQso`/`findQso`/`move`), and transmit selection (`nextTransmission`). Each becomes its own module so each can be unit-tested and swapped independently — the scheduler in particular needs to be testable with synthetic `QsoRecord[]` fixtures, without needing a live `QsoAutomation` instance or the FT8 grammar at all.
 
 ### Actors
 
@@ -246,8 +246,8 @@ flowchart LR
 
 | U-ID | Title | Key files | Depends on |
 |---|---|---|---|
-| U1 | Purity and cold-start-guard fixes | `core/qso.ts`, `test/ui-qso.test.ts` | — |
-| U2 | Split `core/qso.ts` into `core/qso/` modules | `core/qso/protocol.ts`, `core/qso/qso-machine.ts`, `core/qso/registry.ts`, `core/qso/index.ts`, `ui/tui.ts`, `ui/web/server.ts`, `test/ui-qso.test.ts` | U1 |
+| U1 | Purity and cold-start-guard fixes | `core/qso.ts`, `ui/web/view-model.ts`, `ui/tui.ts`, `test/ui-qso.test.ts`, `test/web-view-model.test.ts` | — |
+| U2 | Split `core/qso.ts` into `core/qso/` modules | `core/qso/protocol.ts`, `core/qso/qso-machine.ts`, `core/qso/registry.ts`, `core/qso/index.ts`, `ui/tui.ts`, `ui/web/server.ts`, `ui/web/protocol.ts`, `ui/web/view-model.ts`, `ui/adif.ts`, `ui/qso-log.ts`, `scripts/smoke-assert.ts`, `test/ui-qso.test.ts`, `test/web-view-model.test.ts`, `test/slot-clock.test.ts`, `test/adif.test.ts`, `test/smoke.test.ts` | U1 |
 | U3 | `QsoScheduler` and the two policies | `core/qso/scheduler.ts`, `test/qso-scheduler.test.ts` | U2 |
 | U4 | Wire the scheduler and held flag into the registry | `core/qso/registry.ts`, `test/ui-qso.test.ts` | U3 |
 | U5 | Expose policy and hold in both clients | `ui/web/protocol.ts`, `ui/web/view-model.ts`, `ui/web/server.ts`, `ui/web/public/app.js`, `ui/tui.ts`, `test/web-view-model.test.ts` | U4 |
@@ -257,8 +257,8 @@ flowchart LR
 - **Goal:** Land the two correctness fixes ahead of the module split, so the split doesn't carry a known bug and the scheduler doesn't inherit a side-effecting readiness check.
 - **Requirements:** R8, R9
 - **Dependencies:** none
-- **Files:** `core/qso.ts`, `test/ui-qso.test.ts`
-- **Approach:** Split `messageForQso` into a pure `previewMessage` (computes the message and, for `report`/`r-report` steps, the would-be report value, without assignment) and have `nextTransmission` — the only call site that should mutate — assign `qso.sentReport` after selecting. Replace the `payload.type === "73"` blocklist check in `handleDecode`'s cold-start branch with the allow-list from KTD5. Keep `QsoAutomation`'s public method signatures unchanged; this unit only changes internal purity and the guard condition.
+- **Files:** `core/qso.ts`, `ui/web/view-model.ts`, `ui/tui.ts`, `test/ui-qso.test.ts`, `test/web-view-model.test.ts`
+- **Approach:** Split `messageForQso` into a pure `previewMessage` (computes the message and, for `report`/`r-report` steps, the would-be report value, without assignment) and have `nextTransmission` — the only call site that should mutate — assign `qso.sentReport` after selecting. **The two existing render-path call sites move onto `previewMessage` in this same unit, not later:** `ui/web/view-model.ts:213` (`nextTx: messageForQso(qso)` inside `buildActiveQsoView`, invoked from `ui/web/server.ts`'s `buildState` on every `broadcastState()`) and `ui/tui.ts:811` (`formatQsoRow`, called per-row on every TUI refresh). These are the two places the side effect is already live today; leaving either on `messageForQso` after the split would mean R9 stays unmet in exactly the paths that motivated fixing it. Replace the `payload.type === "73"` blocklist check in `handleDecode`'s cold-start branch with the allow-list from KTD5. Keep `QsoAutomation`'s public method signatures unchanged; this unit only changes internal purity and the guard condition.
 - **Patterns to follow:** The existing injectable-clock pattern (`now: () => Date` in the constructor) for how this codebase already separates "pure computation" from "when a side effect commits."
 - **Test scenarios:**
   - Calling the readiness/preview function on a QSO at the `report` step twice does not change `qso.sentReport`.
@@ -267,30 +267,31 @@ flowchart LR
   - A directed `RR73` with no matching QSO produces no events and creates no QSO.
   - A directed `73` with no matching QSO still produces no events (regression check — behavior must be unchanged, only the mechanism changes from blocklist to allow-list).
   - A directed `grid` or `report` with no matching QSO still creates a new QSO exactly as today (regression check on the allow-list's positive side).
-- **Verification:** `npm test` green, including new scenarios above; no existing `test/ui-qso.test.ts` assertion changes.
+  - Rendering a QSO's row/view-model (`buildActiveQsoView`, `formatQsoRow`) for display does not mutate `sentReport` on any QSO that hasn't actually transmitted.
+- **Verification:** `npm test` green, including new scenarios above and `test/web-view-model.test.ts`; no existing `test/ui-qso.test.ts` assertion changes.
 
 ### U2. Split `core/qso.ts` into `core/qso/` modules
 
 - **Goal:** Mechanical extraction into the four modules from KTD1, with no behavior change.
 - **Requirements:** R10, R11, R12, R14
 - **Dependencies:** U1
-- **Files:** `core/qso/protocol.ts`, `core/qso/qso-machine.ts`, `core/qso/registry.ts`, `core/qso/index.ts`, `ui/tui.ts`, `ui/web/server.ts`, `test/ui-qso.test.ts`
-- **Approach:** Move `parseFt8Message`, `parseDirectedPayload`, `isCallsign`, `isGrid`, `formatReport`, `normalizeToken`, `normalizeMessage` into `protocol.ts`. Move `previewMessage`/`commitOutgoingMessage` (from U1), `stepForIncomingPayload`, `stepRank`, `updateReportsFromPayload`, `payloadGrid`, and the standalone slot helpers (`slotFromTimestamp`, `oppositeSlot`, `secondsUntilNextSlot`) into `qso-machine.ts` — these are the pure per-QSO/per-message functions with no collection state. Move the `QsoAutomation` class, `findOccupiedAf`, `suggestClearAf`, `renderOccupancyBar` (registry/collection-adjacent utilities operating on `DecodeRecord[]`/`QsoRecord[]`) into `registry.ts`. `index.ts` re-exports the full existing public surface so `core/qso.ts`'s current external contract is preserved at one import path. Delete `core/qso.ts`; update the two import sites (`ui/tui.ts:23`, `ui/web/server.ts:23`) to `../core/qso/index.js` / `../../core/qso/index.js`.
+- **Files:** `core/qso/protocol.ts`, `core/qso/qso-machine.ts`, `core/qso/registry.ts`, `core/qso/index.ts`, `ui/tui.ts`, `ui/web/server.ts`, `ui/web/protocol.ts`, `ui/web/view-model.ts`, `ui/adif.ts`, `ui/qso-log.ts`, `scripts/smoke-assert.ts`, `test/ui-qso.test.ts`, `test/web-view-model.test.ts`, `test/slot-clock.test.ts`, `test/adif.test.ts`, `test/smoke.test.ts`
+- **Approach:** Move `parseFt8Message`, `parseDirectedPayload`, `isCallsign`, `isGrid`, `formatReport`, `normalizeToken`, `normalizeMessage` into `protocol.ts`. Move `previewMessage`/`commitOutgoingMessage` (from U1), `stepForIncomingPayload`, `stepRank`, `standardStepOrder`, `updateReportsFromPayload`, `payloadGrid`, and the standalone slot helpers (`slotFromTimestamp`, `oppositeSlot`, `secondsUntilNextSlot`) into `qso-machine.ts` — these are the pure per-QSO/per-message functions with no collection state. `standardStepOrder` lives here (it's what `stepRank` generalizes) and is imported by `registry.ts`, which still needs it for `moveStep`. Move the `QsoAutomation` class, `findOccupiedAf`, `suggestClearAf`, `renderOccupancyBar` (registry/collection-adjacent utilities operating on `DecodeRecord[]`/`QsoRecord[]`) into `registry.ts`. `index.ts` re-exports the full existing public surface so `core/qso.ts`'s current external contract is preserved at one import path. Delete `core/qso.ts`; **every** import site updates to `../core/qso/index.js` (adjusting relative depth per file) — this is not limited to the two automation-construction sites. A repo-wide check of `from ".*core/qso\.js"` at plan-time found twelve: `ui/tui.ts`, `ui/web/server.ts`, `ui/web/protocol.ts`, `ui/web/view-model.ts`, `ui/adif.ts`, `ui/qso-log.ts`, `scripts/smoke-assert.ts`, `test/ui-qso.test.ts`, `test/web-view-model.test.ts`, `test/slot-clock.test.ts`, `test/adif.test.ts`, `test/smoke.test.ts` — treat this as the floor, not the ceiling; re-run the grep before editing in case new sites were added since this plan was written.
 - **Patterns to follow:** `core/` is already the shared, framework-agnostic layer per `docs/rebuild-plan.md` §2 — this unit deepens that layout rather than introducing a new one. `test/ui-qso.test.ts`'s existing import block is the map of the public surface `index.ts` must preserve.
 - **Test scenarios:**
   - Every existing `test/ui-qso.test.ts` test passes unmodified against the new import path.
   - `core/qso/protocol.ts` has zero imports from `core/qso/registry.ts` or `core/qso/scheduler.ts`.
   - `core/qso/qso-machine.ts` has zero imports from `core/qso/registry.ts`.
-  - `npm run build` and `npm run typecheck` both clean with no lingering reference to a deleted `core/qso.ts` path anywhere in `src/` or `ui/`.
-- **Verification:** `npm test`, `npm run build`, `npm run typecheck` all green; `grep -rn "core/qso\.js"` (the old single-file import) returns no matches outside this plan's own history.
+  - `npm run build` and `npm run typecheck` both clean with no lingering reference to a deleted `core/qso.ts` path anywhere in the repo — not just `src/` or `ui/`.
+- **Verification:** `npm test`, `npm run build`, `npm run typecheck` all green; `grep -rn "core/qso\.js"` (the old single-file import) returns no matches anywhere in the repo, including `scripts/` and `test/`.
 
 ### U3. `QsoScheduler` and the two policies
 
-- **Goal:** A scheduler primitive, testable in complete isolation, implementing R1–R5.
+- **Goal:** A scheduler primitive, testable in complete isolation, implementing R1–R5 and R13.
 - **Requirements:** R1, R2, R3, R4, R5, R13
 - **Dependencies:** U2
 - **Files:** `core/qso/scheduler.ts`, `test/qso-scheduler.test.ts`
-- **Approach:** Define `QsoScheduler` (`selectNext(ready: QsoRecord[], ctx: SchedulerContext): QsoRecord | null`), `SchedulerContext` (`{ staleAfterAttempts: number }`), `isStalled` (KTD4), `StrictPriorityScheduler`, `RecencyAwareScheduler`. Both strategies apply the held pre-filter (KTD2/KTD3 area — held check happens once, likely factored into a shared `selectHeld(ready)` helper both strategies call first, to avoid duplicating the pre-filter logic). `RecencyAwareScheduler.selectNext` filters `ready` to non-stalled, returns the first (priority order) if any, else falls back to `ready[0]`. Export a default `staleAfterAttempts` constant (proposed: 2) for callers that don't specify one.
+- **Approach:** Define `QsoScheduler` (`selectNext(ready: QsoRecord[], ctx: SchedulerContext): QsoRecord | null`), `SchedulerContext` (`{ staleAfterAttempts: number }`), `isStalled` (KTD4), `StrictPriorityScheduler`, `RecencyAwareScheduler`. Both strategies apply the held pre-filter (see Key Decisions — "A held QSO is a pre-filter both policies share, not a third policy" — held check happens once, likely factored into a shared `selectHeld(ready)` helper both strategies call first, to avoid duplicating the pre-filter logic). `RecencyAwareScheduler.selectNext` filters `ready` to non-stalled, returns the first (priority order) if any, else falls back to `ready[0]`. Export a default `staleAfterAttempts` constant (proposed: 2) for callers that don't specify one.
 - **Patterns to follow:** `core/slot-clock.ts`'s style of a small, pure, exhaustively-tested primitive with no side effects and no I/O — the closest existing precedent in this codebase for a component this plan wants the scheduler to resemble.
 - **Test scenarios:**
   - Covers AE1. `staleAfterAttempts = 2`, leader stalled at 2, second QSO fresh (0 attempts on its step) — `RecencyAwareScheduler` selects the second.
@@ -343,7 +344,7 @@ flowchart LR
 | Unit and integration tests | `npm test` | U1–U5 | All suites green, including existing `test/ui-qso.test.ts` with zero behavioral diffs under the default policy |
 | Daemon/core build | `npm run build` | U2 | `tsc` clean over `src/` + `core/` |
 | Client types | `npm run typecheck` | U2, U5 | `tsc` clean over `core/ + ui/` — the only gate `ui/tui.ts`'s change gets |
-| Import boundary check | `grep -rn "from \"\.\./core/qso\.js\"\|from \"\.\./\.\./core/qso\.js\"` `ui/` `src/` | U2 | No matches (old single-file import path fully retired) |
+| Import boundary check | `grep -rln "core/qso\.js"` over the whole repo (not scoped to `ui/`/`src/` — twelve real sites span `ui/`, `scripts/`, and `test/`) | U2 | No matches (old single-file import path fully retired) |
 
 No hardware regression gate applies — this plan touches no driver, transport, or CAT code; it is entirely within `core/qso*` and the two clients' QSO-list rendering.
 
