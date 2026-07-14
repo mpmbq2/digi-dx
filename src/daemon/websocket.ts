@@ -2,6 +2,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import { loadConfig, saveConfig, validateSessionConfig, type SessionConfig } from "./config.js";
 import { listAudioDevices, type AudioDevice } from "./audio-devices.js";
 import { type EngineApi, statusFromSnapshot } from "./engine.js";
+import { isNonAssignableCallsign } from "./sim-station.js";
+import { demoSessionConfig } from "./simulated-driver.js";
 import {
   DaemonError,
   getCommandId,
@@ -19,6 +21,9 @@ export interface DaemonWebSocketOptions {
   host?: string;
   authToken?: string;
   configPath?: string;
+  // Force every session onto the simulated engine. This is the headless path the
+  // verification commands use; the UI path does not depend on it.
+  forceSimulated?: boolean;
   listAudioDevices?: () => Promise<AudioDevice[]>;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -180,16 +185,31 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
     });
   }
 
+  function assertPersistableSession(session: SessionConfig): void {
+    // Demo identities are intentionally valid SessionConfigs so the simulated
+    // driver can start. They must never land on disk: a persisted QQ callsign
+    // or simulated device id would satisfy CONFIG_REQUIRED forever and key the
+    // next real session on a fabricated station.
+    if (isNonAssignableCallsign(session.callsign) || session.device.id === demoSessionConfig().device.id) {
+      throw new DaemonError("CONFIG_INVALID", "demo station identity cannot be saved as config", {
+        callsign: session.callsign,
+        deviceId: session.device.id
+      });
+    }
+  }
+
   async function handleSaveConfig(client: WebSocket, command: Record<string, unknown>, id?: CommandId): Promise<void> {
     if (options.engine.snapshot().state !== "inactive") {
       throw new DaemonError("SESSION_ALREADY_ACTIVE", "config cannot be saved while a session is active");
     }
 
-    const session = await saveConfig(command.session, options.configPath);
+    const session = validateSessionConfig(command.session);
+    assertPersistableSession(session);
+    const saved = await saveConfig(session, options.configPath);
     send(client, {
       ...(id === undefined ? {} : { id }),
       type: "config",
-      session,
+      session: saved,
       complete: true
     });
   }
@@ -204,9 +224,25 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
       return;
     }
 
+    // Demo mode. The gate that blocks a radio-less start is here, not in the web
+    // UI -- the UI's configComplete check is only an advisory pre-check, and a
+    // UI-only change would leave demo mode unable to start at all.
+    if (command.demo === true || options.forceSimulated) {
+      // Synthesized in memory and handed straight to the engine. It is NEVER
+      // routed through saveConfig: a demo config on disk would be a complete,
+      // valid config, permanently satisfying the CONFIG_REQUIRED gate -- and the
+      // next real session would key the operator's actual rig on a fabricated
+      // callsign, a device that does not exist, and a dummy CAT block.
+      const session = demoSessionConfig();
+      await options.engine.start(session, "simulated");
+      broadcastStatus(client, id);
+      return;
+    }
+
     let session: SessionConfig;
     if (command.session !== undefined) {
       session = validateSessionConfig(command.session);
+      assertPersistableSession(session);
       await saveConfig(session, options.configPath);
     } else {
       const loaded = await loadConfig(options.configPath);
@@ -218,7 +254,7 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
       session = loaded.session;
     }
 
-    await options.engine.start(session);
+    await options.engine.start(session, "ft8cat");
     broadcastStatus(client, id);
   }
 

@@ -3,7 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DaemonClient } from "../core/daemon-client.js";
 import type { DaemonCommand } from "../core/protocol.js";
-import { appendQsoLog, readQsoLog } from "./qso-log.js";
+import { appendQsoLog, qsoLogPathFor, readQsoLog } from "./qso-log.js";
 import { readTuiState, writeTuiState } from "./tui-state.js";
 import { bandForMHz, buildAdif } from "./adif.js";
 import {
@@ -13,7 +13,6 @@ import {
   parseFt8Message,
   QsoAutomation,
   renderOccupancyBar,
-  secondsUntilNextSlot,
   slotFromTimestamp,
   suggestClearAf,
   type AutomationTx,
@@ -22,6 +21,8 @@ import {
   type QsoRecord,
   type TxSlot
 } from "../core/qso.js";
+import { SlotClock } from "../core/slot-clock.js";
+import type { EngineKind } from "../core/protocol.js";
 
 const url = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8788";
 const token = process.env.DIGI_DX_AUTH_TOKEN;
@@ -40,7 +41,24 @@ let myGrid = "";
 
 // --- automation state -----------------------------------------------------
 
-const automation = new QsoAutomation();
+// The daemon is the authority on slot timing. We adopt the clock it publishes and
+// derive every slot decision from it. There is deliberately no wall-clock
+// fallback: before the first status, and after a reconnect, we have no clock, and
+// a silent `Date.now()` fallback is exactly the bug a scaled clock would hide.
+let clock: SlotClock | null = null;
+
+function requireClock(): SlotClock {
+  if (!clock) {
+    throw new Error("slot clock unavailable: no status received from the daemon yet");
+  }
+  return clock;
+}
+
+// Late-bound over the clock we adopt, and it throws rather than reaching for
+// `Date.now()` -- this is the one place that decides every logged QSO's
+// timestamp. Safe because the daemon sends a status on connect, before any
+// decode can arrive.
+const automation = new QsoAutomation(() => new Date(requireClock().now()));
 let selectedQsoId: string | null = null;
 let pendingAutomationTx: AutomationTx | null = null;
 let automationTimer: NodeJS.Timeout | null = null;
@@ -71,6 +89,9 @@ const workedCalls = new Set<string>();
 const SURVEY_LO_HZ = 300;
 const SURVEY_HI_HZ = 2700;
 const SURVEY_DECODE_LAG_SECONDS = 5;
+// Virtual seconds of lead before the slot opens, so it scales with the clock.
+const AUTOMATION_LEAD_SECONDS = 2;
+let engineKind: EngineKind = "ft8cat";
 let surveyActive = false;
 let surveySlot: TxSlot | null = null;
 let surveyStartSec = 0;
@@ -646,9 +667,15 @@ function appendBandTx(ts: number, af: number, message: string): void {
 // messages so the countdown stays live.
 
 function clockSegment(): string {
-  const nowSec = Math.floor(Date.now() / 1000);
+  if (!clock) {
+    return "{grey-fg}awaiting slot clock{/grey-fg}";
+  }
+  // Virtual seconds, not wall seconds: decode timestamps and the countdown must
+  // agree, and under a scaled engine only one of those is wall time.
+  const nowSec = Math.floor(clock.now() / 1000);
+  const slotSeconds = clock.spec.slotMs / 1000;
   const parity = slotFromTimestamp(nowSec);
-  const remain = 15 - (nowSec % 15);
+  const remain = slotSeconds - (nowSec % slotSeconds);
   let tx: string;
   if (surveyActive) {
     const left = Math.max(0, surveyEndSec - nowSec);
@@ -667,7 +694,11 @@ function renderStatusBar(): void {
   const qrg = dialFreqHz
     ? `{green-fg}${(dialFreqHz / 1e6).toFixed(3)}MHz{/green-fg}`
     : "{yellow-fg}unset{/yellow-fg}";
-  statusBar.setContent(`${statusBase}  ||  ${clockSegment()}  ||  QRG=${qrg}`);
+  // Unmissable: a simulated QSO that an operator mistakes for a real one gets
+  // logged, and a fabricated contact uploaded to LoTW cannot be taken back.
+  const demo =
+    engineKind === "simulated" ? "{black-fg}{yellow-bg} DEMO — NOT ON THE AIR {/}  ||  " : "";
+  statusBar.setContent(`${demo}${statusBase}  ||  ${clockSegment()}  ||  QRG=${qrg}`);
   screen.render();
 }
 
@@ -870,7 +901,7 @@ async function logCompletedQso(qso: QsoRecord, reason: string): Promise<void> {
   }
   loggedQsoIds.add(qso.id);
   try {
-    await appendQsoLog(entry);
+    await appendQsoLog(entry, qsoLogPathFor(engineKind));
     workedCalls.add(entry.theirCall);
     appendLog(`[qso-log] wrote ${entry.theirCall}${dialFreqHz ? ` @${(dialFreqHz / 1e6).toFixed(3)}MHz` : " (no freq set)"}`);
   } catch (error) {
@@ -965,7 +996,7 @@ function scheduleAutomation(): void {
   renderQsoList();
   updateAfWarning();
 
-  if (surveyActive || manualOverridePending || latestTxState === "active") {
+  if (!sessionActive || surveyActive || manualOverridePending || latestTxState === "active") {
     return;
   }
 
@@ -979,14 +1010,22 @@ function scheduleAutomation(): void {
     return;
   }
 
-  const seconds = secondsUntilNextSlot(tx.intent.slot);
-  const delayMs = Math.max(0, (seconds - 2) * 1000);
-  automationTimer = setTimeout(() => sendAutomatedTx(tx), delayMs);
+  if (!clock) {
+    appendLog("[automation] paused: awaiting the slot clock from the daemon");
+    return;
+  }
+
+  // Arm two virtual seconds before the slot opens. The clock converts that
+  // virtual lead into the wall delay setTimeout actually needs.
+  automationTimer = setTimeout(
+    () => sendAutomatedTx(tx),
+    clock.wallDelayUntilSlot(tx.intent.slot, AUTOMATION_LEAD_SECONDS)
+  );
 }
 
 function sendAutomatedTx(tx: AutomationTx): void {
   automationTimer = null;
-  if (surveyActive || manualOverridePending || latestTxState === "active") {
+  if (!sessionActive || surveyActive || manualOverridePending || latestTxState === "active") {
     return;
   }
   const af = currentAfOrNull();
@@ -1018,7 +1057,7 @@ function startSurvey(): void {
 
   surveyActive = true;
   surveySlot = slot;
-  surveyStartSec = Math.floor(Date.now() / 1000);
+  surveyStartSec = clock ? Math.floor(clock.now() / 1000) : 0;
 
   // Stop transmitting so the radio can actually hear its own TX slot: drop any
   // armed timer and cancel a queued (not yet keyed) automated transmit.
@@ -1028,16 +1067,26 @@ function startSurvey(): void {
     pendingAutomationTx = null;
   }
 
+  if (!clock) {
+    appendLog("[survey] unavailable: awaiting the slot clock from the daemon");
+    surveyActive = false;
+    return;
+  }
+
   // Wait for the next full receive cycle of this parity, plus decode latency.
-  const delaySec = secondsUntilNextSlot(slot) + 15 + SURVEY_DECODE_LAG_SECONDS;
-  surveyEndSec = surveyStartSec + delaySec;
+  // That is a negative offset -- past the boundary, not before it -- and the slot
+  // length comes from the clock, never a literal 15.
+  const slotSeconds = clock.spec.slotMs / 1000;
+  const pastBoundary = slotSeconds + SURVEY_DECODE_LAG_SECONDS;
+  const delaySec = clock.secondsUntilSlot(slot) + pastBoundary;
+  surveyEndSec = clock.virtualDeadlineAfter(delaySec);
   appendLog(`[survey] holding TX ~${delaySec}s to listen on the ${slot} slot`);
   updateSurveyButton();
   renderStatusBar();
   if (surveyTimer) {
     clearTimeout(surveyTimer);
   }
-  surveyTimer = setTimeout(finishSurvey, delaySec * 1000);
+  surveyTimer = setTimeout(finishSurvey, clock.wallDelayUntilSlot(slot, -pastBoundary));
 }
 
 function finishSurvey(): void {
@@ -1326,12 +1375,41 @@ client.on("open", () => {
 });
 
 client.on("close", () => {
+  sessionActive = false;
+  clock = null;
+  engineKind = "ft8cat";
+  clearAutomationTimer();
+  automation.qsos.splice(0);
   appendLog("connection closed");
   screen.render();
 });
 
 client.on("status", (msg) => {
   const { session, tx, control } = msg;
+  const previousActive = sessionActive;
+  const previousKind = engineKind;
+  const previousClock = clock;
+
+  // Adopt the daemon's clock. Any field change (not just scale) can move the
+  // next boundary, so drop timers rather than leaving them at a stale anchor.
+  const clockDirty =
+    previousClock === null ||
+    previousClock.spec.epochMs !== msg.clock.epochMs ||
+    previousClock.spec.anchorWallMs !== msg.clock.anchorWallMs ||
+    previousClock.spec.slotMs !== msg.clock.slotMs ||
+    previousClock.spec.scale !== msg.clock.scale;
+  clock = new SlotClock(msg.clock);
+  engineKind = msg.engine;
+
+  const sessionEnded = previousActive && !session.active;
+  const kindChanged = previousKind !== msg.engine;
+  if (sessionEnded || kindChanged) {
+    clearAutomationTimer();
+    automation.qsos.splice(0);
+  } else if (clockDirty) {
+    clearAutomationTimer();
+  }
+
   if (session.callsign !== null) {
     myCall = session.callsign;
   }
@@ -1349,6 +1427,9 @@ client.on("status", (msg) => {
     `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
     `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`;
   updateTxState(tx.state);
+  if (sessionActive && (clockDirty || (kindChanged && !sessionEnded))) {
+    scheduleAutomation();
+  }
   renderSessionButton();
   renderStatusBar();
 });

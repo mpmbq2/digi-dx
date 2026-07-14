@@ -2,6 +2,7 @@ node_modules/
 dist/
 data/
 coverage/
+artifacts/
 *.log
 vendor/engine/*/
 vendor/engine/manifest.json

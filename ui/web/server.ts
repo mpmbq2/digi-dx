@@ -5,15 +5,14 @@ import { fileURLToPath } from "node:url";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { DaemonClient } from "../../core/daemon-client.js";
-import type { DaemonCommand } from "../../core/protocol.js";
-import { appendQsoLog, readQsoLog } from "../qso-log.js";
+import type { DaemonCommand, EngineKind } from "../../core/protocol.js";
+import { appendQsoLog, qsoLogPathFor, readQsoLog } from "../qso-log.js";
 import { readTuiState, writeTuiState } from "../tui-state.js";
 import { bandForMHz } from "../adif.js";
 import {
   QsoAutomation,
   oppositeSlot,
   parseFt8Message,
-  secondsUntilNextSlot,
   slotFromTimestamp,
   suggestClearAf,
   type AutomationTx,
@@ -22,12 +21,13 @@ import {
   type QsoRecord,
   type TxSlot
 } from "../../core/qso.js";
+import { SlotClock } from "../../core/slot-clock.js";
 import {
   annotateDecode,
   buildActiveQsoView,
   buildCompletedView,
+  buildCycleView,
   buildRosters,
-  cycleParity,
   deriveTxCard,
   gridFrom,
   latestSlotAfs,
@@ -47,12 +47,24 @@ export interface WebUiServerOptions {
   token?: string;
   webPort?: number;
   webHost?: string;
+  /**
+   * Headless-start path for verification (no browser). When `demo` is set,
+   * after connecting to the daemon the server claims control and starts a demo
+   * session, then resolves only once the session is live and automation can run.
+   */
+  headless?: { demo?: boolean };
 }
 
 // --- controller state ------------------------------------------------------
 
 const decodes: DecodeRecord[] = [];
-const automation = new QsoAutomation();
+// The automation is constructed once, at module load, long before any clock
+// arrives -- so its timestamp source is a late-bound closure over the clock we
+// adopt from the daemon. It throws rather than reaching for `Date.now()`: this
+// is the one place that decides every logged QSO's timestamp, and a silent
+// wall-time fallback here would log a scaled QSO in the wrong time base. Safe
+// because the daemon sends a status on connect, before any decode can arrive.
+const automation = new QsoAutomation(() => new Date(requireClock().now()));
 
 let myCall = "";
 let myGrid = "";
@@ -70,6 +82,21 @@ let latestTxState: TxState = "idle";
 let pendingAutomationTx: AutomationTx | null = null;
 let activeAutomationTx: AutomationTx | null = null;
 let scheduledAutomationTx: AutomationTx | null = null;
+// The daemon is the authority on slot timing. We hold the clock it publishes and
+// derive every slot decision from it -- countdowns, TX windows, and the automation
+// timer. There is deliberately no wall-clock fallback: before the first status
+// message, and again after a reconnect, we have no clock, and a silent
+// `Date.now()` fallback is exactly the bug a scaled clock would hide.
+let clock: SlotClock | null = null;
+let engineKind: EngineKind = "ft8cat";
+
+function requireClock(): SlotClock {
+  if (!clock) {
+    throw new Error("slot clock unavailable: no status received from the daemon yet");
+  }
+  return clock;
+}
+
 let automationTimer: NodeJS.Timeout | null = null;
 let txEnabled = true;
 
@@ -85,6 +112,9 @@ const workedCalls = new Set<string>();
 const SURVEY_LO_HZ = 300;
 const SURVEY_HI_HZ = 2700;
 const SURVEY_DECODE_LAG_SECONDS = 5;
+// Arm this many virtual seconds before the slot opens, so the daemon has time to
+// hand the message to the engine. Virtual, so it scales with the clock.
+const AUTOMATION_LEAD_SECONDS = 2;
 let surveyActive = false;
 let surveySlot: TxSlot | null = null;
 let surveyEndSec = 0;
@@ -148,12 +178,33 @@ function connectDaemon(): void {
     controlClaimPending = false;
     sessionActive = false;
     latestTxState = "idle";
+    // Drop the daemon's clock on disconnect: there is no authoritative time
+    // base until the next status arrives. Leaving a scaled clock (or an armed
+    // timer) across reconnect is exactly the demo→real footgun.
+    clock = null;
+    engineKind = "ft8cat";
+    clearAutomationState("daemon disconnected");
     appendLog("warn", "daemon connection closed; retrying in 2s");
   });
 
   client.on("status", (msg) => {
     const { session, tx, control } = msg;
     const hadControl = controlMine;
+    const previousActive = sessionActive;
+    const previousKind = engineKind;
+    const previousClock = clock;
+
+    // Adopt the daemon's clock. Any field change (not just scale) can move the
+    // next boundary, so re-arm rather than leaving a timer at a stale anchor.
+    const clockDirty =
+      previousClock === null ||
+      previousClock.spec.epochMs !== msg.clock.epochMs ||
+      previousClock.spec.anchorWallMs !== msg.clock.anchorWallMs ||
+      previousClock.spec.slotMs !== msg.clock.slotMs ||
+      previousClock.spec.scale !== msg.clock.scale;
+    clock = new SlotClock(msg.clock);
+    engineKind = msg.engine;
+
     if (session.callsign !== null) {
       myCall = session.callsign;
     }
@@ -167,8 +218,21 @@ function connectDaemon(): void {
     }
     sessionActive = session.active;
     catConnected = session.catConnected;
+
+    const sessionEnded = previousActive && !session.active;
+    const kindChanged = previousKind !== msg.engine;
+    // Demo→real at scale 1 never trips a scale-only dirty check. Clear in-flight
+    // QSOs so leftover QQ0DEMO CQs cannot key the live radio or land in the
+    // real QSO log when they complete under the new engine.
+    if (sessionEnded || kindChanged) {
+      clearAutomationState(sessionEnded ? "session stopped" : "engine changed");
+    } else if (clockDirty) {
+      clearAutomationTimer();
+    }
+
     updateTxState(tx.state);
-    if (!hadControl && controlMine) {
+
+    if (sessionActive && ((!hadControl && controlMine) || clockDirty || (kindChanged && !sessionEnded))) {
       scheduleAutomation();
     }
     broadcastState();
@@ -283,7 +347,7 @@ async function logCompletedQso(qso: QsoRecord, reason: string): Promise<void> {
   }
   loggedQsoIds.add(qso.id);
   try {
-    await appendQsoLog(entry);
+    await appendQsoLog(entry, qsoLogPathFor(engineKind));
     workedCalls.add(entry.theirCall.toUpperCase());
     appendLog("info", `[qso-log] wrote ${entry.theirCall}${dialFreqHz ? "" : " (no freq set)"}`);
   } catch (error) {
@@ -315,6 +379,17 @@ function clearAutomationTimer(): void {
   scheduledAutomationTx = null;
 }
 
+function clearAutomationState(_reason: string): void {
+  clearAutomationTimer();
+  if (surveyActive) {
+    cancelSurvey("session boundary");
+  }
+  automation.qsos.splice(0);
+  pendingAutomationTx = null;
+  activeAutomationTx = null;
+  scheduledAutomationTx = null;
+}
+
 // Re-arm automation on the falling edge of "active" (a transmission finished),
 // or on a genuine "idle" (e.g. after cancel). The daemon rests in "pending"
 // after a TX, so we never rely on seeing "idle" to resume.
@@ -335,7 +410,7 @@ function updateTxState(next: TxState): void {
 function scheduleAutomation(): void {
   clearAutomationTimer();
 
-  if (surveyActive || !txEnabled || latestTxState === "active") {
+  if (!sessionActive || surveyActive || !txEnabled || latestTxState === "active") {
     broadcastState();
     return;
   }
@@ -358,8 +433,16 @@ function scheduleAutomation(): void {
     return;
   }
 
-  const seconds = secondsUntilNextSlot(tx.intent.slot);
-  const delayMs = Math.max(0, (seconds - 2) * 1000);
+  if (!clock) {
+    appendLog("warn", "[automation] paused: awaiting the slot clock from the daemon");
+    broadcastState();
+    return;
+  }
+
+  // Arm two virtual seconds before the slot opens. The lead is a virtual
+  // quantity, so it scales with everything else; the clock converts it to the
+  // wall delay this setTimeout actually needs.
+  const delayMs = clock.wallDelayUntilSlot(tx.intent.slot, AUTOMATION_LEAD_SECONDS);
   automationTimer = setTimeout(() => sendAutomatedTx(tx), delayMs);
   broadcastState();
 }
@@ -367,7 +450,7 @@ function scheduleAutomation(): void {
 function sendAutomatedTx(tx: AutomationTx): void {
   automationTimer = null;
   scheduledAutomationTx = null;
-  if (surveyActive || !txEnabled || latestTxState === "active") {
+  if (!sessionActive || surveyActive || !txEnabled || latestTxState === "active") {
     return;
   }
   const af = currentAfOrNull();
@@ -404,13 +487,27 @@ function startSurvey(): void {
   activeAutomationTx = null;
   scheduledAutomationTx = null;
 
-  const delaySec = secondsUntilNextSlot(slot) + 15 + SURVEY_DECODE_LAG_SECONDS;
-  surveyEndSec = Math.floor(Date.now() / 1000) + delaySec;
+  if (!clock) {
+    appendLog("warn", "[survey] unavailable: awaiting the slot clock from the daemon");
+    surveyActive = false;
+    broadcastState();
+    return;
+  }
+
+  // Hold TX for one whole slot past the boundary, plus decode latency. That is a
+  // negative offset -- we wait past the slot rather than arming before it -- and
+  // the slot length comes from the clock, never a literal 15.
+  const slotSeconds = clock.spec.slotMs / 1000;
+  const pastBoundary = slotSeconds + SURVEY_DECODE_LAG_SECONDS;
+  const delaySec = clock.secondsUntilSlot(slot) + pastBoundary;
+  // surveyEndSec is a rendered deadline, not a delay, so it lives in the clock's
+  // virtual base -- the same base the countdown is compared against.
+  surveyEndSec = clock.virtualDeadlineAfter(delaySec);
   appendLog("info", `[survey] holding TX ~${delaySec}s to listen on the ${slot} slot`);
   if (surveyTimer) {
     clearTimeout(surveyTimer);
   }
-  surveyTimer = setTimeout(finishSurvey, delaySec * 1000);
+  surveyTimer = setTimeout(finishSurvey, clock.wallDelayUntilSlot(slot, -pastBoundary));
   broadcastState();
 }
 
@@ -472,6 +569,10 @@ function ensureAutomationControl(): boolean {
 function ensureIdentity(): boolean {
   if (!myCall || !myGrid) {
     appendLog("warn", "automation requires a callsign and grid");
+    return false;
+  }
+  if (!clock) {
+    appendLog("warn", "automation paused: awaiting the slot clock from the daemon");
     return false;
   }
   return true;
@@ -711,6 +812,15 @@ function handleCommand(message: CommandMessage): void {
       }
       daemonSend(message.action === "start" ? { type: "start_session" } : { type: "stop_session" });
       break;
+    case "startDemo":
+      if (!ensureControl()) {
+        return;
+      }
+      // No configComplete guard: the whole point is that a user with no radio has
+      // no config to satisfy it with. The daemon synthesizes a demo identity.
+      appendLog("info", "[demo] starting on the simulated engine — nothing is transmitted");
+      daemonSend({ type: "start_session", demo: true });
+      break;
     case "saveSetup":
       if (!ensureControl()) {
         return;
@@ -745,7 +855,12 @@ function handleCommand(message: CommandMessage): void {
 // --- view-model / broadcast ------------------------------------------------
 
 function buildState(): StateMessage {
-  const nowMs = Date.now();
+  // Two clocks, deliberately. `wallNowMs` is what the browser corrects its own
+  // clock against (it runs on a different machine). `nowMs` is virtual time --
+  // the base decode timestamps live in -- and everything slot-shaped uses it.
+  // Mixing them is how a scaled countdown ends up disagreeing with the band.
+  const wallNowMs = Date.now();
+  const nowMs = clock ? clock.now() : wallNowMs;
 
   const activeCallColors = new Map<string, string>();
   for (const qso of automation.qsos) {
@@ -762,8 +877,8 @@ function buildState(): StateMessage {
 
   return {
     type: "state",
-    serverNow: nowMs,
-    cycle: { parity: cycleParity(nowMs) },
+    serverNow: wallNowMs,
+    cycle: buildCycleView(clock, wallNowMs, nowMs),
     station: {
       call: myCall,
       grid: myGrid,
@@ -771,7 +886,8 @@ function buildState(): StateMessage {
       catConnected,
       sessionActive,
       controlHeld,
-      controlMine
+      controlMine,
+      demo: engineKind === "simulated"
     },
     setup: {
       complete: configComplete,
@@ -928,6 +1044,47 @@ function resetControllerState(): void {
   logLines.splice(0);
 }
 
+async function waitUntil(
+  predicate: () => boolean,
+  label: string,
+  timeoutMs: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`headless: timed out waiting for ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/**
+ * Claim control and start a demo session with no browser messages.
+ * The smoke harness uses this so it drives the same QsoAutomation path as the UI.
+ */
+async function bootstrapHeadlessDemo(): Promise<void> {
+  await waitUntil(() => daemonClient?.connected === true, "daemon connection", 15_000);
+
+  if (!controlMine) {
+    if (!daemonSend({ type: "claim_control", ...(token ? { token } : {}) })) {
+      throw new Error("headless: failed to send claim_control");
+    }
+    await waitUntil(() => controlMine, "control claim", 10_000);
+  }
+
+  if (!sessionActive) {
+    appendLog("info", "[demo] headless: starting on the simulated engine — nothing is transmitted");
+    if (!daemonSend({ type: "start_session", demo: true })) {
+      throw new Error("headless: failed to send start_session");
+    }
+    await waitUntil(
+      () => sessionActive && Boolean(myCall) && Boolean(myGrid) && clock !== null,
+      "demo session",
+      15_000
+    );
+  }
+}
+
 export async function startWebUiServer(options: WebUiServerOptions = {}): Promise<void> {
   if (started) {
     return;
@@ -941,13 +1098,26 @@ export async function startWebUiServer(options: WebUiServerOptions = {}): Promis
   await loadPersistedState();
   connectDaemon();
 
-  await new Promise<void>((resolve) => {
-    httpServer.listen(webPort, webHost, () => resolve());
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      httpServer.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      httpServer.off("error", onError);
+      resolve();
+    };
+    httpServer.once("error", onError);
+    httpServer.listen(webPort, webHost, onListening);
   });
   started = true;
 
   // Keep the cycle clock and countdowns live in the browser.
   broadcastInterval = setInterval(broadcastState, 500);
+
+  if (options.headless?.demo) {
+    await bootstrapHeadlessDemo();
+  }
 
   const address = httpServer.address();
   const port = typeof address === "object" && address ? address.port : webPort;
@@ -976,6 +1146,10 @@ export async function closeWebUiServer(): Promise<void> {
   }
   clients.clear();
   await new Promise<void>((resolve, reject) => {
+    // Force-drop keep-alives so headless smoke can exit without waiting on idle sockets.
+    if (typeof httpServer.closeAllConnections === "function") {
+      httpServer.closeAllConnections();
+    }
     httpServer.close((error) => {
       if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
         reject(error);

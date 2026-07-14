@@ -24,6 +24,10 @@ export interface StationView {
   sessionActive: boolean;
   controlHeld: boolean;
   controlMine: boolean;
+  // True when the simulated engine is running. Every client labels this
+  // unmistakably: a ham who believes they worked a station they did not would
+  // log it, and a fabricated contact uploaded to LoTW is not recoverable.
+  demo: boolean;
 }
 
 export interface SetupDeviceView {
@@ -56,8 +60,31 @@ export interface DecodeView {
   message: string;
   from: string | null;
   grid: string | null;
+  // Which slot this decode landed in, and the start of its cycle -- both
+  // computed server-side. The browser cannot import core/slot-clock.ts (it is a
+  // plain script with no build step), so it is never asked to derive slot math
+  // itself, and carries no slot length of its own.
+  slot: TxSlot;
+  cycleStart: number;
   kind: DecodeKind;
   color?: string;
+}
+
+export interface CycleView {
+  parity: TxSlot;
+  // The wall instant of the next slot boundary, already scale-corrected by the
+  // server. The browser counts down to it against its own (skew-corrected) wall
+  // clock, with no scale factor and no 15-second constant anywhere in it.
+  // Null before the daemon has published a clock -- the browser renders a
+  // neutral countdown rather than a confidently wrong one.
+  nextBoundaryWallMs: number | null;
+  // How long a slot lasts in wall time at the current scale -- what the browser
+  // needs to render the cycle progress bar without knowing the scale.
+  slotWallMs: number | null;
+  // How long a slot lasts in FT8 terms (15s). The countdown is rendered in these
+  // units at any scale, because an operator reasons in FT8 seconds, not in the
+  // wall seconds a sped-up test happens to run at.
+  slotSeconds: number | null;
 }
 
 export interface RosterEntryView {
@@ -105,8 +132,11 @@ export interface LogLineView {
 
 export interface StateMessage {
   type: "state";
+  // Wall time on the server, so the browser can correct for its own clock being
+  // off. This is not virtual time -- the skew correction lives in the wall
+  // domain, which is what makes it valid at any scale.
   serverNow: number;
-  cycle: { parity: TxSlot };
+  cycle: CycleView;
   station: StationView;
   setup: SetupView;
   now: NowView;
@@ -144,5 +174,9 @@ export type CommandMessage =
   | { type: "command"; cmd: "txEnable"; enabled: boolean }
   | { type: "command"; cmd: "haltTx" }
   | { type: "command"; cmd: "session"; action: "start" | "stop" }
+  // Start on the simulated engine, with no station config. Reachable from the
+  // first-run setup surface, so a radio-less user finds it by discovery rather
+  // than by typing a flag they would never know about.
+  | { type: "command"; cmd: "startDemo" }
   | { type: "command"; cmd: "saveSetup"; callsign: string; grid: string; deviceId: number; catMode: "rigctld" | "dummy"; catPort: number }
   | { type: "command"; cmd: "releaseControl" };

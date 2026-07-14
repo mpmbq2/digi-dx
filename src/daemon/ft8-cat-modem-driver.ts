@@ -13,8 +13,9 @@ import {
   type EngineDriver,
   type EngineDriverEvents
 } from "./engine-driver.js";
-import type { TxIntent } from "./protocol.js";
+import type { SlotClockSpec, TxIntent } from "./protocol.js";
 import { DaemonError } from "./protocol.js";
+import { realtimeClockSpec } from "../../core/slot-clock.js";
 import { parseInternalUdpLineToDriver } from "./ft8-udp-parse.js";
 
 export type SpawnFn = (
@@ -37,6 +38,7 @@ export interface Ft8CatModemDriverOptions {
 }
 
 export class Ft8CatModemDriver extends EventEmitter<EngineDriverEvents> implements EngineDriver {
+  readonly kind = "ft8cat" as const;
   private child: ChildProcessWithoutNullStreams | null = null;
   private dummyRig: ChildProcess | null = null;
   private udp: UdpSocket | null = null;
@@ -67,6 +69,15 @@ export class Ft8CatModemDriver extends EventEmitter<EngineDriverEvents> implemen
     this.spawnFn = options.spawnFn ?? spawn;
     this.connectivity = options.connectivity ?? { canConnect, waitForConnect };
     this.bindUdpPort = options.bindUdpPort ?? null;
+  }
+
+  // A real radio's slots are imposed by UTC and by ft8modem, not by us. So the
+  // real driver reports wall time at scale 1: virtual time is identical to wall
+  // time, every clock-derived call collapses to today's behavior, and the live
+  // path is unchanged. That is what makes it safe to move timing code we cannot
+  // verify against hardware from a container.
+  clock(): SlotClockSpec {
+    return realtimeClockSpec();
   }
 
   async start(session: SessionConfig): Promise<void> {

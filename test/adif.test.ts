@@ -102,3 +102,20 @@ describe("readQsoLog", () => {
     expect(entries.map((item) => item.theirCall)).toEqual(["K8BL", "K2B"]);
   });
 });
+
+describe("demo QSO log isolation", () => {
+  it("routes demo QSOs to a different file than the operator's real log", async () => {
+    // Isolation by destination, not by a flag on the entry. A flagged entry can
+    // still be exported to ADIF by a code path that forgets to check the flag,
+    // and a fabricated contact uploaded to LoTW is not a bug you take back.
+    const { qsoLogPathFor, realQsoLogPath } = await import("../ui/qso-log.js");
+
+    expect(qsoLogPathFor("simulated")).not.toBe(qsoLogPathFor("ft8cat"));
+    expect(qsoLogPathFor("ft8cat")).toBe(realQsoLogPath());
+  });
+
+  it("keeps the ADIF exporter pointed at the real log only", async () => {
+    const { realQsoLogPath, qsoLogPathFor } = await import("../ui/qso-log.js");
+    expect(realQsoLogPath()).not.toBe(qsoLogPathFor("simulated"));
+  });
+});

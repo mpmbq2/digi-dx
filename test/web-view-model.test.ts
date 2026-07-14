@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { QsoAutomation, type DecodeRecord } from "../core/qso.js";
+import { QsoAutomation, slotFromTimestamp, type DecodeRecord } from "../core/qso.js";
+import { FT8_SLOT_MS, SlotClock, realtimeClockSpec } from "../core/slot-clock.js";
 import {
   annotateDecode,
   buildActiveQsoView,
+  buildCycleView,
   buildRosters,
   classifyKind,
   deriveTxCard,
@@ -97,3 +99,91 @@ describe("web view-model helpers", () => {
 function decode(message: string, ts: number, snr: number, af: number): DecodeRecord {
   return { message, ts, snr, af, dt: 0.1 };
 }
+
+// The browser holds no clock and does no slot math -- it cannot import
+// core/slot-clock.ts, and hand-porting the scale arithmetic into an untested,
+// unbuilt script is the worst place for it. So the server resolves parity and
+// the next boundary here, where the suite can actually reach them.
+describe("buildCycleView", () => {
+  const wallNow = 1_783_048_567_000;
+
+  function scaledClock(scale: number, wallNowMs: number): SlotClock {
+    return new SlotClock(
+      { epochMs: 1_783_048_560_000, anchorWallMs: wallNowMs, slotMs: FT8_SLOT_MS, scale },
+      () => wallNowMs
+    );
+  }
+
+  it("reports no boundary before the daemon has published a clock", () => {
+    // A neutral countdown, not a confidently wrong one.
+    expect(buildCycleView(null, wallNow, wallNow)).toEqual({
+      parity: slotFromTimestamp(Math.floor(wallNow / 1000)),
+      nextBoundaryWallMs: null,
+      slotWallMs: null,
+      slotSeconds: null
+    });
+  });
+
+  it("publishes the slot's wall duration, so the browser never needs the scale", () => {
+    expect(buildCycleView(scaledClock(1, wallNow), wallNow, wallNow).slotWallMs).toBe(FT8_SLOT_MS);
+    expect(buildCycleView(scaledClock(20, wallNow), wallNow, wallNow).slotWallMs).toBe(
+      FT8_SLOT_MS / 20
+    );
+    // The FT8 slot length never changes -- an operator still reasons in 15s
+    // cycles, whatever rate the engine runs at.
+    expect(buildCycleView(scaledClock(20, wallNow), wallNow, wallNow).slotSeconds).toBe(15);
+  });
+
+  it("publishes the next boundary as a wall instant at scale 1", () => {
+    const clock = new SlotClock(realtimeClockSpec(), () => wallNow);
+    const view = buildCycleView(clock, wallNow, clock.now());
+
+    expect(view.parity).toBe(slotFromTimestamp(Math.floor(wallNow / 1000)));
+    // 1783048567 is 7s into a 15s slot, so the next boundary is 8s away.
+    expect(view.nextBoundaryWallMs).toBe(wallNow + 8000);
+  });
+
+  it("scale-corrects the boundary, so a scaled band counts down faster", () => {
+    // Covers AE1's server half: the browser subtracts wall instants, so the
+    // scale correction has to be applied before it ever reaches the browser.
+    const atOne = buildCycleView(scaledClock(1, wallNow), wallNow, scaledClock(1, wallNow).now());
+    const atTwenty = buildCycleView(
+      scaledClock(20, wallNow),
+      wallNow,
+      scaledClock(20, wallNow).now()
+    );
+
+    const wallMsAtOne = atOne.nextBoundaryWallMs! - wallNow;
+    const wallMsAtTwenty = atTwenty.nextBoundaryWallMs! - wallNow;
+
+    expect(wallMsAtOne).toBe(FT8_SLOT_MS);
+    expect(wallMsAtTwenty).toBe(FT8_SLOT_MS / 20);
+    expect(atOne.parity).toBe(atTwenty.parity);
+  });
+
+  it("agrees with the parity the decodes themselves carry", () => {
+    const clock = scaledClock(20, wallNow);
+    const view = buildCycleView(clock, wallNow, clock.now());
+    const virtualNowSec = Math.floor(clock.now() / 1000);
+
+    expect(view.parity).toBe(slotFromTimestamp(virtualNowSec));
+  });
+});
+
+describe("annotateDecode slot metadata", () => {
+  it("publishes each decode's slot and cycle start, so the browser derives neither", () => {
+    const ctx = { myCall: "N1MPM", activeCallColors: new Map(), workedCalls: new Set<string>() };
+    const view = annotateDecode(decode("CQ K1ABC FN42", 1_783_048_575, -8, 1200), ctx);
+
+    expect(view.slot).toBe(slotFromTimestamp(1_783_048_575));
+    expect(view.cycleStart).toBe(1_783_048_575);
+  });
+
+  it("keeps cycle start on the slot grid for a decode mid-cycle", () => {
+    const ctx = { myCall: "N1MPM", activeCallColors: new Map(), workedCalls: new Set<string>() };
+    const view = annotateDecode(decode("CQ K1ABC FN42", 1_783_048_581, -8, 1200), ctx);
+
+    expect(view.cycleStart).toBe(1_783_048_575);
+    expect(view.slot).toBe(slotFromTimestamp(1_783_048_575));
+  });
+});

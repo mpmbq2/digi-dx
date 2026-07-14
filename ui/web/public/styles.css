@@ -452,3 +452,35 @@ select.setup-input { cursor: pointer; }
   background: var(--green); color: #06110c; font-size: 13.5px; font-weight: 600;
 }
 .setup-save:hover { filter: brightness(1.08); }
+
+/* Demo mode. Loud on purpose: a ham who thinks they worked a station they did
+   not will log it, and a fabricated contact uploaded to LoTW is not
+   recoverable. */
+#demo-banner {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  padding: 6px 12px;
+  text-align: center;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #1b1400;
+  background: repeating-linear-gradient(
+    45deg,
+    #f5c542,
+    #f5c542 12px,
+    #e0ae20 12px,
+    #e0ae20 24px
+  );
+  border-bottom: 2px solid #8a6a00;
+}
+
+body.demo .now-card {
+  border-color: #f5c54255;
+}
+
+.setup-demo {
+  background: transparent;
+  border: 1px solid #f5c54277;
+  color: #f5c542;
+}

@@ -5,6 +5,8 @@
 export type {
   CommandId,
   ErrorCode,
+  EngineKind,
+  SlotClockSpec,
   TxSlot,
   TxPublicState,
   SessionConfig,
