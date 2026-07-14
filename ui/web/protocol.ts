@@ -24,6 +24,10 @@ export interface StationView {
   sessionActive: boolean;
   controlHeld: boolean;
   controlMine: boolean;
+  // True when the simulated engine is running. Every client labels this
+  // unmistakably: a ham who believes they worked a station they did not would
+  // log it, and a fabricated contact uploaded to LoTW is not recoverable.
+  demo: boolean;
 }
 
 export interface SetupDeviceView {
@@ -170,5 +174,9 @@ export type CommandMessage =
   | { type: "command"; cmd: "txEnable"; enabled: boolean }
   | { type: "command"; cmd: "haltTx" }
   | { type: "command"; cmd: "session"; action: "start" | "stop" }
+  // Start on the simulated engine, with no station config. Reachable from the
+  // first-run setup surface, so a radio-less user finds it by discovery rather
+  // than by typing a flag they would never know about.
+  | { type: "command"; cmd: "startDemo" }
   | { type: "command"; cmd: "saveSetup"; callsign: string; grid: string; deviceId: number; catMode: "rigctld" | "dummy"; catPort: number }
   | { type: "command"; cmd: "releaseControl" };

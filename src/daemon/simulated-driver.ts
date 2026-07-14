@@ -50,6 +50,27 @@ export function resolveSimOptions(env: NodeJS.ProcessEnv = process.env): Simulat
   return { scale, seed: Number.isFinite(seed) ? seed : 1 };
 }
 
+// The identity a demo session runs under. The callsign comes from the same
+// reserved, non-assignable range the simulated stations use: it is transmitted
+// in every demo message and rendered into the screenshots a reviewer reads, and
+// `validateSessionConfig` would happily accept a real licensee's callsign. A
+// "plausible" demo call is exactly how a real ham's callsign ends up in a
+// fabricated QSO on a pull request.
+export const DEMO_CALLSIGN = "QQ0DEMO";
+export const DEMO_GRID = "FN42";
+
+export function demoSessionConfig(): SessionConfig {
+  return {
+    mode: "FT8",
+    device: { id: SIM_DEVICE.id, name: SIM_DEVICE.name },
+    callsign: DEMO_CALLSIGN,
+    grid: DEMO_GRID,
+    // "dummy" rather than a real rig: the simulated driver never touches CAT,
+    // and this is what satisfies validateSessionConfig without implying a radio.
+    cat: { mode: "dummy", port: 4532 }
+  };
+}
+
 export class SimulatedDriver extends EventEmitter<EngineDriverEvents> implements EngineDriver {
   readonly kind: EngineKind = "simulated";
 

@@ -2,6 +2,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { loadConfig, saveConfig, validateSessionConfig, type SessionConfig } from "./config.js";
 import { listAudioDevices, type AudioDevice } from "./audio-devices.js";
 import { type EngineApi, statusFromSnapshot } from "./engine.js";
+import { demoSessionConfig } from "./simulated-driver.js";
 import {
   DaemonError,
   getCommandId,
@@ -19,6 +20,9 @@ export interface DaemonWebSocketOptions {
   host?: string;
   authToken?: string;
   configPath?: string;
+  // Force every session onto the simulated engine. This is the headless path the
+  // verification commands use; the UI path does not depend on it.
+  forceSimulated?: boolean;
   listAudioDevices?: () => Promise<AudioDevice[]>;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -204,6 +208,21 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
       return;
     }
 
+    // Demo mode. The gate that blocks a radio-less start is here, not in the web
+    // UI -- the UI's configComplete check is only an advisory pre-check, and a
+    // UI-only change would leave demo mode unable to start at all.
+    if (command.demo === true || options.forceSimulated) {
+      // Synthesized in memory and handed straight to the engine. It is NEVER
+      // routed through saveConfig: a demo config on disk would be a complete,
+      // valid config, permanently satisfying the CONFIG_REQUIRED gate -- and the
+      // next real session would key the operator's actual rig on a fabricated
+      // callsign, a device that does not exist, and a dummy CAT block.
+      const session = demoSessionConfig();
+      await options.engine.start(session, "simulated");
+      broadcastStatus(client, id);
+      return;
+    }
+
     let session: SessionConfig;
     if (command.session !== undefined) {
       session = validateSessionConfig(command.session);
@@ -218,7 +237,7 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
       session = loaded.session;
     }
 
-    await options.engine.start(session);
+    await options.engine.start(session, "ft8cat");
     broadcastStatus(client, id);
   }
 

@@ -198,7 +198,11 @@ export type DaemonCommand =
   | { type: "get_config" }
   | { type: "list_audio_devices" }
   | { type: "save_config"; session: unknown }
-  | { type: "start_session"; session?: unknown }
+  // `demo: true` starts on the simulated engine with a synthesized identity, and
+  // skips the config gate -- a user with no radio has no config to satisfy it
+  // with. Driver selection is per session, so this works for a user who already
+  // launched digi-dx normally.
+  | { type: "start_session"; session?: unknown; demo?: boolean }
   | { type: "stop_session" }
   | { type: "transmit"; af: number; slot: TxSlot; message: string }
   | { type: "cancel_transmit" };

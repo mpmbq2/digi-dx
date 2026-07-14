@@ -6,7 +6,7 @@ import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { DaemonClient } from "../../core/daemon-client.js";
 import type { DaemonCommand, EngineKind } from "../../core/protocol.js";
-import { appendQsoLog, readQsoLog } from "../qso-log.js";
+import { appendQsoLog, qsoLogPathFor, readQsoLog } from "../qso-log.js";
 import { readTuiState, writeTuiState } from "../tui-state.js";
 import { bandForMHz } from "../adif.js";
 import {
@@ -319,7 +319,7 @@ async function logCompletedQso(qso: QsoRecord, reason: string): Promise<void> {
   }
   loggedQsoIds.add(qso.id);
   try {
-    await appendQsoLog(entry);
+    await appendQsoLog(entry, qsoLogPathFor(engineKind));
     workedCalls.add(entry.theirCall.toUpperCase());
     appendLog("info", `[qso-log] wrote ${entry.theirCall}${dialFreqHz ? "" : " (no freq set)"}`);
   } catch (error) {
@@ -769,6 +769,15 @@ function handleCommand(message: CommandMessage): void {
       }
       daemonSend(message.action === "start" ? { type: "start_session" } : { type: "stop_session" });
       break;
+    case "startDemo":
+      if (!ensureControl()) {
+        return;
+      }
+      // No configComplete guard: the whole point is that a user with no radio has
+      // no config to satisfy it with. The daemon synthesizes a demo identity.
+      appendLog("info", "[demo] starting on the simulated engine — nothing is transmitted");
+      daemonSend({ type: "start_session", demo: true });
+      break;
     case "saveSetup":
       if (!ensureControl()) {
         return;
@@ -834,7 +843,8 @@ function buildState(): StateMessage {
       catConnected,
       sessionActive,
       controlHeld,
-      controlMine
+      controlMine,
+      demo: engineKind === "simulated"
     },
     setup: {
       complete: configComplete,

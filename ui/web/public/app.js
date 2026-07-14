@@ -258,6 +258,7 @@
 
   function render() {
     renderConnection();
+    renderDemoBanner();
     renderStation();
     renderSetup();
     renderClockAndNow();
@@ -352,7 +353,19 @@
     save.textContent = "Save & continue";
     card.append(hint, save);
 
-    setupRefs = { call, grid, device, catMode, catPort, hint, save };
+    // The way out for somebody with no radio wired yet. Without this, demo mode
+    // is a flag a new user would never type, and the first hour of digi-dx is
+    // spent guessing whether the software or the radio is broken.
+    const demoNote = document.createElement("p");
+    demoNote.className = "setup-sub";
+    demoNote.textContent = "No radio connected yet? See it work first — nothing is transmitted.";
+    const demo = document.createElement("button");
+    demo.className = "setup-save setup-demo";
+    demo.textContent = "Try it without a radio";
+    demo.addEventListener("click", () => send({ cmd: "startDemo" }));
+    card.append(demoNote, demo);
+
+    setupRefs = { call, grid, device, catMode, catPort, hint, save, demo };
     save.addEventListener("click", submitSetup);
     refs.setupOverlay.append(card);
 
@@ -446,6 +459,30 @@
 
     setupRefs.hint.textContent = "Saving…";
     send({ cmd: "saveSetup", callsign, grid, deviceId, catMode, catPort });
+  }
+
+  // Demo mode must be impossible to miss. A ham who believes they worked a
+  // station they did not will log it, and a fabricated contact uploaded to LoTW
+  // or QRZ cannot be taken back.
+  function renderDemoBanner() {
+    let banner = document.getElementById("demo-banner");
+    const demo = Boolean(state && state.station && state.station.demo);
+
+    if (!demo) {
+      if (banner) {
+        banner.remove();
+      }
+      document.body.classList.remove("demo");
+      return;
+    }
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "demo-banner";
+      banner.textContent =
+        "DEMO MODE — simulated band. Nothing is transmitted and no QSO here is real.";
+      document.body.prepend(banner);
+    }
+    document.body.classList.add("demo");
   }
 
   function renderClockAndNow() {

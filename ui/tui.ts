@@ -3,7 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DaemonClient } from "../core/daemon-client.js";
 import type { DaemonCommand } from "../core/protocol.js";
-import { appendQsoLog, readQsoLog } from "./qso-log.js";
+import { appendQsoLog, qsoLogPathFor, readQsoLog } from "./qso-log.js";
 import { readTuiState, writeTuiState } from "./tui-state.js";
 import { bandForMHz, buildAdif } from "./adif.js";
 import {
@@ -694,7 +694,11 @@ function renderStatusBar(): void {
   const qrg = dialFreqHz
     ? `{green-fg}${(dialFreqHz / 1e6).toFixed(3)}MHz{/green-fg}`
     : "{yellow-fg}unset{/yellow-fg}";
-  statusBar.setContent(`${statusBase}  ||  ${clockSegment()}  ||  QRG=${qrg}`);
+  // Unmissable: a simulated QSO that an operator mistakes for a real one gets
+  // logged, and a fabricated contact uploaded to LoTW cannot be taken back.
+  const demo =
+    engineKind === "simulated" ? "{black-fg}{yellow-bg} DEMO — NOT ON THE AIR {/}  ||  " : "";
+  statusBar.setContent(`${demo}${statusBase}  ||  ${clockSegment()}  ||  QRG=${qrg}`);
   screen.render();
 }
 
@@ -897,7 +901,7 @@ async function logCompletedQso(qso: QsoRecord, reason: string): Promise<void> {
   }
   loggedQsoIds.add(qso.id);
   try {
-    await appendQsoLog(entry);
+    await appendQsoLog(entry, qsoLogPathFor(engineKind));
     workedCalls.add(entry.theirCall);
     appendLog(`[qso-log] wrote ${entry.theirCall}${dialFreqHz ? ` @${(dialFreqHz / 1e6).toFixed(3)}MHz` : " (no freq set)"}`);
   } catch (error) {
