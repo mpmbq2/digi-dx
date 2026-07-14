@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: smoke independence resolves a merge base against main
+          # and fails closed when none exists (shallow checkout would red-gate).
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: Daemon build
+        run: npm run build
+
+      - name: Client typecheck
+        run: npm run typecheck
+
+      - name: Headless QSO smoke
+        run: npm run smoke
+
+      - name: Web UI smoke
+        run: npm run smoke:ui

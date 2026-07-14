@@ -38,7 +38,7 @@ Developer overrides (optional):
 
 On first connect, the UI prompts for callsign, grid, audio device, and CAT settings when config is incomplete. Session start stays disabled until config is saved.
 
-If you do not have a radio wired yet, use **Try it without a radio** on that setup screen. That starts a simulated FT8 band (demo mode): nothing is transmitted, no audio device or CAT is required, and completed contacts are written to `data/demo-qso-log.jsonl` rather than your real QSO log. Demo mode runs in real time and is labeled clearly in the UI so it cannot be mistaken for a live band.
+If you do not have a radio wired yet, use **Try it without a radio** on that setup screen. That starts a simulated FT8 band (demo mode): nothing is transmitted, no audio device or CAT is required, and completed contacts are written to `data/demo-qso-log.jsonl` rather than your real QSO log. Demo mode runs in real time and is labeled clearly in the UI so it cannot be mistaken for a live band. Wire-level details (`start_session` with `demo: true`, published `engine` / `clock` on status) are in [protocol.md](./protocol.md).
 
 Developer / verification overrides (optional):
 
