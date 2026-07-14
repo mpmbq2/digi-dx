@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { QsoLogEntry } from "../core/qso.js";
+import type { EngineKind } from "../core/protocol.js";
 
 const defaultLogPath = join(process.cwd(), "data", "qso-log.jsonl");
 
@@ -11,7 +12,7 @@ const defaultLogPath = join(process.cwd(), "data", "qso-log.jsonl");
 const demoLogPath = join(process.cwd(), "data", "demo-qso-log.jsonl");
 
 // The ADIF exporter is never pointed at this. It reads the real log only.
-export function qsoLogPathFor(engine: "ft8cat" | "simulated"): string {
+export function qsoLogPathFor(engine: EngineKind): string {
   return engine === "simulated" ? demoLogPath : defaultLogPath;
 }
 

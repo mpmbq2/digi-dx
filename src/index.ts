@@ -12,22 +12,23 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 
 const paths = await resolveEngineBinaryPaths();
 
+// The environment variable survives as the headless path: it forces every
+// session onto the simulated engine, which is how the verification commands run
+// in a container with no radio. Demo mode (UI "try it without a radio") must
+// stay real-time (KTD5); only the verification path raises DIGI_DX_SIM_SCALE.
+const forceSimulated = process.env.DIGI_DX_ENGINE === "sim";
+if (process.env.DIGI_DX_ENGINE !== undefined && !forceSimulated) {
+  throw new Error(`DIGI_DX_ENGINE must be 'sim' if set, got '${process.env.DIGI_DX_ENGINE}'`);
+}
+
 // Both engines are constructed; the session picks between them. Selection cannot
 // be a boot-time environment variable: the daemon holds one driver for its
 // lifetime, so a user who launched digi-dx normally would be stuck on the real
 // engine forever, and the "try it without a radio" entry point would be dead on
 // arrival for exactly the user it exists for.
 const driver = new Ft8CatModemDriver({ paths });
-const simulatedDriver = new SimulatedDriver(resolveSimOptions());
+const simulatedDriver = new SimulatedDriver(forceSimulated ? resolveSimOptions() : {});
 const engine = new Engine({ driver, simulatedDriver });
-
-// The environment variable survives as the headless path: it forces every
-// session onto the simulated engine, which is how the verification commands run
-// in a container with no radio.
-const forceSimulated = process.env.DIGI_DX_ENGINE === "sim";
-if (process.env.DIGI_DX_ENGINE !== undefined && !forceSimulated) {
-  throw new Error(`DIGI_DX_ENGINE must be 'sim' if set, got '${process.env.DIGI_DX_ENGINE}'`);
-}
 
 const ws = createDaemonWebSocketServer({
   engine,

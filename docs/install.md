@@ -38,6 +38,13 @@ Developer overrides (optional):
 
 On first connect, the UI prompts for callsign, grid, audio device, and CAT settings when config is incomplete. Session start stays disabled until config is saved.
 
+If you do not have a radio wired yet, use **Try it without a radio** on that setup screen. That starts a simulated FT8 band (demo mode): nothing is transmitted, no audio device or CAT is required, and completed contacts are written to `data/demo-qso-log.jsonl` rather than your real QSO log. Demo mode runs in real time and is labeled clearly in the UI so it cannot be mistaken for a live band.
+
+Developer / verification overrides (optional):
+
+- `DIGI_DX_ENGINE=sim` — force every session onto the simulated engine (headless verification path)
+- `DIGI_DX_SIM_SCALE` / `DIGI_DX_SIM_SEED` — only applied when `DIGI_DX_ENGINE=sim`; leave unset for a normal install so interactive demo mode stays real-time
+
 ## Troubleshooting
 
 - **No audio devices** — add your user to the `audio` group and re-login; verify `vendor/engine/<arch>/bin/ft8modem -h` lists devices.

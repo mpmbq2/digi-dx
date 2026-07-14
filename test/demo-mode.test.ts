@@ -126,6 +126,55 @@ describe("demo mode", () => {
     expect(lastOf(messages, "error")).toMatchObject({ code: "CONFIG_REQUIRED" });
   });
 
+  it("leaves an existing real config byte-identical after a demo session", async () => {
+    const existing = JSON.stringify({
+      session: {
+        mode: "FT8",
+        device: { id: 1 },
+        callsign: "N1MPM",
+        grid: "FN33",
+        cat: { mode: "dummy", port: 4532 }
+      }
+    });
+    const { configPath, send, settle } = await harness(existing);
+    const before = await readFile(configPath, "utf8");
+
+    send({ type: "start_session", demo: true });
+    await settle();
+    send({ type: "stop_session" });
+    await settle();
+
+    expect(await readFile(configPath, "utf8")).toBe(before);
+  });
+
+  it("rejects saving a demo-shaped session as station config", async () => {
+    const { messages, send, settle } = await harness(NO_CONFIG);
+    send({
+      type: "save_config",
+      session: {
+        mode: "FT8",
+        device: { id: 99, name: "Simulated Rig" },
+        callsign: DEMO_CALLSIGN,
+        grid: "FN42",
+        cat: { mode: "dummy", port: 4532 }
+      }
+    });
+    await settle();
+    expect(lastOf(messages, "error")).toMatchObject({ code: "CONFIG_INVALID" });
+  });
+
+  it("reports the real engine after a demo session stops", async () => {
+    const { messages, send, settle } = await harness(NO_CONFIG);
+
+    send({ type: "start_session", demo: true });
+    await settle();
+    send({ type: "stop_session" });
+    await settle();
+
+    expect((lastOf(messages, "status") as Record<string, any>).engine).toBe("ft8cat");
+    expect((lastOf(messages, "status") as Record<string, any>).session.active).toBe(false);
+  });
+
   it("never selects the real driver", async () => {
     const { real, send, settle } = await harness(NO_CONFIG);
 

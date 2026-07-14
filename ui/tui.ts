@@ -996,7 +996,7 @@ function scheduleAutomation(): void {
   renderQsoList();
   updateAfWarning();
 
-  if (surveyActive || manualOverridePending || latestTxState === "active") {
+  if (!sessionActive || surveyActive || manualOverridePending || latestTxState === "active") {
     return;
   }
 
@@ -1025,7 +1025,7 @@ function scheduleAutomation(): void {
 
 function sendAutomatedTx(tx: AutomationTx): void {
   automationTimer = null;
-  if (surveyActive || manualOverridePending || latestTxState === "active") {
+  if (!sessionActive || surveyActive || manualOverridePending || latestTxState === "active") {
     return;
   }
   const af = currentAfOrNull();
@@ -1375,22 +1375,39 @@ client.on("open", () => {
 });
 
 client.on("close", () => {
+  sessionActive = false;
+  clock = null;
+  engineKind = "ft8cat";
+  clearAutomationTimer();
+  automation.qsos.splice(0);
   appendLog("connection closed");
   screen.render();
 });
 
 client.on("status", (msg) => {
   const { session, tx, control } = msg;
+  const previousActive = sessionActive;
+  const previousKind = engineKind;
+  const previousClock = clock;
 
-  // Adopt the daemon's clock. The scale can change mid-session (a demo session
-  // runs scaled), so drop any timer armed at the old rate.
-  const hadClock = clock !== null;
-  const rateChanged = clock !== null && clock.spec.scale !== msg.clock.scale;
+  // Adopt the daemon's clock. Any field change (not just scale) can move the
+  // next boundary, so drop timers rather than leaving them at a stale anchor.
+  const clockDirty =
+    previousClock === null ||
+    previousClock.spec.epochMs !== msg.clock.epochMs ||
+    previousClock.spec.anchorWallMs !== msg.clock.anchorWallMs ||
+    previousClock.spec.slotMs !== msg.clock.slotMs ||
+    previousClock.spec.scale !== msg.clock.scale;
   clock = new SlotClock(msg.clock);
   engineKind = msg.engine;
-  if (!hadClock || rateChanged) {
+
+  const sessionEnded = previousActive && !session.active;
+  const kindChanged = previousKind !== msg.engine;
+  if (sessionEnded || kindChanged) {
     clearAutomationTimer();
-    scheduleAutomation();
+    automation.qsos.splice(0);
+  } else if (clockDirty) {
+    clearAutomationTimer();
   }
 
   if (session.callsign !== null) {
@@ -1410,6 +1427,9 @@ client.on("status", (msg) => {
     `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
     `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`;
   updateTxState(tx.state);
+  if (sessionActive && (clockDirty || (kindChanged && !sessionEnded))) {
+    scheduleAutomation();
+  }
   renderSessionButton();
   renderStatusBar();
 });

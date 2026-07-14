@@ -70,9 +70,13 @@ const session: SessionConfig = {
 };
 
 describe("Engine with fake driver", () => {
+  function makeEngine(driver: FakeEngineDriver): Engine {
+    return new Engine({ driver, simulatedDriver: new FakeEngineDriver("simulated") });
+  }
+
   it("starts active and emits decode events", async () => {
     const driver = new FakeEngineDriver();
-    const engine = new Engine({ driver });
+    const engine = makeEngine(driver);
     const events: unknown[] = [];
     engine.on("event", (event) => events.push(event));
 
@@ -102,7 +106,7 @@ describe("Engine with fake driver", () => {
 
   it("forwards transmit intents to the driver", async () => {
     const driver = new FakeEngineDriver();
-    const engine = new Engine({ driver });
+    const engine = makeEngine(driver);
     await engine.start(session);
 
     const intent = { af: 1400, slot: "even" as const, message: "CQ N1MPM FN33" };
@@ -110,19 +114,27 @@ describe("Engine with fake driver", () => {
     expect(driver.transmitted).toEqual([intent]);
   });
 
-  it("stops and returns to inactive", async () => {
+  it("stops and returns to inactive on the real driver", async () => {
     const driver = new FakeEngineDriver();
-    const engine = new Engine({ driver });
-    await engine.start(session);
+    const sim = new FakeEngineDriver("simulated");
+    const engine = new Engine({ driver, simulatedDriver: sim });
+    await engine.start(session, "simulated");
+    expect(engine.snapshot().engine).toBe("simulated");
     await engine.stop();
 
-    expect(driver.stopped).toBe(true);
+    expect(sim.stopped).toBe(true);
     expect(engine.snapshot().state).toBe("inactive");
+    expect(engine.snapshot().engine).toBe("ft8cat");
+  });
+
+  it("refuses to alias the simulated driver onto the real radio", () => {
+    const driver = new FakeEngineDriver();
+    expect(() => new Engine({ driver, simulatedDriver: driver })).toThrow(/distinct simulatedDriver/);
   });
 
   it("emits PROCESS_CRASHED on driver crash", async () => {
     const driver = new FakeEngineDriver();
-    const engine = new Engine({ driver });
+    const engine = makeEngine(driver);
     const errors: unknown[] = [];
     engine.on("error", (error) => errors.push(error));
 
@@ -136,7 +148,7 @@ describe("Engine with fake driver", () => {
 
   it("publishes the driver's kind and clock on the wire status", async () => {
     const driver = new FakeEngineDriver();
-    const engine = new Engine({ driver });
+    const engine = makeEngine(driver);
     await engine.start(session);
 
     const status = statusFromSnapshot(engine.snapshot(), { held: false, byThisClient: false });
@@ -152,7 +164,7 @@ describe("Engine with fake driver", () => {
       scale: 20
     };
     const driver = new FakeEngineDriver("simulated", spec);
-    const engine = new Engine({ driver });
+    const engine = makeEngine(driver);
     await engine.start(session);
 
     const status = statusFromSnapshot(engine.snapshot(), { held: false, byThisClient: false });
@@ -171,7 +183,7 @@ describe("Engine with fake driver", () => {
       scale: 20
     };
     const driver = new FakeEngineDriver("simulated", spec);
-    const engine = new Engine({ driver });
+    const engine = makeEngine(driver);
     const events: Array<{ type: string; ts: number }> = [];
     engine.on("event", (event) => events.push(event as { type: string; ts: number }));
 
@@ -188,7 +200,7 @@ describe("Engine with fake driver", () => {
 
   it("cancels opposite-slot transmit via driver cancelTransmit", async () => {
     const driver = new FakeEngineDriver();
-    const engine = new Engine({ driver });
+    const engine = makeEngine(driver);
     await engine.start(session);
 
     await engine.transmit({ af: 1400, slot: "even", message: "CQ N1MPM FN33" });

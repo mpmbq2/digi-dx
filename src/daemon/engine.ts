@@ -43,7 +43,9 @@ export interface EngineOptions {
   // The engine behind demo mode. Selection happens per session, not per process:
   // an environment variable read at boot cannot serve a user who already
   // launched digi-dx normally and then clicks "try it without a radio".
-  simulatedDriver?: EngineDriver;
+  // Required (no silent fallback onto the real driver): a missing simulator
+  // must fail construction, not key the radio under kind "simulated".
+  simulatedDriver: EngineDriver;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -90,9 +92,12 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
 
   constructor(options: EngineOptions) {
     super();
+    if (options.simulatedDriver === options.driver) {
+      throw new Error("Engine requires a distinct simulatedDriver; refusing to alias it onto the real radio");
+    }
     this.drivers = {
       ft8cat: options.driver,
-      simulated: options.simulatedDriver ?? options.driver
+      simulated: options.simulatedDriver
     };
     this.driver = options.driver;
     this.logger = options.logger ?? console;
@@ -120,6 +125,9 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
 
     // Select the driver for this session, and bind only its events.
     this.driver = this.drivers[kind];
+    // Publish the selected driver's clock before the starting status so clients
+    // never see kind/clock pairs from two different engines.
+    this.clock = new SlotClock(this.driver.clock());
     this.bindDriverEvents();
 
     this.state = "starting";
@@ -143,6 +151,7 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
         // Driver may have failed before spawning.
       }
       this.unbindDriverEvents();
+      this.selectDefaultDriver();
       this.state = "inactive";
       this.session = null;
       this.emit("status");
@@ -165,6 +174,7 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
     await this.driver.stop();
     this.unbindDriverEvents();
     this.resetLocalState();
+    this.selectDefaultDriver();
     this.state = "inactive";
     this.session = null;
     this.emit("event", { type: "log", level: "info", message: "Session stopped" });
@@ -242,11 +252,20 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
       // Driver already exited.
     }
     this.unbindDriverEvents();
+    this.selectDefaultDriver();
     this.state = "inactive";
     this.session = null;
     const error = new DaemonError("PROCESS_CRASHED", "the engine exited unexpectedly");
     this.emit("error", error);
     this.emit("status");
+  }
+
+  // Inactive status always reports the real driver at scale 1. Leaving a demo
+  // session selected after stop would keep the DEMO banner up and leave a
+  // scaled clock published while no session is running.
+  private selectDefaultDriver(): void {
+    this.driver = this.drivers.ft8cat;
+    this.clock = new SlotClock(this.driver.clock());
   }
 
   private resetLocalState(): void {

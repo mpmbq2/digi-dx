@@ -2,6 +2,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { loadConfig, saveConfig, validateSessionConfig, type SessionConfig } from "./config.js";
 import { listAudioDevices, type AudioDevice } from "./audio-devices.js";
 import { type EngineApi, statusFromSnapshot } from "./engine.js";
+import { isNonAssignableCallsign } from "./sim-station.js";
 import { demoSessionConfig } from "./simulated-driver.js";
 import {
   DaemonError,
@@ -184,16 +185,31 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
     });
   }
 
+  function assertPersistableSession(session: SessionConfig): void {
+    // Demo identities are intentionally valid SessionConfigs so the simulated
+    // driver can start. They must never land on disk: a persisted QQ callsign
+    // or simulated device id would satisfy CONFIG_REQUIRED forever and key the
+    // next real session on a fabricated station.
+    if (isNonAssignableCallsign(session.callsign) || session.device.id === demoSessionConfig().device.id) {
+      throw new DaemonError("CONFIG_INVALID", "demo station identity cannot be saved as config", {
+        callsign: session.callsign,
+        deviceId: session.device.id
+      });
+    }
+  }
+
   async function handleSaveConfig(client: WebSocket, command: Record<string, unknown>, id?: CommandId): Promise<void> {
     if (options.engine.snapshot().state !== "inactive") {
       throw new DaemonError("SESSION_ALREADY_ACTIVE", "config cannot be saved while a session is active");
     }
 
-    const session = await saveConfig(command.session, options.configPath);
+    const session = validateSessionConfig(command.session);
+    assertPersistableSession(session);
+    const saved = await saveConfig(session, options.configPath);
     send(client, {
       ...(id === undefined ? {} : { id }),
       type: "config",
-      session,
+      session: saved,
       complete: true
     });
   }
@@ -226,6 +242,7 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
     let session: SessionConfig;
     if (command.session !== undefined) {
       session = validateSessionConfig(command.session);
+      assertPersistableSession(session);
       await saveConfig(session, options.configPath);
     } else {
       const loaded = await loadConfig(options.configPath);

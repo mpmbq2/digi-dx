@@ -172,23 +172,32 @@ function connectDaemon(): void {
     controlClaimPending = false;
     sessionActive = false;
     latestTxState = "idle";
+    // Drop the daemon's clock on disconnect: there is no authoritative time
+    // base until the next status arrives. Leaving a scaled clock (or an armed
+    // timer) across reconnect is exactly the demo→real footgun.
+    clock = null;
+    engineKind = "ft8cat";
+    clearAutomationState("daemon disconnected");
     appendLog("warn", "daemon connection closed; retrying in 2s");
   });
 
   client.on("status", (msg) => {
     const { session, tx, control } = msg;
     const hadControl = controlMine;
+    const previousActive = sessionActive;
+    const previousKind = engineKind;
+    const previousClock = clock;
 
-    // Adopt the daemon's clock. It can change mid-session (a demo session runs
-    // scaled), so re-arm any pending automation timer against the new rate
-    // rather than leaving it armed at the old one.
-    const hadClock = clock !== null;
-    const rateChanged = clock !== null && clock.spec.scale !== msg.clock.scale;
+    // Adopt the daemon's clock. Any field change (not just scale) can move the
+    // next boundary, so re-arm rather than leaving a timer at a stale anchor.
+    const clockDirty =
+      previousClock === null ||
+      previousClock.spec.epochMs !== msg.clock.epochMs ||
+      previousClock.spec.anchorWallMs !== msg.clock.anchorWallMs ||
+      previousClock.spec.slotMs !== msg.clock.slotMs ||
+      previousClock.spec.scale !== msg.clock.scale;
     clock = new SlotClock(msg.clock);
     engineKind = msg.engine;
-    if (!hadClock || rateChanged) {
-      clearAutomationTimer();
-    }
 
     if (session.callsign !== null) {
       myCall = session.callsign;
@@ -203,8 +212,21 @@ function connectDaemon(): void {
     }
     sessionActive = session.active;
     catConnected = session.catConnected;
+
+    const sessionEnded = previousActive && !session.active;
+    const kindChanged = previousKind !== msg.engine;
+    // Demo→real at scale 1 never trips a scale-only dirty check. Clear in-flight
+    // QSOs so leftover QQ0DEMO CQs cannot key the live radio or land in the
+    // real QSO log when they complete under the new engine.
+    if (sessionEnded || kindChanged) {
+      clearAutomationState(sessionEnded ? "session stopped" : "engine changed");
+    } else if (clockDirty) {
+      clearAutomationTimer();
+    }
+
     updateTxState(tx.state);
-    if ((!hadControl && controlMine) || !hadClock || rateChanged) {
+
+    if (sessionActive && ((!hadControl && controlMine) || clockDirty || (kindChanged && !sessionEnded))) {
       scheduleAutomation();
     }
     broadcastState();
@@ -351,6 +373,17 @@ function clearAutomationTimer(): void {
   scheduledAutomationTx = null;
 }
 
+function clearAutomationState(_reason: string): void {
+  clearAutomationTimer();
+  if (surveyActive) {
+    cancelSurvey("session boundary");
+  }
+  automation.qsos.splice(0);
+  pendingAutomationTx = null;
+  activeAutomationTx = null;
+  scheduledAutomationTx = null;
+}
+
 // Re-arm automation on the falling edge of "active" (a transmission finished),
 // or on a genuine "idle" (e.g. after cancel). The daemon rests in "pending"
 // after a TX, so we never rely on seeing "idle" to resume.
@@ -371,7 +404,7 @@ function updateTxState(next: TxState): void {
 function scheduleAutomation(): void {
   clearAutomationTimer();
 
-  if (surveyActive || !txEnabled || latestTxState === "active") {
+  if (!sessionActive || surveyActive || !txEnabled || latestTxState === "active") {
     broadcastState();
     return;
   }
@@ -411,7 +444,7 @@ function scheduleAutomation(): void {
 function sendAutomatedTx(tx: AutomationTx): void {
   automationTimer = null;
   scheduledAutomationTx = null;
-  if (surveyActive || !txEnabled || latestTxState === "active") {
+  if (!sessionActive || surveyActive || !txEnabled || latestTxState === "active") {
     return;
   }
   const af = currentAfOrNull();
@@ -530,6 +563,10 @@ function ensureAutomationControl(): boolean {
 function ensureIdentity(): boolean {
   if (!myCall || !myGrid) {
     appendLog("warn", "automation requires a callsign and grid");
+    return false;
+  }
+  if (!clock) {
+    appendLog("warn", "automation paused: awaiting the slot clock from the daemon");
     return false;
   }
   return true;

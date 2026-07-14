@@ -78,6 +78,10 @@ describe("SimulatedDriver", () => {
     expect(new SimulatedDriver().kind).toBe("simulated");
   });
 
+  it("defaults to real-time scale so interactive demo mode is not strobing", () => {
+    expect(new SimulatedDriver().clock().scale).toBe(1);
+  });
+
   it("publishes a scaled clock anchored on a slot boundary", () => {
     const driver = new SimulatedDriver({ scale: 20 });
     const spec = driver.clock();

@@ -307,7 +307,7 @@
       return;
     }
     const setup = state.setup;
-    if (!setup || setup.complete) {
+    if (!setup || setup.complete || (state.station && state.station.demo)) {
       refs.setupOverlay.hidden = true;
       return;
     }
