@@ -158,7 +158,7 @@ export interface OperatorController {
     callsign: string;
     grid: string;
     catMode: string;
-    catPort: string;
+    catPort: number;
   }): void;
   releaseControl(): void;
 
@@ -1056,7 +1056,7 @@ class OperatorControllerImpl implements OperatorController {
     callsign: string;
     grid: string;
     catMode: string;
-    catPort: string;
+    catPort: number;
   }): void {
     if (!this.ensureControl()) {
       return;

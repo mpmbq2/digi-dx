@@ -119,8 +119,8 @@ export interface CompletedQsoView {
 // already-logged callsigns (upper-case).
 export interface AnnotateContext {
   myCall: string;
-  activeCallColors: Map<string, string>;
-  workedCalls: Set<string>;
+  activeCallColors: ReadonlyMap<string, string>;
+  workedCalls: ReadonlySet<string>;
 }
 
 export function senderOf(message: string): string | null {
