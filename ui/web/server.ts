@@ -33,7 +33,7 @@ import {
   latestSlotAfs,
   senderOf,
   type AnnotateContext
-} from "./view-model.js";
+} from "../../core/view-model.js";
 import type { CommandMessage, LogLineView, SetupView, StateMessage, TxState } from "./protocol.js";
 
 let daemonUrl = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8788";
