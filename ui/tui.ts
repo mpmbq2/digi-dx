@@ -2,113 +2,87 @@ import blessed from "blessed";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DaemonClient } from "../core/daemon-client.js";
-import type { DaemonCommand } from "../core/protocol.js";
 import { appendQsoLog, qsoLogPathFor, readQsoLog } from "./qso-log.js";
 import { readTuiState, writeTuiState } from "./tui-state.js";
 import { bandForMHz, buildAdif } from "./adif.js";
 import {
   findOccupiedAf,
   messageForQso,
-  oppositeSlot,
-  parseFt8Message,
-  QsoAutomation,
   renderOccupancyBar,
   slotFromTimestamp,
-  suggestClearAf,
-  type AutomationTx,
   type DecodeRecord,
-  type QsoAutomationEvent,
   type QsoRecord,
   type TxSlot
 } from "../core/qso.js";
-import { SlotClock } from "../core/slot-clock.js";
 import type { EngineKind } from "../core/protocol.js";
+import type { SlotClock } from "../core/slot-clock.js";
+import { gridFrom, latestSlotAfs, senderOf } from "../core/view-model.js";
+import {
+  createOperatorController,
+  type ControllerState,
+  type QsoLogStore,
+  type StateStore
+} from "../core/controller.js";
 
 const url = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8788";
 const token = process.env.DIGI_DX_AUTH_TOKEN;
 
-const decodes: DecodeRecord[] = [];
+// The engine owns all QSO orchestration; the TUI only renders its ControllerState
+// and routes input to its methods. The one thing the TUI reads straight off the
+// wire is the raw decode/tx stream, because Band Activity is an append-driven
+// event log, not a snapshot — so it subscribes to the shared daemon client for
+// those rows while the controller (sharing that client) does the automation.
+const client = new DaemonClient({ url, token, logger: (message) => appendLog(message) });
 
-// Band Activity is a chronological list of rows: decodes, per-cycle separators,
-// and our own TX lines. bandRows mirrors the list items 1:1 so a selected row
-// maps back to its decode (separators/TX rows are not selectable for reply).
-type BandRow = { kind: "decode"; decode: DecodeRecord } | { kind: "sep" } | { kind: "tx" };
-const bandRows: BandRow[] = [];
-let lastBandPeriod: number | null = null;
+const qsoLog: QsoLogStore = {
+  append: (entry, engine: EngineKind) => appendQsoLog(entry, qsoLogPathFor(engine)),
+  readAll: () => readQsoLog()
+};
+const stateStore: StateStore = {
+  read: () => readTuiState(),
+  write: (patch) => writeTuiState({ dialFreqHz: patch.dialFreqHz ?? null })
+};
+const controller = createOperatorController({
+  client,
+  log: qsoLog,
+  state: stateStore,
+  token,
+  onLog: (_level, text) => appendLog(text),
+  bandForMHz
+});
 
-let myCall = "";
-let myGrid = "";
+// The latest engine snapshot, refreshed on every controller change. All render
+// functions read from it rather than from any local automation state.
+let state: ControllerState = controller.state;
 
-// --- automation state -----------------------------------------------------
-
-// The daemon is the authority on slot timing. We adopt the clock it publishes and
-// derive every slot decision from it. There is deliberately no wall-clock
-// fallback: before the first status, and after a reconnect, we have no clock, and
-// a silent `Date.now()` fallback is exactly the bug a scaled clock would hide.
-let clock: SlotClock | null = null;
-
-function requireClock(): SlotClock {
-  if (!clock) {
-    throw new Error("slot clock unavailable: no status received from the daemon yet");
-  }
-  return clock;
-}
-
-// Late-bound over the clock we adopt, and it throws rather than reaching for
-// `Date.now()` -- this is the one place that decides every logged QSO's
-// timestamp. Safe because the daemon sends a status on connect, before any
-// decode can arrive.
-const automation = new QsoAutomation(() => new Date(requireClock().now()));
-let selectedQsoId: string | null = null;
-let pendingAutomationTx: AutomationTx | null = null;
-let automationTimer: NodeJS.Timeout | null = null;
-let manualOverridePending = false;
-let latestTxState: "idle" | "pending" | "active" = "idle";
-let statusBase = "connecting...";
-const loggedQsoIds = new Set<string>();
-
-// Control/session state, tracked structurally from status updates so the
-// Start/Stop toggle and the auto-claim logic run off real state, not strings.
-let controlHeld = false;
-let controlMine = false;
-let sessionActive = false;
-let configComplete = false;
-
-// Operator-entered dial frequency (Hz). CAT control reports the wrong band on
-// this setup, so this manual value is what gets logged and exported. Null until
-// the operator sets it via the "freq…" command.
-let dialFreqHz: number | null = null;
-
-// Callsigns already in the QSO log — their decodes are greyed in Band Activity
-// so we don't call a station we have already worked. Seeded from the log file
-// at startup and extended as QSOs complete this session.
-const workedCalls = new Set<string>();
-
-// Slot survey: hold TX for one full receive cycle of our TX parity so the
-// (otherwise deaf) TX slot can be observed, then suggest a clear frequency.
-const SURVEY_LO_HZ = 300;
-const SURVEY_HI_HZ = 2700;
-const SURVEY_DECODE_LAG_SECONDS = 5;
-// Virtual seconds of lead before the slot opens, so it scales with the clock.
-const AUTOMATION_LEAD_SECONDS = 2;
-let engineKind: EngineKind = "ft8cat";
-let surveyActive = false;
-let surveySlot: TxSlot | null = null;
-let surveyStartSec = 0;
-let surveyEndSec = 0;
-let surveyTimer: NodeJS.Timeout | null = null;
-const PLOT_WIDTH = 24;
-
-// Last device id seen in a status update, used to pre-fill the save dialog.
-let lastDeviceId: number | null = null;
-
-const client = new DaemonClient({ url, token, logger: appendLog });
-
-function send(command: DaemonCommand): void {
+function send(command: Parameters<DaemonClient["send"]>[0]): void {
   if (!client.send(command)) {
     appendLog("not connected yet");
   }
 }
+
+function clock(): SlotClock | null {
+  return state.clock;
+}
+
+// --- local render state ----------------------------------------------------
+
+// Band Activity's own decode buffer, fed by the raw decode stream. Kept separate
+// from the engine's buffer so the append-driven list and occupancy plots stay
+// exactly as they were.
+const decodes: DecodeRecord[] = [];
+
+type BandRow = { kind: "decode"; decode: DecodeRecord } | { kind: "sep" } | { kind: "tx" };
+const bandRows: BandRow[] = [];
+let lastBandPeriod: number | null = null;
+
+let statusBase = "connecting...";
+let selectedQsoId: string | null = null;
+let lastDeviceId: number | null = null;
+
+const PLOT_WIDTH = 24;
+const SURVEY_LO_HZ = 300;
+const SURVEY_HI_HZ = 2700;
 
 // --- screen and widgets --------------------------------------------------
 
@@ -129,8 +103,6 @@ const statusBar = blessed.box({
   content: "connecting..."
 });
 
-// Explicit height (not a bottom anchor) so blessed's list scroll math works;
-// "48%-3" makes it end exactly at the QSO panel's top (row 3 + height = 48%).
 const decodeList = blessed.list({
   top: 3,
   left: 0,
@@ -149,7 +121,6 @@ const decodeList = blessed.list({
   }
 });
 
-// The QSO panel holds a CQ indicator (top line) and the active QSO list.
 const qsoArea = blessed.box({ top: "48%", left: 0, width: "55%", height: "25%" });
 
 const cqIndicator = blessed.box({
@@ -180,8 +151,6 @@ const qsoList = blessed.list({
   style: { selected: { bg: "blue", fg: "black" } }
 });
 
-// Completed QSOs: bottom-left, under Active QSOs. Explicit height ("27%-3" ends
-// at 100%-3, above the command bar) keeps list scrolling working.
 const completedPanel = blessed.list({
   top: "73%",
   left: 0,
@@ -207,7 +176,7 @@ const composePanel = blessed.box({
   label: " compose "
 });
 
-const afLabel = blessed.text({ parent: composePanel, top: 0, left: 1, content: "AF:" });
+blessed.text({ parent: composePanel, top: 0, left: 1, content: "AF:" });
 const afWarning = blessed.text({
   parent: composePanel,
   top: 0,
@@ -234,9 +203,12 @@ afInput.on("click", () => {
   return false;
 });
 afInput.on("submit", () => {
+  const af = Number(afInput.getValue());
+  if (Number.isInteger(af)) {
+    controller.setAf(af);
+  }
   updateAfWarning();
   renderOccupancyPlots();
-  scheduleAutomation();
   screen.render();
 });
 
@@ -251,11 +223,8 @@ const surveyButton = blessed.button({
   content: "Survey TX slot (pause 1 cycle, find clear freq)",
   style: { fg: "black", bg: "cyan", focus: { bg: "blue" }, hover: { bg: "blue" } }
 });
-surveyButton.on("press", startSurvey);
+surveyButton.on("press", () => controller.survey());
 
-// Live per-slot occupancy strips, refreshed each RX period. The slot you TX in
-// stays stale until a Survey (or manual pause) lets the radio hear it; that
-// slot's label is starred.
 const evenPlot = blessed.text({ parent: composePanel, top: 5, left: 1, tags: true, content: "" });
 const oddPlot = blessed.text({ parent: composePanel, top: 6, left: 1, tags: true, content: "" });
 
@@ -270,23 +239,17 @@ const slotButton = blessed.button({
   content: "slot: even (click to toggle)",
   align: "center"
 });
-let currentSlot: TxSlot = "even";
 slotButton.on("press", () => {
-  currentSlot = currentSlot === "even" ? "odd" : "even";
-  slotButton.setContent(`slot: ${currentSlot} (click to toggle)`);
-  updateAfWarning();
-  renderOccupancyPlots();
-  screen.render();
+  controller.setSlot(state.af.slot === "even" ? "odd" : "even");
 });
 
-// No manual message composition: a target callsign drives Reply QSO. Fill it by
-// double-clicking a decode (uses that message's sender) or by typing.
 const targetLabel = blessed.text({
   parent: composePanel,
   top: 10,
   left: 1,
   content: "target callsign (dbl-click a decode):"
 });
+void targetLabel;
 const targetInput = blessed.textbox({
   parent: composePanel,
   top: 11,
@@ -304,6 +267,8 @@ targetInput.on("click", () => {
   return false;
 });
 
+// Halt / resume. Halting cancels the current TX and disables automation (the
+// web client's model); pressing it again re-enables and resumes paused QSOs.
 const cancelButton = blessed.button({
   parent: composePanel,
   top: 14,
@@ -317,13 +282,11 @@ const cancelButton = blessed.button({
   style: { fg: "black", bg: "red" }
 });
 cancelButton.on("press", () => {
-  send({ type: "cancel_transmit" });
-  cancelSurvey("cancelled");
-  pendingAutomationTx = null;
-  manualOverridePending = false;
-  clearAutomationTimer();
-  automation.pauseAll("cancelled");
-  renderQsoList();
+  if (state.tx.enabled) {
+    controller.haltTx();
+  } else {
+    controller.setTxEnabled(true);
+  }
 });
 
 // --- qso automation controls ---------------------------------------------
@@ -347,27 +310,20 @@ function opButton(top: number, left: string | number, content: string, handler: 
 
 opButton(19, 1, "Call CQ", callCq);
 opButton(19, "48%", "Reply QSO", replyToTarget);
-opButton(20, 1, "Resume", () => actOnSelected((qso) => automation.resume(qso.id)));
-opButton(20, "48%", "Complete", () => {
-  const qso = selectedQso();
-  if (qso) {
-    handleQsoEvents(automation.complete(qso.id));
-    scheduleAutomation();
-  }
-});
+opButton(20, 1, "Resume", () => actOnSelected("resume"));
+opButton(20, "48%", "Complete", () => actOnSelected("complete"));
 opButton(21, 1, "Abandon", () => {
-  const qso = selectedQso();
-  if (qso) {
-    automation.abandon(qso.id);
+  const id = selectedQsoId;
+  if (id) {
+    controller.qsoAction(id, "abandon");
     selectedQsoId = null;
-    scheduleAutomation();
   }
 });
-opButton(21, "48%", "Retry", () => actOnSelected((qso) => automation.resetAttempts(qso.id)));
-opButton(22, 1, "Prev step", () => actOnSelected((qso) => automation.previousStep(qso.id)));
-opButton(22, "48%", "Next step", () => actOnSelected((qso) => automation.nextStep(qso.id)));
-opButton(23, 1, "Up", () => moveSelected(-1));
-opButton(23, "48%", "Down", () => moveSelected(1));
+opButton(21, "48%", "Retry", () => actOnSelected("retry"));
+opButton(22, 1, "Prev step", () => actOnSelected("prevStep"));
+opButton(22, "48%", "Next step", () => actOnSelected("nextStep"));
+opButton(23, 1, "Up", () => actOnSelected("moveUp"));
+opButton(23, "48%", "Down", () => actOnSelected("moveDown"));
 
 const logBox = blessed.log({
   top: "73%",
@@ -389,12 +345,9 @@ const commandBar = blessed.box({
   label: " commands "
 });
 
-// One button per daemon command. The Session button toggles start/stop and
-// auto-claims control; Release hands control back. Commands that need arguments
-// (save) open a dialog pre-filled from current status; the rest send at once.
 const commandButtons: Array<{ id?: string; label: string; run: () => void }> = [
   { id: "session", label: "▶ start", run: toggleSession },
-  { label: "release", run: releaseControl },
+  { label: "release", run: () => controller.releaseControl() },
   { label: "status", run: () => send({ type: "get_status" }) },
   { label: "config", run: () => send({ type: "get_config" }) },
   { label: "devices", run: () => send({ type: "list_audio_devices" }) },
@@ -420,55 +373,26 @@ commandButtons.forEach((command, index) => {
     sessionButton = button;
   }
 });
-renderSessionButton();
 
 // --- control workflow -----------------------------------------------------
 
-// Ensure we hold control before a state-changing command. Auto-claims when
-// control is free; refuses (with a friendly message) when another client holds
-// it. The daemon processes the claim before the command sent right after it, so
-// controlMine need not be updated yet for the follow-up command to succeed.
-function ensureControl(): boolean {
-  if (controlMine) {
-    return true;
-  }
-  if (controlHeld) {
-    appendLog("You do not have control (another client holds it)");
-    return false;
-  }
-  send({ type: "claim_control", ...(token ? { token } : {}) });
-  return true;
-}
-
 function toggleSession(): void {
-  if (!ensureControl()) {
-    return;
+  if (state.station.sessionActive) {
+    controller.stopSession();
+  } else {
+    controller.startSession();
   }
-  if (!sessionActive && !configComplete) {
-    appendLog("Complete station config first (command: save)");
-    return;
-  }
-  send(sessionActive ? { type: "stop_session" } : { type: "start_session" });
 }
 
-function releaseControl(): void {
-  if (!controlMine) {
-    appendLog(controlHeld ? "You do not have control (another client holds it)" : "control is not held");
-    return;
-  }
-  send({ type: "release_control" });
-}
-
-// Label/colour the Session toggle from the live session state: green ▶ start
-// when idle, red ■ stop while a session is running.
 function renderSessionButton(): void {
   if (!sessionButton) {
     return;
   }
-  sessionButton.setContent(sessionActive ? "■ stop" : configComplete ? "▶ start" : "▶ setup first");
-  sessionButton.style.bg = sessionActive ? "red" : configComplete ? "green" : "yellow";
+  const active = state.station.sessionActive;
+  const complete = state.setup.complete;
+  sessionButton.setContent(active ? "■ stop" : complete ? "▶ start" : "▶ setup first");
+  sessionButton.style.bg = active ? "red" : complete ? "green" : "yellow";
   sessionButton.style.fg = "black";
-  screen.render();
 }
 
 screen.append(statusBar);
@@ -495,16 +419,12 @@ decodeList.on("select", (_item, index) => {
   const doubleClick = index === lastBandClickIndex && now - lastBandClickTime < 500;
   lastBandClickIndex = index;
   lastBandClickTime = now;
-
-  // Double click: start a reply QSO for this message's sender. Do not touch the
-  // operator's AF field; a double click arrives as two list selections.
   if (doubleClick) {
     replyToDecode(record);
   }
   screen.render();
 });
 
-// 'r' replies to the selected decode's sender, or falls back to the target box.
 decodeList.key(["r"], () => {
   const index = (decodeList as unknown as { selected: number }).selected;
   const row = bandRows[index];
@@ -516,9 +436,6 @@ decodeList.key(["r"], () => {
 });
 decodeList.key(["c"], callCq);
 
-// Replace blessed's default list wheel (which moves the selection and snaps the
-// view back to it) with a plain viewport scroll, so wheeling starts from where
-// you are looking — the bottom — rather than the stale selection.
 const bandScroll = decodeList as unknown as { scroll(offset: number): void };
 decodeList.removeAllListeners("element wheeldown");
 decodeList.removeAllListeners("element wheelup");
@@ -541,26 +458,23 @@ function trackQsoSelection(): void {
 qsoList.on("select item", trackQsoSelection);
 qsoList.on("select", trackQsoSelection);
 qsoList.key(["c"], callCq);
-qsoList.key(["u", "S-up"], () => moveSelected(-1));
-qsoList.key(["d", "S-down"], () => moveSelected(1));
+qsoList.key(["u", "S-up"], () => actOnSelected("moveUp"));
+qsoList.key(["d", "S-down"], () => actOnSelected("moveDown"));
 
-function senderOf(message: string): string | null {
-  const parsed = parseFt8Message(message);
-  if (!parsed) {
-    return null;
-  }
-  return parsed.type === "cq" ? parsed.call : parsed.from;
+// --- input actions (routed to the controller) -----------------------------
+
+function callCq(): void {
+  controller.callCq(state.af.slot);
 }
 
-function gridFrom(message: string): string | null {
-  const parsed = parseFt8Message(message);
-  if (!parsed) {
-    return null;
+function replyToTarget(): void {
+  const call = targetInput.getValue().trim().toUpperCase();
+  if (!call) {
+    appendLog("enter a target callsign (or double-click a decode)");
+    return;
   }
-  if (parsed.type === "cq") {
-    return parsed.grid;
-  }
-  return parsed.payload.type === "grid" ? parsed.payload.grid : null;
+  targetInput.clearValue();
+  controller.replyToCall(call);
 }
 
 function replyToDecode(record: DecodeRecord): void {
@@ -569,34 +483,34 @@ function replyToDecode(record: DecodeRecord): void {
     appendLog("selected decode has no sender callsign");
     return;
   }
-  replyToCall(sender, oppositeSlot(slotFromTimestamp(record.ts)), gridFrom(record.message));
+  // The controller derives the reply slot and their grid from its own decode
+  // buffer, so the TUI only has to name the station.
+  controller.replyToCall(sender);
 }
 
-function findLastDecodeFrom(call: string): DecodeRecord | null {
-  for (let index = decodes.length - 1; index >= 0; index--) {
-    if (senderOf(decodes[index]!.message) === call) {
-      return decodes[index]!;
-    }
+function actOnSelected(action: Parameters<typeof controller.qsoAction>[1]): void {
+  if (selectedQsoId) {
+    controller.qsoAction(selectedQsoId, action);
   }
-  return null;
 }
 
-// Each active QSO gets a stable colour, used to tint its decodes in Band
-// Activity and mark its row. Yellow is reserved for "replying to me".
+// --- rendering ------------------------------------------------------------
+
 const QSO_PALETTE = ["cyan", "magenta", "green", "blue", "red", "white"];
 const qsoColors = new Map<string, string>();
 let nextQsoColor = 0;
-function colorForQso(qso: QsoRecord): string {
-  let color = qsoColors.get(qso.id);
+function colorForQso(id: string): string {
+  let color = qsoColors.get(id);
   if (!color) {
     color = QSO_PALETTE[nextQsoColor % QSO_PALETTE.length]!;
     nextQsoColor++;
-    qsoColors.set(qso.id, color);
+    qsoColors.set(id, color);
   }
   return color;
 }
 
 function mentionsMyCall(message: string): boolean {
+  const myCall = state.station.call;
   if (!myCall) {
     return false;
   }
@@ -622,21 +536,19 @@ function pushBandSeparator(periodStart: number, youTx: boolean): void {
 }
 
 function decodeMarkup(message: string, line: string): string {
-  // Someone replying to me stays yellow, regardless of any QSO colour.
   if (mentionsMyCall(message)) {
     return `{black-fg}{yellow-bg}${line}{/yellow-bg}{/black-fg}`;
   }
   const sender = senderOf(message);
   if (sender) {
-    const qso = automation.qsos.find(
+    const qso = state.qsos.active.find(
       (candidate) => candidate.kind === "standard" && candidate.theirCall === sender && candidate.status !== "complete"
     );
     if (qso) {
-      const color = colorForQso(qso);
+      const color = colorForQso(qso.id);
       return `{black-fg}{${color}-bg}${line}{/${color}-bg}{/black-fg}`;
     }
-    // Already worked (in the log): grey it out so we don't call them again.
-    if (workedCalls.has(sender)) {
+    if (state.workedCalls.has(sender)) {
       return `{grey-fg}${line}{/grey-fg}`;
     }
   }
@@ -652,8 +564,6 @@ function appendBandDecode(record: DecodeRecord): void {
   decodeList.scrollTo(bandRows.length);
 }
 
-// Our TX slot is deaf, so a cycle we transmit in has no decodes; show the TX
-// message there instead.
 function appendBandTx(ts: number, af: number, message: string): void {
   pushBandSeparator(Math.floor(ts / 15) * 15, true);
   bandRows.push({ kind: "tx" });
@@ -662,27 +572,23 @@ function appendBandTx(ts: number, af: number, message: string): void {
 }
 
 // --- cycle clock ----------------------------------------------------------
-// Shows the current even/odd 15s period, the countdown to the next boundary,
-// and whether we are transmitting. Ticks on a timer independent of daemon
-// messages so the countdown stays live.
 
 function clockSegment(): string {
-  if (!clock) {
+  const c = clock();
+  if (!c) {
     return "{grey-fg}awaiting slot clock{/grey-fg}";
   }
-  // Virtual seconds, not wall seconds: decode timestamps and the countdown must
-  // agree, and under a scaled engine only one of those is wall time.
-  const nowSec = Math.floor(clock.now() / 1000);
-  const slotSeconds = clock.spec.slotMs / 1000;
+  const nowSec = Math.floor(c.now() / 1000);
+  const slotSeconds = c.spec.slotMs / 1000;
   const parity = slotFromTimestamp(nowSec);
   const remain = slotSeconds - (nowSec % slotSeconds);
   let tx: string;
-  if (surveyActive) {
-    const left = Math.max(0, surveyEndSec - nowSec);
-    tx = `{cyan-fg}{bold}SURVEY ${surveySlot} t-${left}s{/bold}{/cyan-fg}`;
-  } else if (latestTxState === "active") {
+  if (state.survey.active) {
+    const left = Math.max(0, state.survey.endSec - nowSec);
+    tx = `{cyan-fg}{bold}SURVEY ${state.survey.slot} t-${left}s{/bold}{/cyan-fg}`;
+  } else if (state.tx.state === "active") {
     tx = "{red-fg}{bold}TX{/bold}{/red-fg}";
-  } else if (latestTxState === "pending") {
+  } else if (state.tx.state === "pending") {
     tx = "{yellow-fg}TX-arm{/yellow-fg}";
   } else {
     tx = "{green-fg}RX{/green-fg}";
@@ -691,119 +597,15 @@ function clockSegment(): string {
 }
 
 function renderStatusBar(): void {
+  const dialFreqHz = state.station.dialFreqHz;
   const qrg = dialFreqHz
     ? `{green-fg}${(dialFreqHz / 1e6).toFixed(3)}MHz{/green-fg}`
     : "{yellow-fg}unset{/yellow-fg}";
-  // Unmissable: a simulated QSO that an operator mistakes for a real one gets
-  // logged, and a fabricated contact uploaded to LoTW cannot be taken back.
-  const demo =
-    engineKind === "simulated" ? "{black-fg}{yellow-bg} DEMO — NOT ON THE AIR {/}  ||  " : "";
+  const demo = state.station.demo ? "{black-fg}{yellow-bg} DEMO — NOT ON THE AIR {/}  ||  " : "";
   statusBar.setContent(`${demo}${statusBase}  ||  ${clockSegment()}  ||  QRG=${qrg}`);
-  screen.render();
 }
 
-function setDialFreqHz(value: number | null): void {
-  dialFreqHz = value;
-  renderStatusBar();
-  void persistTuiState();
-}
-
-async function persistTuiState(): Promise<void> {
-  try {
-    await writeTuiState({ dialFreqHz });
-  } catch (error) {
-    appendLog(`[state error] ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-// --- qso automation helpers ----------------------------------------------
-
-function ensureAutomationIdentity(): boolean {
-  if (!myCall || !myGrid) {
-    appendLog("automation requires configured callsign and grid");
-    return false;
-  }
-  return true;
-}
-
-function callCq(): void {
-  if (!ensureAutomationIdentity()) {
-    return;
-  }
-  automation.createCq(myCall, myGrid, currentSlot, "top");
-  appendLog("[qso] calling CQ");
-  renderQsoList();
-  scheduleAutomation();
-}
-
-function replyToTarget(): void {
-  if (!ensureAutomationIdentity()) {
-    return;
-  }
-  const call = targetInput.getValue().trim().toUpperCase();
-  if (!call) {
-    appendLog("enter a target callsign (or double-click a decode)");
-    return;
-  }
-  // Best-guess reply slot and their grid from the most recent decode of them.
-  const last = findLastDecodeFrom(call);
-  replyToCall(call, last ? oppositeSlot(slotFromTimestamp(last.ts)) : currentSlot, last ? gridFrom(last.message) : null);
-}
-
-function replyToCall(call: string, nextSlot: TxSlot, theirGrid: string | null): void {
-  if (!ensureAutomationIdentity()) {
-    return;
-  }
-  const normalizedCall = call.trim().toUpperCase();
-  if (!/^[A-Z0-9/]{2,}$/.test(normalizedCall)) {
-    appendLog(`'${normalizedCall}' is not a valid callsign`);
-    return;
-  }
-  const existing = automation.qsos.find(
-    (qso) => qso.kind === "standard" && qso.theirCall === normalizedCall && qso.status !== "complete"
-  );
-  if (existing) {
-    appendLog(`QSO already exists for ${normalizedCall}`);
-    selectQso(existing.id);
-    return;
-  }
-  const qso = automation.createReplyToCall(normalizedCall, myCall, myGrid, nextSlot, theirGrid, "top");
-  colorForQso(qso);
-  appendLog(`[qso] reply to ${qso.theirCall}`);
-  targetInput.clearValue();
-  selectQso(qso.id);
-  scheduleAutomation();
-}
-
-function selectedQso(): QsoRecord | null {
-  if (!selectedQsoId) {
-    return null;
-  }
-  return automation.qsos.find((qso) => qso.id === selectedQsoId) ?? null;
-}
-
-function selectQso(id: string | null): void {
-  selectedQsoId = id;
-  renderQsoList();
-}
-
-function actOnSelected(action: (qso: QsoRecord) => unknown): void {
-  const qso = selectedQso();
-  if (!qso) {
-    return;
-  }
-  action(qso);
-  scheduleAutomation();
-}
-
-function moveSelected(delta: -1 | 1): void {
-  const qso = selectedQso();
-  if (!qso) {
-    return;
-  }
-  automation.move(qso.id, delta);
-  scheduleAutomation();
-}
+// --- qso list -------------------------------------------------------------
 
 function formatQsoRow(qso: QsoRecord, priority: number): string {
   const who = qso.theirCall ?? "CQ";
@@ -811,7 +613,7 @@ function formatQsoRow(qso: QsoRecord, priority: number): string {
   const preview = messageForQso(qso) ?? "-";
   const lastRx = qso.rxMessages[qso.rxMessages.length - 1]?.message ?? "-";
   const note = qso.note ? ` (${qso.note})` : "";
-  const color = colorForQso(qso);
+  const color = colorForQso(qso.id);
   const dot = `{${color}-fg}●{/${color}-fg}`;
   const base = `${priority} ${qso.status} ${who} ${qso.step} att=${attempts} rx>${lastRx} tx>${preview}${note}`;
   switch (qso.status) {
@@ -831,22 +633,16 @@ function formatCompletedRow(qso: QsoRecord): string {
   return `{green-fg}✓ ${qso.theirCall ?? "?"}${grid} ${reports}{/green-fg}`;
 }
 
-function renderCqIndicator(): void {
-  cqIndicator.setContent(
-    automation.isCallingCq()
-      ? "{green-bg}{black-fg} ● CALLING CQ {/black-fg}{/green-bg}"
-      : "{grey-fg}○ CQ idle — press Call CQ to start{/grey-fg}"
-  );
-}
-
-// Active QSOs exclude the hidden CQ row (shown via the indicator) and completed
-// QSOs (shown in their own list). renderedActive maps list rows to records.
 let renderedActive: QsoRecord[] = [];
 
 function renderQsoList(): void {
-  renderCqIndicator();
+  cqIndicator.setContent(
+    state.qsos.callingCq
+      ? "{green-bg}{black-fg} ● CALLING CQ {/black-fg}{/green-bg}"
+      : "{grey-fg}○ CQ idle — press Call CQ to start{/grey-fg}"
+  );
 
-  renderedActive = automation.qsos.filter((qso) => qso.kind !== "calling-cq" && qso.status !== "complete");
+  renderedActive = state.qsos.active.filter((qso) => qso.kind !== "calling-cq" && qso.status !== "complete");
   qsoList.setItems(renderedActive.map((qso, index) => formatQsoRow(qso, index + 1)));
   if (selectedQsoId) {
     const index = renderedActive.findIndex((qso) => qso.id === selectedQsoId);
@@ -857,60 +653,10 @@ function renderQsoList(): void {
     }
   }
 
-  renderCompleted();
-
-  screen.render();
+  completedPanel.setItems(state.qsos.completed.map(formatCompletedRow));
 }
 
-function renderCompleted(): void {
-  completedPanel.setItems(automation.qsos.filter((qso) => qso.status === "complete").map(formatCompletedRow));
-}
-
-function handleQsoEvents(events: QsoAutomationEvent[]): void {
-  for (const event of events) {
-    switch (event.type) {
-      case "qso_created":
-        colorForQso(event.qso);
-        appendLog(`[qso] created ${event.qso.theirCall ?? "CQ"}`);
-        break;
-      case "qso_updated":
-        appendLog(`[qso] ${event.qso.theirCall} ${event.previousStep} -> ${event.qso.step}`);
-        break;
-      case "qso_completed":
-        appendLog(`[qso] complete ${event.qso.theirCall ?? "CQ"} (${event.reason})`);
-        void logCompletedQso(event.qso, event.reason);
-        break;
-      case "qso_timed_out":
-        appendLog(`[qso] timed out ${event.qso.theirCall ?? "CQ"} step=${event.qso.step}`);
-        break;
-      case "cq_stopped":
-        appendLog("[qso] CQ stopped after reply");
-        break;
-    }
-  }
-  renderQsoList();
-}
-
-async function logCompletedQso(qso: QsoRecord, reason: string): Promise<void> {
-  if (loggedQsoIds.has(qso.id)) {
-    return;
-  }
-  const entry = automation.toLogEntry(qso, reason, dialFreqHz);
-  if (!entry) {
-    return;
-  }
-  loggedQsoIds.add(qso.id);
-  try {
-    await appendQsoLog(entry, qsoLogPathFor(engineKind));
-    workedCalls.add(entry.theirCall);
-    appendLog(`[qso-log] wrote ${entry.theirCall}${dialFreqHz ? ` @${(dialFreqHz / 1e6).toFixed(3)}MHz` : " (no freq set)"}`);
-  } catch (error) {
-    loggedQsoIds.delete(qso.id);
-    appendLog(`[qso-log error] ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-// --- occupied AF warning --------------------------------------------------
+// --- occupancy plots + AF warning -----------------------------------------
 
 function updateAfWarning(): void {
   const af = Number(afInput.getValue());
@@ -918,220 +664,45 @@ function updateAfWarning(): void {
     afWarning.setContent("");
     return;
   }
-  const match = findOccupiedAf(decodes, af, currentSlot, 50, 2);
+  const match = findOccupiedAf(decodes, af, state.af.slot, 50, 2);
   afWarning.setContent(
     match ? `{yellow-fg}occupied +/-50Hz: ${match.decode.af} ${match.decode.message}{/yellow-fg}` : ""
   );
 }
 
-// The slot we transmit in: the active CQ row's slot, else the manual slot.
-function currentTxSlot(): TxSlot {
-  const cq = automation.qsos.find((qso) => qso.kind === "calling-cq" && qso.status === "active");
-  return cq ? cq.nextSlot : currentSlot;
-}
-
-// AFs decoded in the most recent RX period of the given parity ("the last set
-// of decodes" for that slot). Empty until a period of that parity is heard.
-function latestSlotAfs(parity: TxSlot): number[] {
-  let latestStart = -1;
-  for (const decode of decodes) {
-    if (slotFromTimestamp(decode.ts) !== parity) {
-      continue;
-    }
-    const start = Math.floor(decode.ts / 15) * 15;
-    if (start > latestStart) {
-      latestStart = start;
-    }
-  }
-  if (latestStart < 0) {
-    return [];
-  }
-  return decodes.filter((decode) => Math.floor(decode.ts / 15) * 15 === latestStart).map((decode) => decode.af);
-}
-
 function renderOccupancyPlots(): void {
   const afValue = Number(afInput.getValue());
   const mark = Number.isInteger(afValue) ? afValue : undefined;
-  const txSlot = currentTxSlot();
-  const even = renderOccupancyBar(latestSlotAfs("even"), SURVEY_LO_HZ, SURVEY_HI_HZ, PLOT_WIDTH, mark);
-  const odd = renderOccupancyBar(latestSlotAfs("odd"), SURVEY_LO_HZ, SURVEY_HI_HZ, PLOT_WIDTH, mark);
+  const txSlot = state.af.slot;
+  const even = renderOccupancyBar(latestSlotAfs(decodes, "even"), SURVEY_LO_HZ, SURVEY_HI_HZ, PLOT_WIDTH, mark);
+  const odd = renderOccupancyBar(latestSlotAfs(decodes, "odd"), SURVEY_LO_HZ, SURVEY_HI_HZ, PLOT_WIDTH, mark);
   evenPlot.setContent(`${txSlot === "even" ? "{bold}E*{/bold}" : "E "}|${even}|`);
   oddPlot.setContent(`${txSlot === "odd" ? "{bold}O*{/bold}" : "O "}|${odd}|`);
 }
 
-// --- scheduler ------------------------------------------------------------
-
-function currentAfOrNull(): number | null {
-  const af = Number(afInput.getValue());
-  if (!Number.isInteger(af) || af < 200 || af > 3000) {
-    return null;
-  }
-  return af;
-}
-
-function clearAutomationTimer(): void {
-  if (automationTimer) {
-    clearTimeout(automationTimer);
-    automationTimer = null;
-  }
-}
-
-// The daemon rests in "pending" after a transmission (its desiredTx lingers
-// until cancel/clear), so we can never rely on seeing "idle" to resume. Re-arm
-// automation on the falling edge of "active" (a transmission just finished), or
-// on a genuine "idle" (e.g. after cancel).
-function updateTxState(next: "idle" | "pending" | "active"): void {
-  const wasActive = latestTxState === "active";
-  latestTxState = next;
-  if (manualOverridePending || surveyActive || next === "active") {
-    return;
-  }
-  if (wasActive || next === "idle") {
-    scheduleAutomation();
-  }
-}
-
-function scheduleAutomation(): void {
-  clearAutomationTimer();
-  renderQsoList();
-  updateAfWarning();
-
-  if (!sessionActive || surveyActive || manualOverridePending || latestTxState === "active") {
-    return;
-  }
-
-  const af = currentAfOrNull();
-  if (af === null) {
-    return;
-  }
-
-  const tx = automation.nextTransmission(af);
-  if (!tx) {
-    return;
-  }
-
-  if (!clock) {
-    appendLog("[automation] paused: awaiting the slot clock from the daemon");
-    return;
-  }
-
-  // Arm two virtual seconds before the slot opens. The clock converts that
-  // virtual lead into the wall delay setTimeout actually needs.
-  automationTimer = setTimeout(
-    () => sendAutomatedTx(tx),
-    clock.wallDelayUntilSlot(tx.intent.slot, AUTOMATION_LEAD_SECONDS)
-  );
-}
-
-function sendAutomatedTx(tx: AutomationTx): void {
-  automationTimer = null;
-  if (!sessionActive || surveyActive || manualOverridePending || latestTxState === "active") {
-    return;
-  }
-  const af = currentAfOrNull();
-  if (af === null) {
-    appendLog("automation paused: invalid AF");
-    return;
-  }
-
-  const refreshed: AutomationTx = {
-    ...tx,
-    intent: { ...tx.intent, af }
-  };
-
-  pendingAutomationTx = refreshed;
-  send({ type: "transmit", ...refreshed.intent });
-  renderQsoList();
-}
-
-// --- slot survey ----------------------------------------------------------
-
-function startSurvey(): void {
-  if (surveyActive) {
-    appendLog("[survey] already running");
-    return;
-  }
-  // Our TX parity is the active CQ row's slot, falling back to the manual slot.
-  const cq = automation.qsos.find((qso) => qso.kind === "calling-cq" && qso.status === "active");
-  const slot: TxSlot = cq ? cq.nextSlot : currentSlot;
-
-  surveyActive = true;
-  surveySlot = slot;
-  surveyStartSec = clock ? Math.floor(clock.now() / 1000) : 0;
-
-  // Stop transmitting so the radio can actually hear its own TX slot: drop any
-  // armed timer and cancel a queued (not yet keyed) automated transmit.
-  clearAutomationTimer();
-  if (pendingAutomationTx) {
-    send({ type: "cancel_transmit" });
-    pendingAutomationTx = null;
-  }
-
-  if (!clock) {
-    appendLog("[survey] unavailable: awaiting the slot clock from the daemon");
-    surveyActive = false;
-    return;
-  }
-
-  // Wait for the next full receive cycle of this parity, plus decode latency.
-  // That is a negative offset -- past the boundary, not before it -- and the slot
-  // length comes from the clock, never a literal 15.
-  const slotSeconds = clock.spec.slotMs / 1000;
-  const pastBoundary = slotSeconds + SURVEY_DECODE_LAG_SECONDS;
-  const delaySec = clock.secondsUntilSlot(slot) + pastBoundary;
-  surveyEndSec = clock.virtualDeadlineAfter(delaySec);
-  appendLog(`[survey] holding TX ~${delaySec}s to listen on the ${slot} slot`);
-  updateSurveyButton();
-  renderStatusBar();
-  if (surveyTimer) {
-    clearTimeout(surveyTimer);
-  }
-  surveyTimer = setTimeout(finishSurvey, clock.wallDelayUntilSlot(slot, -pastBoundary));
-}
-
-function finishSurvey(): void {
-  surveyTimer = null;
-  const slot = surveySlot;
-  surveyActive = false;
-  surveySlot = null;
-
-  if (slot) {
-    // The held cycle refreshed this slot's plot; auto-pick the widest clear gap.
-    const occupied = latestSlotAfs(slot);
-    const suggestion = suggestClearAf(occupied, SURVEY_LO_HZ, SURVEY_HI_HZ);
-    afInput.setValue(String(suggestion));
-    appendLog(`[survey] ${slot} slot updated, clear@${suggestion}Hz (${occupied.length} sigs)`);
-  }
-
-  updateSurveyButton();
-  renderOccupancyPlots();
-  renderStatusBar();
-  scheduleAutomation();
-}
-
-function cancelSurvey(reason: string): void {
-  if (!surveyActive) {
-    return;
-  }
-  if (surveyTimer) {
-    clearTimeout(surveyTimer);
-    surveyTimer = null;
-  }
-  surveyActive = false;
-  surveySlot = null;
-  appendLog(`[survey] aborted (${reason})`);
-  updateSurveyButton();
-  renderStatusBar();
-}
-
 function updateSurveyButton(): void {
-  if (surveyActive) {
+  if (state.survey.active) {
     surveyButton.setContent("SURVEYING… (CANCEL TX to stop)");
     surveyButton.style.bg = "red";
   } else {
     surveyButton.setContent("Survey TX slot (find clear freq)");
     surveyButton.style.bg = "cyan";
   }
+}
+
+function renderSlotButton(): void {
+  slotButton.setContent(`slot: ${state.af.slot} (click to toggle)`);
+}
+
+// Redraw everything that derives from a controller snapshot.
+function renderFromState(): void {
+  renderQsoList();
+  renderSessionButton();
+  renderSlotButton();
+  updateSurveyButton();
+  updateAfWarning();
+  renderOccupancyPlots();
+  renderStatusBar();
   screen.render();
 }
 
@@ -1139,8 +710,6 @@ function updateSurveyButton(): void {
 
 let dialogOpen = false;
 
-// Modal form: a labelled textbox per field plus OK/Cancel. Pre-filled values
-// are shown so the operator can accept or edit them.
 function openDialog(
   title: string,
   fields: Array<{ name: string; label: string; value: string }>,
@@ -1223,7 +792,6 @@ function openDialog(
   ok.key(["enter", "space"], submit);
   cancel.key(["enter", "space"], close);
 
-  // Enter advances to the next field; from the last field it moves to OK.
   inputs.forEach((input, index) => {
     input.on("submit", () => {
       focusDialogField(inputs[index + 1] ?? ok);
@@ -1257,10 +825,6 @@ function focusDialogField(field: blessed.Widgets.BlessedElement): void {
   focusFieldWithoutInputTrap(field);
 }
 
-// Focus a field, defeating blessed's inputOnFocus "focus trap": a textbox that
-// is still reading rewinds focus back to itself on blur, which can instantly
-// blur the field we are trying to focus. Disabling inputOnFocus on the mid-read
-// textbox while we take focus stops the rewind; we restore it after.
 function focusFieldWithoutInputTrap(field: blessed.Widgets.BlessedElement): void {
   if (screen.focused === field) {
     return;
@@ -1281,8 +845,8 @@ function openSaveDialog(): void {
     "save config",
     [
       { name: "deviceId", label: "device id", value: lastDeviceId != null ? String(lastDeviceId) : "" },
-      { name: "callsign", label: "callsign", value: myCall },
-      { name: "grid", label: "grid", value: myGrid },
+      { name: "callsign", label: "callsign", value: state.station.call },
+      { name: "grid", label: "grid", value: state.station.grid },
       { name: "catMode", label: "cat mode (rigctld|dummy)", value: "rigctld" },
       { name: "catPort", label: "cat port", value: "4532" }
     ],
@@ -1292,38 +856,35 @@ function openSaveDialog(): void {
         appendLog("save: device id, callsign, grid, and cat mode are required");
         return;
       }
-      send({
-        type: "save_config",
-        session: {
-          mode: "FT8",
-          device: { id: deviceId },
-          callsign: values.callsign,
-          grid: values.grid,
-          cat: { mode: values.catMode, port: values.catPort ? Number(values.catPort) : 4532 }
-        }
+      controller.saveSetup({
+        deviceId,
+        callsign: values.callsign!,
+        grid: values.grid!,
+        catMode: values.catMode!,
+        catPort: values.catPort ? Number(values.catPort) : 4532
       });
-      configComplete = true;
-      renderSessionButton();
       appendLog(`[save] device=${deviceId} ${values.callsign} ${values.grid} ${values.catMode}`);
     }
   );
 }
 
-// Operating (dial) frequency: entered manually because CAT reports the wrong
-// band on this setup. Stored in Hz; logged with each QSO and used for export.
 function openFreqDialog(): void {
   openDialog(
     "operating frequency",
-    [{ name: "mhz", label: "dial freq MHz (e.g. 14.074)", value: dialFreqHz ? (dialFreqHz / 1e6).toFixed(3) : "" }],
+    [
+      {
+        name: "mhz",
+        label: "dial freq MHz (e.g. 14.074)",
+        value: state.station.dialFreqHz ? (state.station.dialFreqHz / 1e6).toFixed(3) : ""
+      }
+    ],
     (values) => {
       const mhz = Number(values.mhz);
       if (!Number.isFinite(mhz) || mhz <= 0) {
         appendLog("freq: enter a positive frequency in MHz (e.g. 14.074)");
         return;
       }
-      setDialFreqHz(Math.round(mhz * 1e6));
-      const band = bandForMHz(mhz);
-      appendLog(`[freq] operating dial freq = ${mhz.toFixed(3)} MHz${band ? ` (${band})` : " (out of ham band?)"}`);
+      controller.setDialFreq(mhz);
     }
   );
 }
@@ -1365,151 +926,30 @@ async function exportAdif(path: string): Promise<void> {
   }
 }
 
-// --- websocket event handling ---------------------------------------------
+// --- raw daemon stream (Band Activity rendering only) ---------------------
 
 client.on("open", () => {
   appendLog(`connected to ${url}`);
-  send({ type: "get_config" });
   decodeList.focus();
   screen.render();
-});
-
-client.on("close", () => {
-  sessionActive = false;
-  clock = null;
-  engineKind = "ft8cat";
-  clearAutomationTimer();
-  automation.qsos.splice(0);
-  appendLog("connection closed");
-  screen.render();
-});
-
-client.on("status", (msg) => {
-  const { session, tx, control } = msg;
-  const previousActive = sessionActive;
-  const previousKind = engineKind;
-  const previousClock = clock;
-
-  // Adopt the daemon's clock. Any field change (not just scale) can move the
-  // next boundary, so drop timers rather than leaving them at a stale anchor.
-  const clockDirty =
-    previousClock === null ||
-    previousClock.spec.epochMs !== msg.clock.epochMs ||
-    previousClock.spec.anchorWallMs !== msg.clock.anchorWallMs ||
-    previousClock.spec.slotMs !== msg.clock.slotMs ||
-    previousClock.spec.scale !== msg.clock.scale;
-  clock = new SlotClock(msg.clock);
-  engineKind = msg.engine;
-
-  const sessionEnded = previousActive && !session.active;
-  const kindChanged = previousKind !== msg.engine;
-  if (sessionEnded || kindChanged) {
-    clearAutomationTimer();
-    automation.qsos.splice(0);
-  } else if (clockDirty) {
-    clearAutomationTimer();
-  }
-
-  if (session.callsign !== null) {
-    myCall = session.callsign;
-  }
-  if (session.grid !== null) {
-    myGrid = session.grid;
-  }
-  if (session.device) {
-    lastDeviceId = session.device.id;
-  }
-  controlHeld = control.held;
-  controlMine = control.byThisClient;
-  sessionActive = session.active;
-  statusBase =
-    `{bold}active{/bold}=${session.active} device=${session.device?.id ?? "-"} ` +
-    `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
-    `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`;
-  updateTxState(tx.state);
-  if (sessionActive && (clockDirty || (kindChanged && !sessionEnded))) {
-    scheduleAutomation();
-  }
-  renderSessionButton();
-  renderStatusBar();
 });
 
 client.on("decode", (msg) => {
   const record: DecodeRecord = { ts: msg.ts, snr: msg.snr, dt: msg.dt, af: msg.af, message: msg.message };
   decodes.push(record);
   appendBandDecode(record);
-  screen.render();
-
-  // Occupied-frequency info and the per-slot plots depend on decodes.
   updateAfWarning();
   renderOccupancyPlots();
-
-  // Only touch the scheduler when a decode actually advances a QSO. An
-  // unrelated decode must not re-arm (or re-fire) the active transmission,
-  // e.g. it must not keep re-triggering CQ while we wait for a reply.
-  const events = automation.handleDecode(record, myCall, myGrid);
-  if (events.length > 0) {
-    handleQsoEvents(events);
-    // A live QSO beats surveying: if a caller just answered, stop holding.
-    cancelSurvey("answering caller");
-    scheduleAutomation();
-  }
+  screen.render();
 });
 
 client.on("tx", (msg) => {
-  appendLog(`[tx] af=${msg.af} ${msg.message}`);
   appendBandTx(msg.ts, msg.af, msg.message);
-  if (manualOverridePending) {
-    manualOverridePending = false;
-    pendingAutomationTx = null;
-    scheduleAutomation();
-    return;
-  }
-  const result = automation.confirmTransmission(pendingAutomationTx, { ts: msg.ts, af: msg.af, message: msg.message });
-  if (result.matched) {
-    pendingAutomationTx = null;
-  }
-  if (result.events.length > 0) {
-    handleQsoEvents(result.events);
-  }
-  scheduleAutomation();
+  screen.render();
 });
 
 client.on("tx_update", (msg) => {
   appendLog(`[tx_update] state=${msg.state} af=${msg.af ?? "-"} slot=${msg.slot ?? "-"} msg=${msg.message ?? "-"}`);
-  updateTxState(msg.state);
-});
-
-client.on("log", (msg) => {
-  appendLog(`[${msg.level}] ${msg.message}`);
-});
-
-client.on("daemonError", (msg) => {
-  if (msg.code === "CONTROL_REQUIRED" || msg.code === "CONTROL_UNAVAILABLE") {
-    appendLog("You do not have control (another client holds it)");
-  } else {
-    appendLog(`[error] ${msg.code}: ${msg.message}${msg.details ? ` ${JSON.stringify(msg.details)}` : ""}`);
-  }
-  if (pendingAutomationTx) {
-    // Do not count this as an attempt; leave the QSO active and retry later.
-    pendingAutomationTx = null;
-    scheduleAutomation();
-  }
-});
-
-client.on("config", (msg) => {
-  configComplete = msg.complete;
-  if (msg.session?.callsign) {
-    myCall = msg.session.callsign;
-  }
-  if (msg.session?.grid) {
-    myGrid = msg.session.grid;
-  }
-  if (msg.session?.device?.id != null) {
-    lastDeviceId = msg.session.device.id;
-  }
-  appendLog(`[config] complete=${msg.complete} ${JSON.stringify(msg.session ?? msg.missing ?? "")}`);
-  renderSessionButton();
 });
 
 client.on("audio_devices", (msg) => {
@@ -1519,53 +959,39 @@ client.on("audio_devices", (msg) => {
   }
 });
 
-// Seed the worked-callsign set from the persisted log so already-worked
-// stations are greyed in Band Activity from the first decode.
-async function loadWorkedCalls(): Promise<void> {
-  try {
-    const entries = await readQsoLog();
-    for (const entry of entries) {
-      if (entry.theirCall) {
-        workedCalls.add(entry.theirCall.toUpperCase());
-      }
-    }
-    appendLog(`[qso-log] ${workedCalls.size} worked callsign(s) loaded`);
-  } catch (error) {
-    appendLog(`[qso-log error] ${error instanceof Error ? error.message : String(error)}`);
+// Track the device id for the save dialog pre-fill, and the status one-liner.
+client.on("status", (msg) => {
+  const { session, tx, control } = msg;
+  if (session.device) {
+    lastDeviceId = session.device.id;
   }
-}
+  statusBase =
+    `{bold}active{/bold}=${session.active} device=${session.device?.id ?? "-"} ` +
+    `cat=${session.catConnected} freq=${session.freq ?? "-"} ptt=${session.ptt} call=${session.callsign ?? "-"} grid=${session.grid ?? "-"}  ||  ` +
+    `tx=${tx.state} af=${tx.af ?? "-"} slot=${tx.slot ?? "-"}  ||  control held=${control.held} mine=${control.byThisClient}`;
+});
 
-async function loadStoredDialFreq(): Promise<void> {
-  try {
-    const state = await readTuiState();
-    if (state.dialFreqHz != null) {
-      dialFreqHz = state.dialFreqHz;
-      appendLog(`[freq] restored dial freq = ${(dialFreqHz / 1e6).toFixed(3)} MHz`);
-      renderStatusBar();
-      return;
-    }
-
-    const entries = await readQsoLog();
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const loggedFreq = entries[index]!.dialFreqHz;
-      if (loggedFreq != null) {
-        setDialFreqHz(loggedFreq);
-        appendLog(`[freq] restored last logged dial freq = ${(loggedFreq / 1e6).toFixed(3)} MHz`);
-        return;
-      }
-    }
-  } catch (error) {
-    appendLog(`[state error] ${error instanceof Error ? error.message : String(error)}`);
+client.on("config", (msg) => {
+  if (msg.session?.device?.id != null) {
+    lastDeviceId = msg.session.device.id;
   }
-}
+});
 
-setInterval(() => {
-  renderOccupancyPlots();
-  renderStatusBar();
-}, 500);
-void loadStoredDialFreq();
-void loadWorkedCalls();
-renderOccupancyPlots();
-renderQsoList();
+client.on("close", () => {
+  // Band Activity is left in place; the engine resets its own state.
+  bandRows.length = 0;
+  lastBandPeriod = null;
+});
+
+// The engine drives everything else.
+controller.onChange((next) => {
+  state = next;
+  renderFromState();
+});
+
+setInterval(renderStatusBar, 500);
+setInterval(() => screen.render(), 500);
+
+renderFromState();
 screen.render();
-client.connect();
+controller.start();
