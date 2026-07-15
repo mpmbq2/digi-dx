@@ -977,11 +977,9 @@ client.on("config", (msg) => {
   }
 });
 
-client.on("close", () => {
-  // Band Activity is left in place; the engine resets its own state.
-  bandRows.length = 0;
-  lastBandPeriod = null;
-});
+// Band Activity persists across reconnects (its row->decode mapping must stay in
+// sync with the blessed list); the engine resets its own state on close and the
+// status bar follows via onChange.
 
 // The engine drives everything else.
 controller.onChange((next) => {

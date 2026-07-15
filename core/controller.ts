@@ -69,7 +69,6 @@ export interface OperatorControllerDeps {
   log: QsoLogStore;
   state?: StateStore;
   token?: string;
-  now?: () => number; // injectable wall clock (test hook); defaults to Date.now
   onLog?: (level: LogLevel, text: string) => void; // activity-log sink
   // Optional ham-band namer for the dial-frequency log line. Injected (rather
   // than imported) so the engine keeps zero ui/ dependencies.
@@ -244,7 +243,6 @@ class OperatorControllerImpl implements OperatorController {
     this.token = deps.token;
     this.onLog = deps.onLog;
     this.bandForMHz = deps.bandForMHz;
-    void deps.now; // wall-now hook reserved; slot math uses the daemon clock
   }
 
   // --- state + change emission --------------------------------------------
