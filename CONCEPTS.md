@@ -33,4 +33,4 @@ Simulated stations use callsigns from an ITU non-assignable prefix so a leaked d
 ## Flagged ambiguities
 
 - "'KTD5' is plan-local numbering — the demo-mode plan's KTD5 is 'demo is real-time; only verification scales,' not the similarly numbered item in the earlier engine-backend plan."
-- "'Engine' in conversation may mean the daemon's session orchestrator or the external modem binary; prefer Engine driver for the process boundary and Session for the orchestrated lifetime."
+- "'Engine' in conversation may mean the daemon's session orchestrator, the external modem binary, or the client-side 'QSO automation engine' (the OperatorController that drives QSO orchestration); prefer Engine driver for the process boundary, Session for the orchestrated lifetime, and 'automation engine'/OperatorController for the client-side QSO orchestration."
