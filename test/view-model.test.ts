@@ -10,7 +10,7 @@ import {
   deriveTxCard,
   latestSlotAfs,
   senderOf
-} from "../ui/web/view-model.js";
+} from "../core/view-model.js";
 
 describe("web view-model helpers", () => {
   it("classifies replies, active QSOs, worked calls, and normal decodes", () => {

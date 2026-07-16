@@ -5,23 +5,17 @@ import { fileURLToPath } from "node:url";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { DaemonClient } from "../../core/daemon-client.js";
-import type { DaemonCommand, EngineKind } from "../../core/protocol.js";
+import type { EngineKind } from "../../core/protocol.js";
+import {
+  createOperatorController,
+  type ControllerState,
+  type OperatorController,
+  type QsoLogStore,
+  type StateStore
+} from "../../core/controller.js";
 import { appendQsoLog, qsoLogPathFor, readQsoLog } from "../qso-log.js";
 import { readTuiState, writeTuiState } from "../tui-state.js";
 import { bandForMHz } from "../adif.js";
-import {
-  QsoAutomation,
-  oppositeSlot,
-  parseFt8Message,
-  slotFromTimestamp,
-  suggestClearAf,
-  type AutomationTx,
-  type DecodeRecord,
-  type QsoAutomationEvent,
-  type QsoRecord,
-  type TxSlot
-} from "../../core/qso.js";
-import { SlotClock } from "../../core/slot-clock.js";
 import {
   annotateDecode,
   buildActiveQsoView,
@@ -29,12 +23,10 @@ import {
   buildCycleView,
   buildRosters,
   deriveTxCard,
-  gridFrom,
   latestSlotAfs,
-  senderOf,
   type AnnotateContext
-} from "./view-model.js";
-import type { CommandMessage, LogLineView, SetupView, StateMessage, TxState } from "./protocol.js";
+} from "../../core/view-model.js";
+import type { CommandMessage, LogLineView, StateMessage } from "./protocol.js";
 
 let daemonUrl = process.env.DIGI_DX_URL ?? "ws://127.0.0.1:8788";
 let token = process.env.DIGI_DX_AUTH_TOKEN;
@@ -55,73 +47,17 @@ export interface WebUiServerOptions {
   headless?: { demo?: boolean };
 }
 
-// --- controller state ------------------------------------------------------
+// --- engine + transport wiring ---------------------------------------------
 
-const decodes: DecodeRecord[] = [];
-// The automation is constructed once, at module load, long before any clock
-// arrives -- so its timestamp source is a late-bound closure over the clock we
-// adopt from the daemon. It throws rather than reaching for `Date.now()`: this
-// is the one place that decides every logged QSO's timestamp, and a silent
-// wall-time fallback here would log a scaled QSO in the wrong time base. Safe
-// because the daemon sends a status on connect, before any decode can arrive.
-const automation = new QsoAutomation(() => new Date(requireClock().now()));
-
-let myCall = "";
-let myGrid = "";
-let dialFreqHz: number | null = null;
-
-let controlHeld = false;
-let controlMine = false;
-let sessionActive = false;
-let catConnected = false;
-let configComplete = false;
-let configMissing: string[] = [];
-let setupDevices: SetupView["devices"] = [];
-
-let latestTxState: TxState = "idle";
-let pendingAutomationTx: AutomationTx | null = null;
-let activeAutomationTx: AutomationTx | null = null;
-let scheduledAutomationTx: AutomationTx | null = null;
-// The daemon is the authority on slot timing. We hold the clock it publishes and
-// derive every slot decision from it -- countdowns, TX windows, and the automation
-// timer. There is deliberately no wall-clock fallback: before the first status
-// message, and again after a reconnect, we have no clock, and a silent
-// `Date.now()` fallback is exactly the bug a scaled clock would hide.
-let clock: SlotClock | null = null;
-let engineKind: EngineKind = "ft8cat";
-
-function requireClock(): SlotClock {
-  if (!clock) {
-    throw new Error("slot clock unavailable: no status received from the daemon yet");
-  }
-  return clock;
-}
-
-let automationTimer: NodeJS.Timeout | null = null;
-let txEnabled = true;
-
-// Current TX audio frequency and manual slot, mirroring the TUI's AF/slot inputs.
-let currentAf = 1000;
-let currentSlot: TxSlot = "even";
-
-const loggedQsoIds = new Set<string>();
-const workedCalls = new Set<string>();
-
-// Slot survey: hold TX for one receive cycle of our TX parity so the (otherwise
-// deaf) TX slot can be observed, then suggest a clear frequency.
-const SURVEY_LO_HZ = 300;
-const SURVEY_HI_HZ = 2700;
-const SURVEY_DECODE_LAG_SECONDS = 5;
-// Arm this many virtual seconds before the slot opens, so the daemon has time to
-// hand the message to the engine. Virtual, so it scales with the clock.
-const AUTOMATION_LEAD_SECONDS = 2;
-let surveyActive = false;
-let surveySlot: TxSlot | null = null;
-let surveyEndSec = 0;
-let surveyTimer: NodeJS.Timeout | null = null;
+// The QSO automation engine. The web server owns no orchestration of its own: it
+// constructs the controller, renders its ControllerState into the browser wire
+// shape, and routes browser commands to controller methods.
+let controller: OperatorController | null = null;
+let daemonClient: DaemonClient | null = null;
 
 // Stable per-QSO colour used to tint decodes/roster rows. Yellow is reserved by
-// the browser for "replying to me", so it is absent from this palette.
+// the browser for "replying to me", so it is absent from this palette. This is a
+// browser presentation concern, so it lives here, not in the engine.
 const QSO_PALETTE = ["#34d3d3", "#d96be0", "#7c9cff", "#57c46a", "#f5a742", "#e0607d"];
 const qsoColors = new Map<string, string>();
 let nextQsoColor = 0;
@@ -135,783 +71,139 @@ function colorFor(id: string): string {
   return color;
 }
 
-// Recent activity log ring, streamed to the browser.
+// Recent activity log ring, streamed to the browser. Fed by the engine's log
+// sink; the engine holds no ring of its own.
 const logLines: LogLineView[] = [];
-function appendLog(level: LogLineView["level"], text: string): void {
+function pushLog(level: LogLineView["level"], text: string): void {
   logLines.push({ level, text });
   if (logLines.length > 200) {
     logLines.splice(0, logLines.length - 200);
   }
-  broadcastState();
 }
 
-// --- daemon connection -----------------------------------------------------
+const qsoLog: QsoLogStore = {
+  append: (entry, engine: EngineKind) => appendQsoLog(entry, qsoLogPathFor(engine)),
+  readAll: () => readQsoLog()
+};
 
-let daemonClient: DaemonClient | null = null;
-let controlClaimPending = false;
+const stateStore: StateStore = {
+  read: () => readTuiState(),
+  write: (patch) => writeTuiState({ dialFreqHz: patch.dialFreqHz ?? null })
+};
 
-function daemonSend(command: DaemonCommand): boolean {
-  if (!daemonClient || !daemonClient.send(command)) {
-    appendLog("warn", "daemon not connected");
-    return false;
-  }
-  return true;
-}
-
-function connectDaemon(): void {
-  const client = new DaemonClient({
-    url: daemonUrl,
-    token,
-    reconnectMs: 2000,
-    logger: (message) => appendLog("error", message)
-  });
-  daemonClient = client;
-
-  client.on("open", () => {
-    appendLog("info", `connected to daemon ${daemonUrl}`);
-    daemonSend({ type: "get_config" });
-    daemonSend({ type: "list_audio_devices" });
-  });
-  client.on("close", () => {
-    controlHeld = false;
-    controlMine = false;
-    controlClaimPending = false;
-    sessionActive = false;
-    latestTxState = "idle";
-    // Drop the daemon's clock on disconnect: there is no authoritative time
-    // base until the next status arrives. Leaving a scaled clock (or an armed
-    // timer) across reconnect is exactly the demo→real footgun.
-    clock = null;
-    engineKind = "ft8cat";
-    clearAutomationState("daemon disconnected");
-    appendLog("warn", "daemon connection closed; retrying in 2s");
-  });
-
-  client.on("status", (msg) => {
-    const { session, tx, control } = msg;
-    const hadControl = controlMine;
-    const previousActive = sessionActive;
-    const previousKind = engineKind;
-    const previousClock = clock;
-
-    // Adopt the daemon's clock. Any field change (not just scale) can move the
-    // next boundary, so re-arm rather than leaving a timer at a stale anchor.
-    const clockDirty =
-      previousClock === null ||
-      previousClock.spec.epochMs !== msg.clock.epochMs ||
-      previousClock.spec.anchorWallMs !== msg.clock.anchorWallMs ||
-      previousClock.spec.slotMs !== msg.clock.slotMs ||
-      previousClock.spec.scale !== msg.clock.scale;
-    clock = new SlotClock(msg.clock);
-    engineKind = msg.engine;
-
-    if (session.callsign !== null) {
-      myCall = session.callsign;
-    }
-    if (session.grid !== null) {
-      myGrid = session.grid;
-    }
-    controlHeld = control.held;
-    controlMine = control.byThisClient;
-    if (controlMine || !controlHeld) {
-      controlClaimPending = false;
-    }
-    sessionActive = session.active;
-    catConnected = session.catConnected;
-
-    const sessionEnded = previousActive && !session.active;
-    const kindChanged = previousKind !== msg.engine;
-    // Demo→real at scale 1 never trips a scale-only dirty check. Clear in-flight
-    // QSOs so leftover QQ0DEMO CQs cannot key the live radio or land in the
-    // real QSO log when they complete under the new engine.
-    if (sessionEnded || kindChanged) {
-      clearAutomationState(sessionEnded ? "session stopped" : "engine changed");
-    } else if (clockDirty) {
-      clearAutomationTimer();
-    }
-
-    updateTxState(tx.state);
-
-    if (sessionActive && ((!hadControl && controlMine) || clockDirty || (kindChanged && !sessionEnded))) {
-      scheduleAutomation();
-    }
-    broadcastState();
-  });
-
-  client.on("decode", (msg) => {
-    const record: DecodeRecord = { ts: msg.ts, snr: msg.snr, dt: msg.dt, af: msg.af, message: msg.message };
-    decodes.push(record);
-    if (decodes.length > 2000) {
-      decodes.splice(0, decodes.length - 2000);
-    }
-    const events = automation.handleDecode(record, myCall, myGrid);
-    if (events.length > 0) {
-      handleQsoEvents(events);
-      cancelSurvey("answering caller");
-      scheduleAutomation();
-    }
-    broadcastState();
-  });
-
-  client.on("tx", (msg) => {
-    appendLog("tx", `[tx] af=${msg.af} ${msg.message}`);
-    const result = automation.confirmTransmission(pendingAutomationTx, { ts: msg.ts, af: msg.af, message: msg.message });
-    if (result.matched) {
-      activeAutomationTx = pendingAutomationTx;
-      pendingAutomationTx = null;
-    }
-    if (result.events.length > 0) {
-      handleQsoEvents(result.events);
-    }
-    scheduleAutomation();
-  });
-
-  client.on("tx_update", (msg) => updateTxState(msg.state));
-
-  client.on("log", (msg) => appendLog(msg.level, `[daemon] ${msg.message}`));
-
-  client.on("daemonError", (msg) => {
-    if (msg.code === "CONTROL_REQUIRED" || msg.code === "CONTROL_UNAVAILABLE") {
-      controlClaimPending = false;
-      appendLog("warn", "control is held by another client");
-    } else {
-      appendLog("error", `[error] ${msg.code}: ${msg.message}`);
-    }
-    if (pendingAutomationTx) {
-      pendingAutomationTx = null;
-      activeAutomationTx = null;
-      scheduledAutomationTx = null;
-      scheduleAutomation();
-    }
-  });
-
-  client.on("config", (msg) => {
-    configComplete = msg.complete;
-    configMissing = msg.missing ?? [];
-    if (msg.session?.callsign) {
-      myCall = msg.session.callsign;
-    }
-    if (msg.session?.grid) {
-      myGrid = msg.session.grid;
-    }
-    appendLog("info", `[config] complete=${msg.complete}`);
-    broadcastState();
-  });
-
-  client.on("audio_devices", (msg) => {
-    setupDevices = msg.devices.map((device) => ({
-      id: device.id,
-      name: device.name,
-      defaultSampleRate: device.defaultSampleRate ?? null
-    }));
-    broadcastState();
-  });
-
-  client.connect();
-}
-
-// --- QSO event handling / logging ------------------------------------------
-
-function handleQsoEvents(events: QsoAutomationEvent[]): void {
-  for (const event of events) {
-    switch (event.type) {
-      case "qso_created":
-        colorFor(event.qso.id);
-        appendLog("qso", `[qso] created ${event.qso.theirCall ?? "CQ"}`);
-        break;
-      case "qso_updated":
-        appendLog("qso", `[qso] ${event.qso.theirCall} ${event.previousStep} -> ${event.qso.step}`);
-        break;
-      case "qso_completed":
-        appendLog("qso", `[qso] complete ${event.qso.theirCall ?? "CQ"} (${event.reason})`);
-        void logCompletedQso(event.qso, event.reason);
-        break;
-      case "qso_timed_out":
-        appendLog("qso", `[qso] timed out ${event.qso.theirCall ?? "CQ"} step=${event.qso.step}`);
-        break;
-      case "cq_stopped":
-        appendLog("qso", "[qso] CQ stopped after reply");
-        break;
-    }
-  }
-  broadcastState();
-}
-
-async function logCompletedQso(qso: QsoRecord, reason: string): Promise<void> {
-  if (loggedQsoIds.has(qso.id)) {
-    return;
-  }
-  const entry = automation.toLogEntry(qso, reason, dialFreqHz);
-  if (!entry) {
-    return;
-  }
-  loggedQsoIds.add(qso.id);
-  try {
-    await appendQsoLog(entry, qsoLogPathFor(engineKind));
-    workedCalls.add(entry.theirCall.toUpperCase());
-    appendLog("info", `[qso-log] wrote ${entry.theirCall}${dialFreqHz ? "" : " (no freq set)"}`);
-  } catch (error) {
-    loggedQsoIds.delete(qso.id);
-    appendLog("error", `[qso-log error] ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-// --- scheduler -------------------------------------------------------------
-
-// The slot we transmit in: the active CQ row's slot, else the manual slot.
-function currentTxSlot(): TxSlot {
-  const cq = automation.qsos.find((qso) => qso.kind === "calling-cq" && qso.status === "active");
-  return cq ? cq.nextSlot : currentSlot;
-}
-
-function currentAfOrNull(): number | null {
-  if (!Number.isInteger(currentAf) || currentAf < 200 || currentAf > 3000) {
-    return null;
-  }
-  return currentAf;
-}
-
-function clearAutomationTimer(): void {
-  if (automationTimer) {
-    clearTimeout(automationTimer);
-    automationTimer = null;
-  }
-  scheduledAutomationTx = null;
-}
-
-function clearAutomationState(_reason: string): void {
-  clearAutomationTimer();
-  if (surveyActive) {
-    cancelSurvey("session boundary");
-  }
-  automation.qsos.splice(0);
-  pendingAutomationTx = null;
-  activeAutomationTx = null;
-  scheduledAutomationTx = null;
-}
-
-// Re-arm automation on the falling edge of "active" (a transmission finished),
-// or on a genuine "idle" (e.g. after cancel). The daemon rests in "pending"
-// after a TX, so we never rely on seeing "idle" to resume.
-function updateTxState(next: TxState): void {
-  const wasActive = latestTxState === "active";
-  latestTxState = next;
-  if (wasActive && next !== "active") {
-    activeAutomationTx = null;
-  }
-  if (surveyActive || next === "active") {
-    return;
-  }
-  if (wasActive || next === "idle") {
-    scheduleAutomation();
-  }
-}
-
-function scheduleAutomation(): void {
-  clearAutomationTimer();
-
-  if (!sessionActive || surveyActive || !txEnabled || latestTxState === "active") {
-    broadcastState();
-    return;
-  }
-
-  const af = currentAfOrNull();
-  if (af === null) {
-    broadcastState();
-    return;
-  }
-
-  const tx = automation.nextTransmission(af);
-  if (!tx) {
-    broadcastState();
-    return;
-  }
-
-  scheduledAutomationTx = tx;
-  if (!ensureAutomationControl()) {
-    broadcastState();
-    return;
-  }
-
-  if (!clock) {
-    appendLog("warn", "[automation] paused: awaiting the slot clock from the daemon");
-    broadcastState();
-    return;
-  }
-
-  // Arm two virtual seconds before the slot opens. The lead is a virtual
-  // quantity, so it scales with everything else; the clock converts it to the
-  // wall delay this setTimeout actually needs.
-  const delayMs = clock.wallDelayUntilSlot(tx.intent.slot, AUTOMATION_LEAD_SECONDS);
-  automationTimer = setTimeout(() => sendAutomatedTx(tx), delayMs);
-  broadcastState();
-}
-
-function sendAutomatedTx(tx: AutomationTx): void {
-  automationTimer = null;
-  scheduledAutomationTx = null;
-  if (!sessionActive || surveyActive || !txEnabled || latestTxState === "active") {
-    return;
-  }
-  const af = currentAfOrNull();
-  if (af === null) {
-    appendLog("warn", "automation paused: invalid AF");
-    return;
-  }
-  if (!ensureAutomationControl()) {
-    scheduledAutomationTx = tx;
-    broadcastState();
-    return;
-  }
-  const refreshed: AutomationTx = { ...tx, intent: { ...tx.intent, af } };
-  pendingAutomationTx = refreshed;
-  daemonSend({ type: "transmit", ...refreshed.intent });
-  broadcastState();
-}
-
-// --- slot survey -----------------------------------------------------------
-
-function startSurvey(): void {
-  if (surveyActive) {
-    return;
-  }
-  const slot = currentTxSlot();
-  surveyActive = true;
-  surveySlot = slot;
-
-  clearAutomationTimer();
-  if (pendingAutomationTx) {
-    daemonSend({ type: "cancel_transmit" });
-    pendingAutomationTx = null;
-  }
-  activeAutomationTx = null;
-  scheduledAutomationTx = null;
-
-  if (!clock) {
-    appendLog("warn", "[survey] unavailable: awaiting the slot clock from the daemon");
-    surveyActive = false;
-    broadcastState();
-    return;
-  }
-
-  // Hold TX for one whole slot past the boundary, plus decode latency. That is a
-  // negative offset -- we wait past the slot rather than arming before it -- and
-  // the slot length comes from the clock, never a literal 15.
-  const slotSeconds = clock.spec.slotMs / 1000;
-  const pastBoundary = slotSeconds + SURVEY_DECODE_LAG_SECONDS;
-  const delaySec = clock.secondsUntilSlot(slot) + pastBoundary;
-  // surveyEndSec is a rendered deadline, not a delay, so it lives in the clock's
-  // virtual base -- the same base the countdown is compared against.
-  surveyEndSec = clock.virtualDeadlineAfter(delaySec);
-  appendLog("info", `[survey] holding TX ~${delaySec}s to listen on the ${slot} slot`);
-  if (surveyTimer) {
-    clearTimeout(surveyTimer);
-  }
-  surveyTimer = setTimeout(finishSurvey, clock.wallDelayUntilSlot(slot, -pastBoundary));
-  broadcastState();
-}
-
-function finishSurvey(): void {
-  surveyTimer = null;
-  const slot = surveySlot;
-  surveyActive = false;
-  surveySlot = null;
-  if (slot) {
-    const occupied = latestSlotAfs(decodes, slot);
-    const suggestion = suggestClearAf(occupied, SURVEY_LO_HZ, SURVEY_HI_HZ);
-    currentAf = suggestion;
-    appendLog("info", `[survey] ${slot} slot updated, clear@${suggestion}Hz (${occupied.length} sigs)`);
-  }
-  scheduleAutomation();
-}
-
-function cancelSurvey(reason: string): void {
-  if (!surveyActive) {
-    return;
-  }
-  if (surveyTimer) {
-    clearTimeout(surveyTimer);
-    surveyTimer = null;
-  }
-  surveyActive = false;
-  surveySlot = null;
-  appendLog("info", `[survey] aborted (${reason})`);
-}
-
-// --- operator actions ------------------------------------------------------
-
-function ensureControl(): boolean {
-  if (controlMine) {
-    return true;
-  }
-  if (controlHeld) {
-    appendLog("warn", "you do not have control (another client holds it)");
-    return false;
-  }
-  return daemonSend({ type: "claim_control", ...(token ? { token } : {}) });
-}
-
-function ensureAutomationControl(): boolean {
-  if (controlMine) {
-    return true;
-  }
-  if (controlHeld) {
-    appendLog("warn", "automation paused: another client has control");
-    return false;
-  }
-  if (!controlClaimPending && daemonSend({ type: "claim_control", ...(token ? { token } : {}) })) {
-    controlClaimPending = true;
-    appendLog("info", "[control] claiming daemon control for automation");
-  }
-  return false;
-}
-
-function ensureIdentity(): boolean {
-  if (!myCall || !myGrid) {
-    appendLog("warn", "automation requires a callsign and grid");
-    return false;
-  }
-  if (!clock) {
-    appendLog("warn", "automation paused: awaiting the slot clock from the daemon");
-    return false;
-  }
-  return true;
-}
-
-function setIdentity(call: string, grid: string): void {
-  myCall = call.trim().toUpperCase();
-  myGrid = grid.trim().toUpperCase();
-}
-
-function applyOptionalIdentity(message: { myCall?: string; myGrid?: string }): void {
-  if (typeof message.myCall === "string" && typeof message.myGrid === "string") {
-    const nextCall = message.myCall.trim().toUpperCase();
-    const nextGrid = message.myGrid.trim().toUpperCase();
-    if (nextCall || nextGrid) {
-      myCall = nextCall;
-      myGrid = nextGrid;
-    }
-  }
-}
-
-function findLastDecodeFrom(call: string): DecodeRecord | null {
-  for (let index = decodes.length - 1; index >= 0; index--) {
-    if (senderOf(decodes[index]!.message) === call) {
-      return decodes[index]!;
-    }
-  }
-  return null;
-}
-
-function callCq(slot?: TxSlot): void {
-  if (!ensureIdentity()) {
-    return;
-  }
-  if (automation.isCallingCq()) {
-    stopCq("operator stopped CQ");
-    return;
-  }
-  if (slot) {
-    currentSlot = slot;
-  }
-  automation.createCq(myCall, myGrid, slot ?? currentSlot, "top");
-  appendLog("qso", "[qso] calling CQ");
-  scheduleAutomation();
-}
-
-function stopCq(reason: string): void {
-  const cq = automation.qsos.find((qso) => qso.kind === "calling-cq" && qso.status === "active");
-  if (!cq) {
-    return;
-  }
-
-  const shouldCancelDaemonTx =
-    pendingAutomationTx?.qsoId === cq.id ||
-    activeAutomationTx?.qsoId === cq.id;
-
-  automation.abandon(cq.id);
-  if (scheduledAutomationTx?.qsoId === cq.id) {
-    clearAutomationTimer();
-  }
-  if (pendingAutomationTx?.qsoId === cq.id) {
-    pendingAutomationTx = null;
-  }
-  if (activeAutomationTx?.qsoId === cq.id) {
-    activeAutomationTx = null;
-  }
-  if (shouldCancelDaemonTx) {
-    daemonSend({ type: "cancel_transmit" });
-  }
-  appendLog("qso", `[qso] ${reason}`);
-  scheduleAutomation();
-}
-
-function setTxSlot(slot: TxSlot): void {
-  currentSlot = slot;
-  const cq = automation.qsos.find((qso) => qso.kind === "calling-cq" && qso.status === "active");
-  if (cq) {
-    cq.nextSlot = slot;
-    cq.updatedAt = new Date().toISOString();
-  }
-}
-
-function replyToCall(rawCall: string): void {
-  if (!ensureIdentity()) {
-    return;
-  }
-  const call = rawCall.trim().toUpperCase();
-  if (!/^[A-Z0-9/]{2,}$/.test(call)) {
-    appendLog("warn", `'${call}' is not a valid callsign`);
-    return;
-  }
-  const existing = automation.qsos.find(
-    (qso) => qso.kind === "standard" && qso.theirCall === call && qso.status !== "complete"
-  );
-  if (existing) {
-    appendLog("info", `QSO already exists for ${call}`);
-    return;
-  }
-  const last = findLastDecodeFrom(call);
-  const nextSlot = last ? oppositeSlot(slotFromTimestamp(last.ts)) : currentSlot;
-  const theirGrid = last ? gridFrom(last.message) : null;
-  const qso = automation.createReplyToCall(call, myCall, myGrid, nextSlot, theirGrid, "top");
-  colorFor(qso.id);
-  appendLog("qso", `[qso] reply to ${qso.theirCall}`);
-  scheduleAutomation();
-}
-
-function qsoAction(id: string, action: string): void {
-  switch (action) {
-    case "complete":
-      handleQsoEvents(automation.complete(id));
-      break;
-    case "abandon":
-      automation.abandon(id);
-      break;
-    case "resume":
-      automation.resume(id);
-      break;
-    case "retry":
-      automation.resetAttempts(id);
-      break;
-    case "prevStep":
-      automation.previousStep(id);
-      break;
-    case "nextStep":
-      automation.nextStep(id);
-      break;
-    case "moveUp":
-      automation.move(id, -1);
-      break;
-    case "moveDown":
-      automation.move(id, 1);
-      break;
-    default:
-      appendLog("warn", `unknown qso action '${action}'`);
-      return;
-  }
-  scheduleAutomation();
-}
-
-function setDialFreq(mhz: number | null): void {
-  if (mhz === null) {
-    dialFreqHz = null;
-  } else if (!Number.isFinite(mhz) || mhz <= 0) {
-    appendLog("warn", "freq: enter a positive frequency in MHz (e.g. 14.074)");
-    return;
-  } else {
-    dialFreqHz = Math.round(mhz * 1e6);
-    const band = bandForMHz(mhz);
-    appendLog("info", `[freq] dial = ${mhz.toFixed(3)} MHz${band ? ` (${band})` : " (out of ham band?)"}`);
-  }
-  void writeTuiState({ dialFreqHz }).catch((error) =>
-    appendLog("error", `[state error] ${error instanceof Error ? error.message : String(error)}`)
-  );
-  broadcastState();
-}
-
-function haltTx(): void {
-  daemonSend({ type: "cancel_transmit" });
-  cancelSurvey("halted");
-  pendingAutomationTx = null;
-  activeAutomationTx = null;
-  scheduledAutomationTx = null;
-  clearAutomationTimer();
-  txEnabled = false;
-  automation.pauseAll("halted");
-  appendLog("warn", "[tx] halted by operator");
-  broadcastState();
-}
-
-function setTxEnabled(enabled: boolean): void {
-  txEnabled = enabled;
-  if (!enabled) {
-    clearAutomationTimer();
-    appendLog("info", "[tx] disabled — current transmission will finish");
-  } else {
-    // Resuming re-activates anything paused by a prior halt.
-    for (const qso of automation.qsos) {
-      if (qso.status === "paused") {
-        automation.resume(qso.id);
-      }
-    }
-    appendLog("info", "[tx] enabled");
-    scheduleAutomation();
-  }
-  broadcastState();
-}
+// --- command dispatch ------------------------------------------------------
 
 function handleCommand(message: CommandMessage): void {
+  if (!controller) {
+    return;
+  }
   switch (message.cmd) {
     case "setIdentity":
-      setIdentity(message.call, message.grid);
-      appendLog("info", `[identity] ${myCall} ${myGrid}`);
-      broadcastState();
+      controller.setIdentity(message.call, message.grid);
       break;
     case "setDialFreq":
-      setDialFreq(message.mhz);
+      controller.setDialFreq(message.mhz);
       break;
     case "callCq":
-      applyOptionalIdentity(message);
-      callCq(message.slot);
+      controller.callCq(message.slot, { myCall: message.myCall, myGrid: message.myGrid });
       break;
     case "replyToCall":
-      applyOptionalIdentity(message);
-      replyToCall(message.call);
+      controller.replyToCall(message.call, { myCall: message.myCall, myGrid: message.myGrid });
       break;
     case "qso":
-      qsoAction(message.id, message.action);
+      controller.qsoAction(message.id, message.action);
       break;
     case "setAf":
-      if (Number.isInteger(message.af)) {
-        currentAf = message.af;
-        scheduleAutomation();
-      }
+      controller.setAf(message.af);
       break;
     case "setSlot":
-      setTxSlot(message.slot);
-      scheduleAutomation();
+      controller.setSlot(message.slot);
       break;
     case "survey":
-      startSurvey();
+      controller.survey();
       break;
     case "txEnable":
-      setTxEnabled(message.enabled);
+      controller.setTxEnabled(message.enabled);
       break;
     case "haltTx":
-      haltTx();
+      controller.haltTx();
       break;
     case "session":
-      if (!ensureControl()) {
-        return;
+      if (message.action === "start") {
+        controller.startSession();
+      } else {
+        controller.stopSession();
       }
-      if (message.action === "start" && !configComplete) {
-        appendLog("warn", "complete station setup before starting a session");
-        broadcastState();
-        return;
-      }
-      daemonSend(message.action === "start" ? { type: "start_session" } : { type: "stop_session" });
       break;
     case "startDemo":
-      if (!ensureControl()) {
-        return;
-      }
-      // No configComplete guard: the whole point is that a user with no radio has
-      // no config to satisfy it with. The daemon synthesizes a demo identity.
-      appendLog("info", "[demo] starting on the simulated engine — nothing is transmitted");
-      daemonSend({ type: "start_session", demo: true });
+      controller.startDemo();
       break;
     case "saveSetup":
-      if (!ensureControl()) {
-        return;
-      }
-      if (sessionActive) {
-        appendLog("warn", "cannot save setup while a session is active");
-        return;
-      }
-      daemonSend({
-        type: "save_config",
-        session: {
-          mode: "FT8",
-          device: { id: message.deviceId },
-          callsign: message.callsign,
-          grid: message.grid,
-          cat: { mode: message.catMode, port: message.catPort }
-        }
+      controller.saveSetup({
+        deviceId: message.deviceId,
+        callsign: message.callsign,
+        grid: message.grid,
+        catMode: message.catMode,
+        catPort: message.catPort
       });
       break;
     case "releaseControl":
-      if (!controlMine) {
-        appendLog("warn", "control is not held by this client");
-        return;
-      }
-      daemonSend({ type: "release_control" });
+      controller.releaseControl();
       break;
     default:
-      appendLog("warn", "unknown command");
+      pushLog("warn", "unknown command");
   }
 }
 
 // --- view-model / broadcast ------------------------------------------------
 
-function buildState(): StateMessage {
+function buildState(state: ControllerState): StateMessage {
   // Two clocks, deliberately. `wallNowMs` is what the browser corrects its own
   // clock against (it runs on a different machine). `nowMs` is virtual time --
   // the base decode timestamps live in -- and everything slot-shaped uses it.
   // Mixing them is how a scaled countdown ends up disagreeing with the band.
   const wallNowMs = Date.now();
-  const nowMs = clock ? clock.now() : wallNowMs;
+  const nowMs = state.clock ? state.clock.now() : wallNowMs;
 
   const activeCallColors = new Map<string, string>();
-  for (const qso of automation.qsos) {
-    if (qso.kind === "standard" && qso.status !== "complete" && qso.theirCall) {
+  for (const qso of state.qsos.active) {
+    if (qso.kind === "standard" && qso.theirCall) {
       activeCallColors.set(qso.theirCall, colorFor(qso.id));
     }
   }
-  const ctx: AnnotateContext = { myCall, activeCallColors, workedCalls };
+  const ctx: AnnotateContext = {
+    myCall: state.station.call,
+    activeCallColors,
+    workedCalls: state.workedCalls
+  };
 
-  const recentDecodes = decodes.slice(-200).map((record) => annotateDecode(record, ctx));
-  const rosters = buildRosters(decodes, ctx, nowMs);
-  const txingQsoId = pendingAutomationTx?.qsoId ?? activeAutomationTx?.qsoId ?? null;
-  const displayAutomationTx = pendingAutomationTx ?? activeAutomationTx ?? scheduledAutomationTx;
+  const recentDecodes = state.decodes.slice(-200).map((record) => annotateDecode(record, ctx));
+  const rosters = buildRosters(state.decodes, ctx, nowMs);
 
   return {
     type: "state",
     serverNow: wallNowMs,
-    cycle: buildCycleView(clock, wallNowMs, nowMs),
-    station: {
-      call: myCall,
-      grid: myGrid,
-      dialFreqHz,
-      catConnected,
-      sessionActive,
-      controlHeld,
-      controlMine,
-      demo: engineKind === "simulated"
-    },
-    setup: {
-      complete: configComplete,
-      missing: configMissing,
-      devices: setupDevices
-    },
+    cycle: buildCycleView(state.clock, wallNowMs, nowMs),
+    station: state.station,
+    setup: state.setup,
     now: {
-      ...deriveTxCard(latestTxState, displayAutomationTx),
-      txEnabled,
-      surveyActive,
-      surveySlot,
-      surveyEndSec
+      ...deriveTxCard(state.tx.state, state.tx.displayTx),
+      txEnabled: state.tx.enabled,
+      surveyActive: state.survey.active,
+      surveySlot: state.survey.slot,
+      surveyEndSec: state.survey.endSec
     },
-    af: { value: currentAf, slot: currentTxSlot() },
+    af: state.af,
     qsos: {
-      callingCq: automation.isCallingCq(),
-      active: buildActiveQsoView(automation.qsos, colorFor, txingQsoId, nowMs),
-      completed: buildCompletedView(automation.qsos)
+      callingCq: state.qsos.callingCq,
+      active: buildActiveQsoView(state.qsos.active, colorFor, state.tx.txingQsoId, nowMs),
+      completed: buildCompletedView(state.qsos.completed)
     },
     decodes: recentDecodes,
     rosters,
     occupancy: {
-      even: latestSlotAfs(decodes, "even"),
-      odd: latestSlotAfs(decodes, "odd")
+      even: latestSlotAfs(state.decodes, "even"),
+      odd: latestSlotAfs(state.decodes, "odd")
     },
     log: logLines.slice(-200)
   };
@@ -920,10 +212,10 @@ function buildState(): StateMessage {
 const clients = new Set<WebSocket>();
 
 function broadcastState(): void {
-  if (clients.size === 0) {
+  if (clients.size === 0 || !controller) {
     return;
   }
-  const data = JSON.stringify(buildState());
+  const data = JSON.stringify(buildState(controller.state));
   for (const client of clients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(data);
@@ -977,7 +269,9 @@ httpServer.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) =>
 
 browserWss.on("connection", (client: WebSocket) => {
   clients.add(client);
-  client.send(JSON.stringify(buildState()));
+  if (controller) {
+    client.send(JSON.stringify(buildState(controller.state)));
+  }
   client.on("message", (raw: RawData) => {
     try {
       const message = JSON.parse(raw.toString()) as CommandMessage;
@@ -985,7 +279,7 @@ browserWss.on("connection", (client: WebSocket) => {
         handleCommand(message);
       }
     } catch (error) {
-      appendLog("error", `bad command: ${error instanceof Error ? error.message : String(error)}`);
+      pushLog("error", `bad command: ${error instanceof Error ? error.message : String(error)}`);
     }
   });
   client.on("close", () => clients.delete(client));
@@ -993,62 +287,10 @@ browserWss.on("connection", (client: WebSocket) => {
 
 // --- startup ---------------------------------------------------------------
 
-async function loadPersistedState(): Promise<void> {
-  try {
-    const state = await readTuiState();
-    if (state.dialFreqHz != null) {
-      dialFreqHz = state.dialFreqHz;
-    }
-  } catch {
-    // Non-fatal: start without a restored dial frequency.
-  }
-  try {
-    for (const entry of await readQsoLog()) {
-      if (entry.theirCall) {
-        workedCalls.add(entry.theirCall.toUpperCase());
-      }
-    }
-  } catch {
-    // Non-fatal: start with an empty worked-call set.
-  }
-}
-
 let broadcastInterval: NodeJS.Timeout | null = null;
 let started = false;
 
-function resetControllerState(): void {
-  decodes.splice(0);
-  automation.qsos.splice(0);
-  myCall = "";
-  myGrid = "";
-  dialFreqHz = null;
-  controlHeld = false;
-  controlMine = false;
-  controlClaimPending = false;
-  sessionActive = false;
-  catConnected = false;
-  latestTxState = "idle";
-  pendingAutomationTx = null;
-  activeAutomationTx = null;
-  scheduledAutomationTx = null;
-  txEnabled = true;
-  currentAf = 1000;
-  currentSlot = "even";
-  loggedQsoIds.clear();
-  workedCalls.clear();
-  surveyActive = false;
-  surveySlot = null;
-  surveyEndSec = 0;
-  qsoColors.clear();
-  nextQsoColor = 0;
-  logLines.splice(0);
-}
-
-async function waitUntil(
-  predicate: () => boolean,
-  label: string,
-  timeoutMs: number
-): Promise<void> {
+async function waitUntil(predicate: () => boolean, label: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() >= deadline) {
@@ -1059,30 +301,17 @@ async function waitUntil(
 }
 
 /**
- * Claim control and start a demo session with no browser messages.
- * The smoke harness uses this so it drives the same QsoAutomation path as the UI.
+ * Claim control and start a demo session with no browser messages. The smoke
+ * harness uses this so it drives the same engine path as the UI.
  */
 async function bootstrapHeadlessDemo(): Promise<void> {
   await waitUntil(() => daemonClient?.connected === true, "daemon connection", 15_000);
-
-  if (!controlMine) {
-    if (!daemonSend({ type: "claim_control", ...(token ? { token } : {}) })) {
-      throw new Error("headless: failed to send claim_control");
-    }
-    await waitUntil(() => controlMine, "control claim", 10_000);
-  }
-
-  if (!sessionActive) {
-    appendLog("info", "[demo] headless: starting on the simulated engine — nothing is transmitted");
-    if (!daemonSend({ type: "start_session", demo: true })) {
-      throw new Error("headless: failed to send start_session");
-    }
-    await waitUntil(
-      () => sessionActive && Boolean(myCall) && Boolean(myGrid) && clock !== null,
-      "demo session",
-      15_000
-    );
-  }
+  pushLog("info", "[demo] headless: starting on the simulated engine — nothing is transmitted");
+  controller?.startDemo();
+  await waitUntil(() => {
+    const s = controller?.state;
+    return Boolean(s?.station.sessionActive && s.station.call && s.station.grid && s.clock);
+  }, "demo session", 15_000);
 }
 
 export async function startWebUiServer(options: WebUiServerOptions = {}): Promise<void> {
@@ -1094,9 +323,30 @@ export async function startWebUiServer(options: WebUiServerOptions = {}): Promis
   webPort = options.webPort ?? webPort;
   webHost = options.webHost ?? webHost;
 
-  resetControllerState();
-  await loadPersistedState();
-  connectDaemon();
+  // Fresh view state on each start.
+  logLines.splice(0);
+  qsoColors.clear();
+  nextQsoColor = 0;
+
+  daemonClient = new DaemonClient({
+    url: daemonUrl,
+    token,
+    reconnectMs: 2000,
+    logger: (message) => {
+      pushLog("error", message);
+      broadcastState();
+    }
+  });
+  controller = createOperatorController({
+    client: daemonClient,
+    log: qsoLog,
+    state: stateStore,
+    token,
+    onLog: pushLog,
+    bandForMHz
+  });
+  controller.onChange(() => broadcastState());
+  controller.start();
 
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => {
@@ -1128,14 +378,13 @@ export async function startWebUiServer(options: WebUiServerOptions = {}): Promis
 
 export async function closeWebUiServer(): Promise<void> {
   started = false;
-  clearAutomationTimer();
-  if (surveyTimer) {
-    clearTimeout(surveyTimer);
-    surveyTimer = null;
-  }
   if (broadcastInterval) {
     clearInterval(broadcastInterval);
     broadcastInterval = null;
+  }
+  if (controller) {
+    controller.dispose();
+    controller = null;
   }
   if (daemonClient) {
     daemonClient.close();

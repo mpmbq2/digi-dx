@@ -3,18 +3,31 @@
 // pushes a StateMessage view-model; the browser sends CommandMessages. Keep
 // these types in sync with the runtime shapes app.js reads/writes.
 
-import type { QsoStep, TxSlot } from "../../core/qso.js";
+import type { TxSlot } from "../../core/qso.js";
 import type { TxPublicState } from "../../core/protocol.js";
+// The decode/QSO/cycle view shapes moved to core/view-model.ts (rebuild plan W2)
+// so the view-model depends only on core. Re-exported here so the browser bridge
+// and app.js keep importing them from the web protocol module.
+import type {
+  ActiveQsoView,
+  CompletedQsoView,
+  CycleView,
+  DecodeView,
+  NowView,
+  RosterEntryView
+} from "../../core/view-model.js";
+export type {
+  ActiveQsoView,
+  CompletedQsoView,
+  CycleView,
+  DecodeKind,
+  DecodeView,
+  NowView,
+  RosterEntryView
+} from "../../core/view-model.js";
 
 // Aliased from the daemon contract so the browser view shares core's TX state.
 export type TxState = TxPublicState;
-
-// How a decoded/heard station is coloured in the band panel and rosters.
-//  - "reply"  : the message mentions our callsign (someone answering us)
-//  - "qso"    : the sender matches an active standard QSO (carries its colour)
-//  - "worked" : the sender is already in the QSO log
-//  - "normal" : everything else
-export type DecodeKind = "reply" | "qso" | "worked" | "normal";
 
 export interface StationView {
   call: string;
@@ -40,89 +53,6 @@ export interface SetupView {
   complete: boolean;
   missing: string[];
   devices: SetupDeviceView[];
-}
-
-export interface NowView {
-  txState: TxState;
-  txEnabled: boolean;
-  af: number | null;
-  slot: TxSlot | null;
-  message: string | null;
-  surveyActive: boolean;
-  surveySlot: TxSlot | null;
-  surveyEndSec: number;
-}
-
-export interface DecodeView {
-  ts: number;
-  snr: number;
-  af: number;
-  message: string;
-  from: string | null;
-  grid: string | null;
-  // Which slot this decode landed in, and the start of its cycle -- both
-  // computed server-side. The browser cannot import core/slot-clock.ts (it is a
-  // plain script with no build step), so it is never asked to derive slot math
-  // itself, and carries no slot length of its own.
-  slot: TxSlot;
-  cycleStart: number;
-  kind: DecodeKind;
-  color?: string;
-}
-
-export interface CycleView {
-  parity: TxSlot;
-  // The wall instant of the next slot boundary, already scale-corrected by the
-  // server. The browser counts down to it against its own (skew-corrected) wall
-  // clock, with no scale factor and no 15-second constant anywhere in it.
-  // Null before the daemon has published a clock -- the browser renders a
-  // neutral countdown rather than a confidently wrong one.
-  nextBoundaryWallMs: number | null;
-  // How long a slot lasts in wall time at the current scale -- what the browser
-  // needs to render the cycle progress bar without knowing the scale.
-  slotWallMs: number | null;
-  // How long a slot lasts in FT8 terms (15s). The countdown is rendered in these
-  // units at any scale, because an operator reasons in FT8 seconds, not in the
-  // wall seconds a sped-up test happens to run at.
-  slotSeconds: number | null;
-}
-
-export interface RosterEntryView {
-  call: string;
-  grid: string | null;
-  snr: number;
-  ageSec: number;
-  af: number;
-  kind: DecodeKind;
-  color?: string;
-}
-
-export interface ActiveQsoView {
-  id: string;
-  call: string | null;
-  grid: string | null;
-  priority: number;
-  kind: "hunted" | "caller";
-  stepKey: QsoStep;
-  status: string;
-  attempts: number;
-  slot: TxSlot;
-  heardAgoSec: number | null;
-  lastRx: string | null;
-  nextTx: string | null;
-  txing: boolean;
-  note: string | null;
-  color: string;
-}
-
-export interface CompletedQsoView {
-  id: string;
-  call: string | null;
-  grid: string | null;
-  sentReport: string | null;
-  receivedReport: string | null;
-  slot: TxSlot | null;
-  time: string;
 }
 
 export interface LogLineView {

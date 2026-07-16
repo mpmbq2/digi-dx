@@ -1,7 +1,12 @@
 // Pure, framework-agnostic helpers that turn raw controller state (decodes, QSO
-// records, TX state) into the browser view-model. Kept free of I/O and timers so
-// they can be unit-tested in isolation (test/web-view-model.test.ts); the server
-// (ui/web/server.ts) supplies the live state and the browser renders the result.
+// records, TX state) into a client view-model. Kept free of I/O and timers so
+// they can be unit-tested in isolation (test/view-model.test.ts). Both reference
+// clients render from these: the web server maps the result into its StateMessage
+// wire shape, and the TUI renders the same builders with blessed.
+//
+// These view types live in core (not ui/web/protocol.ts) so the module depends
+// only on core/qso.ts and core/slot-clock.ts — the isolation the rebuild plan's
+// W2 requires. ui/web/protocol.ts re-exports them for the browser wire contract.
 
 import {
   messageForQso,
@@ -11,29 +16,111 @@ import {
   type AutomationTx,
   type DecodeRecord,
   type QsoRecord,
+  type QsoStep,
   type TxSlot
-} from "../../core/qso.js";
-import { FT8_SLOT_MS, type SlotClock } from "../../core/slot-clock.js";
+} from "./qso.js";
+import { FT8_SLOT_MS, type SlotClock } from "./slot-clock.js";
+import type { TxPublicState } from "./protocol.js";
 
 const SLOT_SECONDS = FT8_SLOT_MS / 1000;
-import type {
-  ActiveQsoView,
-  CompletedQsoView,
-  CycleView,
-  DecodeKind,
-  DecodeView,
-  NowView,
-  RosterEntryView,
-  TxState
-} from "./protocol.js";
+
+// The daemon's TX state, shared by the view-model and the browser wire contract.
+export type TxState = TxPublicState;
+
+// How a decoded/heard station is coloured in the band panel and rosters.
+//  - "reply"  : the message mentions our callsign (someone answering us)
+//  - "qso"    : the sender matches an active standard QSO (carries its colour)
+//  - "worked" : the sender is already in the QSO log
+//  - "normal" : everything else
+export type DecodeKind = "reply" | "qso" | "worked" | "normal";
+
+export interface NowView {
+  txState: TxState;
+  txEnabled: boolean;
+  af: number | null;
+  slot: TxSlot | null;
+  message: string | null;
+  surveyActive: boolean;
+  surveySlot: TxSlot | null;
+  surveyEndSec: number;
+}
+
+export interface DecodeView {
+  ts: number;
+  snr: number;
+  af: number;
+  message: string;
+  from: string | null;
+  grid: string | null;
+  // Which slot this decode landed in, and the start of its cycle -- both
+  // computed here. The browser cannot import core/slot-clock.ts (it is a plain
+  // script with no build step), so it is never asked to derive slot math itself.
+  slot: TxSlot;
+  cycleStart: number;
+  kind: DecodeKind;
+  color?: string;
+}
+
+export interface CycleView {
+  parity: TxSlot;
+  // The wall instant of the next slot boundary, already scale-corrected. The
+  // browser counts down to it against its own (skew-corrected) wall clock, with
+  // no scale factor and no 15-second constant anywhere in it. Null before the
+  // daemon has published a clock -- render a neutral countdown, not a wrong one.
+  nextBoundaryWallMs: number | null;
+  // How long a slot lasts in wall time at the current scale -- what the browser
+  // needs to render the cycle progress bar without knowing the scale.
+  slotWallMs: number | null;
+  // How long a slot lasts in FT8 terms (15s). The countdown is rendered in these
+  // units at any scale, because an operator reasons in FT8 seconds.
+  slotSeconds: number | null;
+}
+
+export interface RosterEntryView {
+  call: string;
+  grid: string | null;
+  snr: number;
+  ageSec: number;
+  af: number;
+  kind: DecodeKind;
+  color?: string;
+}
+
+export interface ActiveQsoView {
+  id: string;
+  call: string | null;
+  grid: string | null;
+  priority: number;
+  kind: "hunted" | "caller";
+  stepKey: QsoStep;
+  status: string;
+  attempts: number;
+  slot: TxSlot;
+  heardAgoSec: number | null;
+  lastRx: string | null;
+  nextTx: string | null;
+  txing: boolean;
+  note: string | null;
+  color: string;
+}
+
+export interface CompletedQsoView {
+  id: string;
+  call: string | null;
+  grid: string | null;
+  sentReport: string | null;
+  receivedReport: string | null;
+  slot: TxSlot | null;
+  time: string;
+}
 
 // Context shared by the annotation helpers. `activeCallColors` maps an active
 // standard QSO's callsign to its stable colour; `workedCalls` is the set of
 // already-logged callsigns (upper-case).
 export interface AnnotateContext {
   myCall: string;
-  activeCallColors: Map<string, string>;
-  workedCalls: Set<string>;
+  activeCallColors: ReadonlyMap<string, string>;
+  workedCalls: ReadonlySet<string>;
 }
 
 export function senderOf(message: string): string | null {
@@ -106,7 +193,6 @@ export function annotateDecode(record: DecodeRecord, ctx: AnnotateContext): Deco
 
 // AFs decoded in the most recent RX period of the given parity — "the last set
 // of decodes" for that slot. Empty until a period of that parity is heard.
-// Ported from the private helper in ui/tui.ts.
 export function latestSlotAfs(decodes: DecodeRecord[], parity: TxSlot): number[] {
   let latestStart = -1;
   for (const decode of decodes) {
