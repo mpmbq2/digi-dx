@@ -15,7 +15,7 @@ import {
 } from "../../core/controller.js";
 import { appendQsoLog, qsoLogPathFor, readQsoLog } from "../qso-log.js";
 import { readTuiState, writeTuiState } from "../tui-state.js";
-import { bandForMHz } from "../adif.js";
+import { bandForMHz, buildAdif } from "../adif.js";
 import {
   annotateDecode,
   buildActiveQsoView,
@@ -237,6 +237,23 @@ const CONTENT_TYPES: Record<string, string> = {
 
 async function serveStatic(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requestPath = (req.url ?? "/").split("?")[0]!;
+  if (requestPath === "/api/log") {
+    const engine = controller?.state.station.demo ? "simulated" : "ft8cat";
+    const entries = await readQsoLog(qsoLogPathFor(engine));
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(entries));
+    return;
+  }
+  if (requestPath === "/api/log/export") {
+    const entries = await readQsoLog(qsoLogPathFor("ft8cat"));
+    const adif = buildAdif(entries);
+    res.writeHead(200, {
+      "content-type": "text/plain; charset=utf-8",
+      "content-disposition": 'attachment; filename="digi-dx-qsos.adif"'
+    });
+    res.end(adif);
+    return;
+  }
   const relative = requestPath === "/" ? "index.html" : requestPath.replace(/^\/+/, "");
   const resolved = normalize(join(publicDir, relative));
   // Path-traversal guard: never serve outside publicDir.

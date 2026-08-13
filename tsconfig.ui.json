@@ -11,6 +11,7 @@
     "types": ["node"]
   },
   "include": [
+    "ui/types.d.ts",
     "core/**/*.ts",
     "ui/**/*.ts",
     "scripts/smoke.ts",

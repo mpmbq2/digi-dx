@@ -130,11 +130,11 @@ async function shutdownDaemon(child: ChildProcess): Promise<void> {
 
 function trackLatestState(page: Page): { latest: () => UiStateMessage | null } {
   let latest: UiStateMessage | null = null;
-  page.on("websocket", (ws) => {
+  page.on("websocket", (ws: import("playwright").WebSocket) => {
     if (!ws.url().includes("/ws")) {
       return;
     }
-    ws.on("framereceived", (event) => {
+    ws.on("framereceived", (event: { payload: string | Buffer }) => {
       try {
         const payload =
           typeof event.payload === "string" ? event.payload : event.payload.toString();
@@ -187,7 +187,7 @@ async function assertCountdownAtCapture(page: Page, cycle: PublishedCycle): Prom
     throw new SmokeFailure("smoke-ui failed: no published cycle deadline at capture");
   }
 
-  const result = await page.evaluate((published) => {
+  const result = await page.evaluate((published: PublishedCycle) => {
     const nowMs = Date.now();
     const text = document.getElementById("cycle-value")?.textContent?.trim() ?? "";
     const remainingWallMs = Math.max(0, published.nextBoundaryWallMs! - nowMs);

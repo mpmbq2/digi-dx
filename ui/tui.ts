@@ -409,7 +409,7 @@ screen.key(["S-tab"], () => screen.focusPrevious());
 
 let lastBandClickIndex = -1;
 let lastBandClickTime = 0;
-decodeList.on("select", (_item, index) => {
+decodeList.on("select", (_item: unknown, index: number) => {
   const row = bandRows[index];
   if (!row || row.kind !== "decode") {
     return;

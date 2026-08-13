@@ -183,7 +183,6 @@
           setAfFromPointer(event, lane);
         }
       });
-      lane.addEventListener("pointerup", () => {
         draggingSlot = null;
       });
       lane.addEventListener("pointercancel", () => {
@@ -1125,5 +1124,84 @@
 
   function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
+  }
+
+  let logbookEntries = [];
+
+  async function openLogbookModal() {
+    const modal = document.getElementById("logbook-modal");
+    if (!modal) return;
+    modal.hidden = false;
+    try {
+      const res = await fetch("/api/log");
+      if (res.ok) {
+        logbookEntries = await res.json();
+      }
+    } catch {
+      logbookEntries = [];
+    }
+    renderLogbookTable();
+  }
+
+  function renderLogbookTable() {
+    const tbody = document.getElementById("logbook-table-body");
+    const count = document.getElementById("logbook-count");
+    const searchInput = document.getElementById("logbook-search");
+    if (!tbody) return;
+
+    const term = (searchInput?.value || "").toLowerCase().trim();
+    const filtered = logbookEntries.filter((e) => {
+      if (!term) return true;
+      return (
+        (e.theirCall && e.theirCall.toLowerCase().includes(term)) ||
+        (e.theirGrid && e.theirGrid.toLowerCase().includes(term)) ||
+        (e.myCall && e.myCall.toLowerCase().includes(term))
+      );
+    });
+
+    if (count) count.textContent = `${filtered.length} contact${filtered.length === 1 ? "" : "s"}`;
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty-hint">No matching logged QSOs found.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = filtered
+      .slice()
+      .reverse()
+      .map((e) => {
+        const dateStr = e.startedAt ? new Date(e.startedAt).toLocaleString() : "—";
+        const mhz = e.dialFreqHz != null ? (e.dialFreqHz / 1e6).toFixed(3) : "—";
+        return `<tr>
+          <td>${dateStr}</td>
+          <td><b>${e.theirCall}</b></td>
+          <td>${e.theirGrid || "—"}</td>
+          <td>${e.sentReport || "—"}</td>
+          <td>${e.receivedReport || "—"}</td>
+          <td>${mhz} MHz</td>
+          <td>${e.myCall || "—"}</td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  function openConfigModal() {
+    const modal = document.getElementById("config-modal");
+    if (!modal) return;
+    modal.hidden = false;
+
+    if (state?.station) {
+      const callIn = document.getElementById("cfg-callsign");
+      const gridIn = document.getElementById("cfg-grid");
+      if (callIn && state.station.call) callIn.value = state.station.call;
+      if (gridIn && state.station.grid) gridIn.value = state.station.grid;
+    }
+
+    const select = document.getElementById("cfg-audio-device");
+    if (select && state?.setup?.devices) {
+      select.innerHTML = state.setup.devices
+        .map((d) => `<option value="${d.id}">${d.name} (${d.id})</option>`)
+        .join("");
+    }
   }
 })();

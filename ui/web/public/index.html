@@ -29,10 +29,10 @@
 
       <span class="rail-label">WORKSPACE</span>
       <nav class="rail-nav">
-        <div class="nav-item active">◉ Operate</div>
-        <div class="nav-item" title="Not in this workspace yet">▤ Log book</div>
-        <div class="nav-item" title="Not in this workspace yet">⚙ Config</div>
-        <div class="nav-item" title="Not in this workspace yet">🎚 Devices</div>
+        <div class="nav-item active" id="nav-operate">◉ Operate</div>
+        <div class="nav-item" id="nav-logbook">▤ Log book</div>
+        <div class="nav-item" id="nav-config">⚙ Config</div>
+        <div class="nav-item" id="nav-devices">🎚 Devices</div>
       </nav>
       <div class="rail-spacer"></div>
       <button class="session-btn" id="session-btn">▶ start session</button>
@@ -172,6 +172,81 @@
       </section>
     </main>
   </div>
+  <!-- LOG BOOK MODAL -->
+  <div class="modal-overlay" id="logbook-modal" hidden>
+    <div class="modal-card modal-lg">
+      <div class="modal-head">
+        <span class="modal-title">▤ QSO Log Book</span>
+        <span class="spacer"></span>
+        <a class="btn-primary sm" id="export-adif-btn" href="/api/log/export" download="digi-dx-qsos.adif">⬇ Export ADIF</a>
+        <button class="modal-close" id="logbook-close">✕</button>
+      </div>
+      <div class="modal-toolbar">
+        <input class="modal-search" id="logbook-search" placeholder="Search callsign, grid, or band…" spellcheck="false">
+        <span class="pill-count" id="logbook-count">0 contacts</span>
+      </div>
+      <div class="modal-body">
+        <table class="log-table">
+          <thead>
+            <tr>
+              <th>Date / Time</th>
+              <th>Callsign</th>
+              <th>Grid</th>
+              <th>Sent</th>
+              <th>Rcvd</th>
+              <th>Dial / Band</th>
+              <th>My Call</th>
+            </tr>
+          </thead>
+          <tbody id="logbook-table-body">
+            <tr><td colspan="7" class="empty-hint">No logged QSOs found.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONFIG & DEVICES MODAL -->
+  <div class="modal-overlay" id="config-modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="modal-title">⚙ Station & Audio Setup</span>
+        <span class="spacer"></span>
+        <button class="modal-close" id="config-close">✕</button>
+      </div>
+      <div class="modal-body form-body">
+        <label class="form-row">
+          <span>Callsign</span>
+          <input id="cfg-callsign" placeholder="e.g. W1AW" spellcheck="false">
+        </label>
+        <label class="form-row">
+          <span>Grid Square</span>
+          <input id="cfg-grid" placeholder="e.g. FN31" spellcheck="false">
+        </label>
+        <label class="form-row">
+          <span>Audio Device</span>
+          <select id="cfg-audio-device">
+            <option value="0">Default System Audio (0)</option>
+          </select>
+        </label>
+        <label class="form-row">
+          <span>CAT Mode</span>
+          <select id="cfg-cat-mode">
+            <option value="rigctld">rigctld (Hamlib network protocol)</option>
+            <option value="dummy">dummy (Testing CAT server)</option>
+          </select>
+        </label>
+        <label class="form-row">
+          <span>CAT Port</span>
+          <input id="cfg-cat-port" type="number" value="4532">
+        </label>
+        <div class="form-actions">
+          <button class="btn-primary" id="cfg-save-btn">Save Configuration</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="setup-overlay" id="setup-overlay" hidden></div>
   <script src="/app.js"></script>
 </body>
