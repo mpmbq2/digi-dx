@@ -208,4 +208,33 @@ describe("OperatorController", () => {
     expect(controller.state.station.dialFreqHz).toBe(14_074_000);
     expect(writes.at(-1)).toEqual({ dialFreqHz: 14_074_000 });
   });
+
+  it("updates and persists dial frequency when daemon status reports a CAT frequency", async () => {
+    const client = new FakeDaemonClient();
+    const log = new MemoryQsoLog();
+    const writes: Array<{ dialFreqHz?: number | null }> = [];
+    const controller = createOperatorController({
+      client,
+      log,
+      state: {
+        read: async () => ({ dialFreqHz: 14_074_000 }),
+        write: async (patch) => {
+          writes.push(patch);
+        }
+      }
+    });
+    controller.start();
+    await vi.runAllTimersAsync();
+    expect(controller.state.station.dialFreqHz).toBe(14_074_000);
+
+    // Daemon reports 40m FT8 via CAT status
+    const msg = statusMessage();
+    msg.session.catConnected = true;
+    msg.session.freq = 7_074_000;
+    client.emit("status", msg);
+    await vi.runAllTimersAsync();
+
+    expect(controller.state.station.dialFreqHz).toBe(7_074_000);
+    expect(writes.at(-1)).toEqual({ dialFreqHz: 7_074_000 });
+  });
 });

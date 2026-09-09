@@ -445,6 +445,17 @@ class OperatorControllerImpl implements OperatorController {
     }
     this.sessionActive = session.active;
     this.catConnected = session.catConnected;
+    if (session.catConnected && session.freq !== null && this.dialFreqHz !== session.freq) {
+      this.dialFreqHz = session.freq;
+      const mhz = session.freq / 1e6;
+      const band = this.bandForMHz?.(mhz) ?? null;
+      this.appendLog("info", `[freq] dial = ${mhz.toFixed(3)} MHz${band ? ` (${band})` : ""}`);
+      void this.stateStore
+        ?.write({ dialFreqHz: this.dialFreqHz })
+        .catch((error) =>
+          this.appendLog("error", `[state error] ${error instanceof Error ? error.message : String(error)}`)
+        );
+    }
 
     const sessionEnded = previousActive && !session.active;
     const kindChanged = previousKind !== msg.engine;
