@@ -24,13 +24,34 @@ The persistable station description used to start a live session (identity, devi
 ### Reserved demo identity
 Simulated stations use callsigns from an ITU non-assignable prefix so a leaked demo transmission or log entry cannot be mistaken for a real licensee. Persistence rejects that identity class outright.
 
+## Common Core and Periphery
+
+### Common core
+The invariant, bounded radio components: radio CAT/PTT control, soundcard audio I/O, FT8 DSP modulation/demodulation, slot clock publishing, and basic data storage/streaming.
+
+### Policy layer (UX)
+The operator's automation and operating rules: contact prioritization, CQ caller queueing, message sequencing, and transmit triggers given received decodes.
+
+### Interaction layer (UI)
+The visual presentation, layout, and control widgets that render station telemetry and accept operator input.
+
+### Infinite periphery
+The unbounded, operator-customizable combination of Policy and Interaction layers generated and evolved via agent dialogue, decoupled from the common core and executed within an isolated browser sandbox.
+
+### Unitary edge client
+The minimal application running on the radio-attached machine that executes physical transceiver control, audio DSP, and fail-safe PTT monitoring, pairing securely with the cloud service.
+
 ## Relationships
 
 - A Session selects exactly one Engine driver for its lifetime and publishes one Slot clock derived from that driver.
 - Demo mode is a Session whose engine driver is simulated and whose Session config is never persisted.
 - Live Sessions consume a persisted Session config; Demo mode must never write or accept that config as the saved station.
+- The Common core is partitioned between the Unitary edge client (physical radio/audio/DSP) and the Cloud platform (persistence, session routing, client SDK).
+- The Infinite periphery runs inside a sandboxed environment, decoupled from the Common core.
+- A single Policy layer may drive multiple independent Interaction layer layouts.
 
 ## Flagged ambiguities
 
 - "'KTD5' is plan-local numbering — the demo-mode plan's KTD5 is 'demo is real-time; only verification scales,' not the similarly numbered item in the earlier engine-backend plan."
 - "'Engine' in conversation may mean the daemon's session orchestrator, the external modem binary, or the client-side 'QSO automation engine' (the OperatorController that drives QSO orchestration); prefer Engine driver for the process boundary, Session for the orchestrated lifetime, and 'automation engine'/OperatorController for the client-side QSO orchestration."
+

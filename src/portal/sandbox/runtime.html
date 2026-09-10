@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Strict Content Security Policy: no network egress allowed (R10) -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:;">
+  <title>Digi-Dx Periphery Sandbox Runtime</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 0; background: #0b0f19; color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+    #policy-container { display: none; }
+    #interaction-container { width: 100vw; height: 100vh; overflow: auto; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <div id="policy-container"></div>
+  <div id="interaction-container">
+    <div style="display:flex; height:100%; align-items:center; justify-content:center; color:#64748b;">
+      <p>Awaiting Interaction Layer layout...</p>
+    </div>
+  </div>
+
+  <script>
+    (function() {
+      const CHANNEL_ID = 'digi-dx-periphery';
+      const eventListeners = new Map();
+      let policyState = {
+        callerQueue: [],
+        currentQso: null,
+        rules: {}
+      };
+
+      // Injected window.digiDx CoreClient proxy (R11)
+      window.digiDx = {
+        on: function(event, callback) {
+          if (!eventListeners.has(event)) eventListeners.set(event, new Set());
+          eventListeners.get(event).add(callback);
+          return function() { eventListeners.get(event)?.delete(callback); };
+        },
+        off: function(event, callback) {
+          eventListeners.get(event)?.delete(callback);
+        },
+        emitCommand: function(command) {
+          window.parent.postMessage({
+            channel: CHANNEL_ID,
+            type: 'rpc_command',
+            payload: command
+          }, '*');
+        },
+        transmit: function(intent) {
+          this.emitCommand({ type: 'transmit', ...intent });
+        },
+        cancelTransmit: function() {
+          this.emitCommand({ type: 'cancel_transmit' });
+        },
+        haltTx: function() {
+          this.emitCommand({ type: 'cancel_transmit' });
+        },
+        setIdentity: function(call, grid) {
+          this.emitCommand({ type: 'set_identity', call: call, grid: grid });
+        },
+        getPolicyState: function() {
+          return { ...policyState };
+        },
+        setPolicyState: function(patch) {
+          policyState = { ...policyState, ...patch };
+          window.parent.postMessage({
+            channel: CHANNEL_ID,
+            type: 'policy_state_sync',
+            state: policyState
+          }, '*');
+          const listeners = eventListeners.get('policyStateChange');
+          if (listeners) {
+            listeners.forEach(fn => fn(policyState));
+          }
+        }
+      };
+
+      // Message dispatcher from parent host portal
+      window.addEventListener('message', function(e) {
+        const msg = e.data;
+        if (!msg || msg.channel !== CHANNEL_ID) return;
+
+        if (msg.type === 'rpc_event' && msg.payload) {
+          const evtType = msg.payload.type;
+          const listeners = eventListeners.get(evtType);
+          if (listeners) {
+            listeners.forEach(fn => fn(msg.payload));
+          }
+        }
+
+        if (msg.type === 'policy_state_sync' && msg.state) {
+          policyState = msg.state;
+          const listeners = eventListeners.get('policyStateChange');
+          if (listeners) {
+            listeners.forEach(fn => fn(policyState));
+          }
+        }
+
+        if (msg.type === 'mount_policy' && msg.code) {
+          try {
+            if (msg.state) policyState = msg.state;
+            const policyFn = new Function('digiDx', msg.code);
+            policyFn(window.digiDx);
+          } catch (err) {
+            console.error('[sandbox] Error executing Policy layer:', err);
+          }
+        }
+
+        if (msg.type === 'mount_interaction' && msg.code) {
+          try {
+            if (msg.state) policyState = msg.state;
+            const container = document.getElementById('interaction-container');
+            container.innerHTML = '';
+            const interactionFn = new Function('digiDx', 'container', msg.code);
+            interactionFn(window.digiDx, container);
+          } catch (err) {
+            console.error('[sandbox] Error executing Interaction layer:', err);
+          }
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
