@@ -13,6 +13,7 @@ export interface EdgeClientOptions extends EdgeRuntimeOptions {
   ui?: "gui" | "tui" | "both" | "none";
   guiPort?: number;
   guiHost?: string;
+  onQuit?: () => void | Promise<void>;
 }
 
 export async function bootstrapEdgeClient(options: EdgeClientOptions = {}) {
@@ -32,7 +33,10 @@ export async function bootstrapEdgeClient(options: EdgeClientOptions = {}) {
 
   let tui: ReturnType<typeof startEdgeTui> | undefined;
   if (uiMode === "tui" || uiMode === "both") {
-    tui = startEdgeTui({ runtime });
+    tui = startEdgeTui({
+      runtime,
+      onQuit: options.onQuit
+    });
   }
 
   return {

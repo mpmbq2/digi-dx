@@ -24,6 +24,17 @@ function parseArgs(argv: string[]): {
       help = true;
     } else if (arg === "--sim") {
       sim = true;
+    } else if (arg === "--tui") {
+      ui = "tui";
+    } else if (arg === "--gui") {
+      ui = "gui";
+    } else if (arg === "--headless") {
+      ui = "headless";
+    } else if (arg.startsWith("--ui=")) {
+      const val = arg.slice(5);
+      if (val === "gui" || val === "tui" || val === "headless") {
+        ui = val;
+      }
     } else if (arg === "--ui" && (next === "gui" || next === "tui" || next === "headless")) {
       ui = next;
       i += 1;
@@ -55,6 +66,7 @@ Options:
                             - gui: Serves local web dashboard (monitor-attached or LAN browser)
                             - tui: Starts Blessed terminal UI in current terminal (headless SSH)
                             - headless: Runs edge background service with HTTP API only
+  --tui, --gui, --headless Shorthand flags for --ui mode
   --port <number>          Port for local GUI server (default: 8792)
   --host <string>          Bind address for local GUI server (default: 0.0.0.0)
   --sim                    Force simulated engine (radio-less demo/testing mode)
@@ -70,13 +82,19 @@ if (parsed.help) {
   process.exit(0);
 }
 
+const isTui = parsed.ui === "tui";
+
 const client = await bootstrapEdgeClient({
   ui: parsed.ui === "headless" ? "none" : parsed.ui,
   guiPort: parsed.port,
   guiHost: parsed.host,
   forceSimulated: parsed.sim,
   cloudUrl: parsed.cloud,
-  configPath: parsed.config
+  configPath: parsed.config,
+  logger: isTui ? { info: () => {}, warn: () => {}, error: () => {} } : console,
+  onQuit: async () => {
+    await shutdown("QUIT");
+  }
 });
 
 if (parsed.ui !== "tui") {

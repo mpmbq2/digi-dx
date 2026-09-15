@@ -108,6 +108,7 @@ export interface EdgeRuntimeEvents {
   catTest: [{ ok: boolean; freqHz: number | null; error?: string }];
   pttTest: [{ ok: boolean; error?: string }];
   error: [Error];
+  log: [string];
 }
 
 async function sendRigctldCommand(port: number, command: string, timeoutMs = 2000): Promise<{ ok: boolean; response: string; error?: string }> {
@@ -176,7 +177,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
       timeoutMs: options.watchdogTimeoutMs ?? 500,
       logger: this.logger,
       onTimeout: async () => {
-        this.logger.warn("[edge-runtime] fail-safe watchdog triggered: aborting transmit");
+        this.logMessage("warn", "[edge-runtime] fail-safe watchdog triggered: aborting transmit");
         try {
           await this.engine.cancelTransmit();
         } catch {
@@ -220,7 +221,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
         });
         this.setupEngineListeners();
       } catch (err) {
-        this.logger.warn(`[edge-runtime] live engine binaries unavailable (${String(err)}), using simulated driver`);
+        this.logMessage("warn", `[edge-runtime] live engine binaries unavailable (${String(err)}), using simulated driver`);
       }
     }
 
@@ -347,7 +348,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
         await this.engine.start(updated, this.forceSimulated ? "simulated" : undefined);
       }
     } catch (err) {
-      this.logger.error(`[edge-runtime] failed to save config: ${String(err)}`);
+      this.logMessage("error", `[edge-runtime] failed to save config: ${String(err)}`);
       throw err;
     }
   }
@@ -408,7 +409,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
     const catMode = config?.cat.mode ?? "rigctld";
     const catPort = config?.cat.port ?? 4532;
 
-    this.logger.info(`[edge-runtime] safe PTT pulse test requested (${durationMs}ms)`);
+    this.logMessage("info", `[edge-runtime] safe PTT pulse test requested (${durationMs}ms)`);
 
     if (catMode === "dummy" || snap.engine === "simulated") {
       await new Promise((r) => setTimeout(r, durationMs));
@@ -453,7 +454,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
       this.cloudSocket = ws;
 
       ws.on("open", () => {
-        this.logger.info(`[edge-runtime] connected to cloud gateway at ${url}`);
+        this.logMessage("info", `[edge-runtime] connected to cloud gateway at ${url}`);
         this.emitTelemetry();
 
         const pairing = this.pairingService.state;
@@ -476,16 +477,16 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
       });
 
       ws.on("close", () => {
-        this.logger.warn("[edge-runtime] cloud gateway connection closed");
+        this.logMessage("warn", "[edge-runtime] cloud gateway connection closed");
         this.stopHeartbeat();
         this.emitTelemetry();
       });
 
       ws.on("error", (err) => {
-        this.logger.warn(`[edge-runtime] cloud gateway socket error: ${err.message}`);
+        this.logMessage("warn", `[edge-runtime] cloud gateway socket error: ${err.message}`);
       });
     } catch (err) {
-      this.logger.warn(`[edge-runtime] failed to connect to cloud: ${String(err)}`);
+      this.logMessage("warn", `[edge-runtime] failed to connect to cloud: ${String(err)}`);
     }
   }
 
@@ -558,7 +559,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
 
     this.engine.on("status", () => this.emitTelemetry());
     this.engine.on("error", (err) => {
-      this.logger.error(`[edge-runtime] engine error: ${err.message}`);
+      this.logMessage("error", `[edge-runtime] engine error: ${err.message}`);
       this.emitTelemetry();
     });
   }
@@ -585,6 +586,11 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
       this.isConfigured = false;
     }
     this.emitTelemetry();
+  }
+
+  private logMessage(level: "info" | "warn" | "error", msg: string): void {
+    this.logger[level](msg);
+    this.emit("log", msg);
   }
 
   private emitTelemetry(): void {

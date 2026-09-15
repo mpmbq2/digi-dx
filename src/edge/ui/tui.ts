@@ -330,6 +330,10 @@ export function startEdgeTui(options: EdgeTuiOptions): { screen: blessed.Widgets
 
   if (runtime) {
     runtime.on("telemetry", () => renderStatus());
+    runtime.on("log", (msg) => {
+      appendRadioLog(msg.replace(/^\[edge-runtime\]\s*/, ""));
+      renderStatus();
+    });
   } else if (options.pairingService) {
     const refresh = () => renderStatus();
     options.pairingService.on("codeGenerated", refresh);
