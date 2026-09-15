@@ -183,6 +183,7 @@
           setAfFromPointer(event, lane);
         }
       });
+      lane.addEventListener("pointerup", () => {
         draggingSlot = null;
       });
       lane.addEventListener("pointercancel", () => {
@@ -201,6 +202,42 @@
       logOpen = !logOpen;
       renderLog();
     });
+
+    const navLogbook = document.getElementById("nav-logbook");
+    if (navLogbook) navLogbook.addEventListener("click", openLogbookModal);
+
+    const logbookClose = document.getElementById("logbook-close");
+    if (logbookClose) {
+      logbookClose.addEventListener("click", () => {
+        const m = document.getElementById("logbook-modal");
+        if (m) m.hidden = true;
+      });
+    }
+
+    const navConfig = document.getElementById("nav-config");
+    if (navConfig) navConfig.addEventListener("click", openConfigModal);
+
+    const configClose = document.getElementById("config-close");
+    if (configClose) {
+      configClose.addEventListener("click", () => {
+        const m = document.getElementById("config-modal");
+        if (m) m.hidden = true;
+      });
+    }
+
+    const cfgSaveBtn = document.getElementById("cfg-save-btn");
+    if (cfgSaveBtn) {
+      cfgSaveBtn.addEventListener("click", () => {
+        const m = document.getElementById("config-modal");
+        if (m) m.hidden = true;
+        const call = document.getElementById("cfg-callsign")?.value || "";
+        const grid = document.getElementById("cfg-grid")?.value || "";
+        const deviceId = Number(document.getElementById("cfg-audio-device")?.value || 0);
+        const catMode = document.getElementById("cfg-cat-mode")?.value || "rigctld";
+        const catPort = Number(document.getElementById("cfg-cat-port")?.value || 4532);
+        send({ cmd: "saveSetup", callsign: call, grid, deviceId, catMode, catPort });
+      });
+    }
   }
 
   function commitIdentity() {
