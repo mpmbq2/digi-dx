@@ -47,17 +47,31 @@ describe("Edge GUI Server & Dashboard (5 Diagnostic Pillars)", () => {
     expect(telem.server).toBeDefined();
     expect(telem.ft8).toBeDefined();
 
+    // 2b. GET /api/update-readiness before any activity (cold start with minUptimeSeconds=0)
+    const readyBeforeRes = await fetch(`${baseUrl}/api/update-readiness?minUptimeSeconds=0`);
+    expect(readyBeforeRes.status).toBe(200);
+    const readyBefore = await readyBeforeRes.json();
+    expect(readyBefore.ready).toBe(true);
+    expect(readyBefore.reason).toBe("idle");
+
     // 3. GET /api/devices
     const devRes = await fetch(`${baseUrl}/api/devices`);
     expect(devRes.status).toBe(200);
     const devices = await devRes.json();
     expect(Array.isArray(devices)).toBe(true);
 
-    // 4. POST /api/pairing/code
+    // 4. POST /api/pairing/code (records activity)
     const pinRes = await fetch(`${baseUrl}/api/pairing/code`, { method: "POST" });
     expect(pinRes.status).toBe(200);
     const pinData = await pinRes.json();
     expect(pinData.code).toMatch(/^\d{6}$/);
+
+    // 4b. GET /api/update-readiness immediately after activity is blocked
+    const readyAfterRes = await fetch(`${baseUrl}/api/update-readiness?minUptimeSeconds=0&minIdleSeconds=1800`);
+    expect(readyAfterRes.status).toBe(200);
+    const readyAfter = await readyAfterRes.json();
+    expect(readyAfter.ready).toBe(false);
+    expect(readyAfter.reason).toBe("recent_activity");
 
     // 5. POST /api/config
     const cfgRes = await fetch(`${baseUrl}/api/config`, {

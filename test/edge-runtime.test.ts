@@ -115,4 +115,50 @@ describe("EdgeRuntime & Telemetry (5 Diagnostic Pillars)", () => {
 
     await runtime.stop();
   });
+
+  it("tracks operator/TX activity and enforces the 30-minute update-readiness cooldown", async () => {
+    const liveDriver = new SimulatedDriver({});
+    const simDriver = new SimulatedDriver({});
+    const engine = new Engine({ driver: liveDriver, simulatedDriver: simDriver });
+
+    const runtime = new EdgeRuntime({
+      configPath,
+      forceSimulated: true,
+      engine
+    });
+    await runtime.init();
+
+    // Fresh boot with zero activity is warming up under default minUptimeSeconds=60,
+    // and ready once warm (simulated via minUptimeSeconds=0).
+    expect(runtime.getTelemetry().program.lastActivityTs).toBeNull();
+    expect(runtime.getUpdateReadiness(1800, 60)).toMatchObject({ ready: false, reason: "warming_up" });
+    expect(runtime.getUpdateReadiness(1800, 0)).toMatchObject({ ready: true, reason: "idle", lastActivityTs: null });
+
+    // Passive RX decodes must NOT mark the station active.
+    engine.emit("event", {
+      type: "decode",
+      ts: Math.floor(Date.now() / 1000),
+      snr: -10,
+      dt: 0.1,
+      af: 1500,
+      mode: "FT8",
+      message: "CQ K1ABC FN31"
+    });
+    expect(runtime.getTelemetry().program.lastActivityTs).toBeNull();
+    expect(runtime.getUpdateReadiness(1800, 0).ready).toBe(true);
+
+    // Operator action marks activity and blocks updates for 30 minutes.
+    runtime.generatePairingCode();
+    expect(runtime.getTelemetry().program.lastActivityTs).not.toBeNull();
+    expect(runtime.getUpdateReadiness(1800, 0)).toMatchObject({ ready: false, reason: "recent_activity" });
+
+    // Once idle > 30 minutes (1801s), updates become ready again.
+    runtime.recordActivity(Date.now() - 1801 * 1000);
+    const readyAfterCooldown = runtime.getUpdateReadiness(1800, 0);
+    expect(readyAfterCooldown.ready).toBe(true);
+    expect(readyAfterCooldown.reason).toBe("idle");
+    expect(readyAfterCooldown.idleSeconds).toBeGreaterThanOrEqual(1800);
+
+    await runtime.stop();
+  });
 });

@@ -89,6 +89,30 @@ export function createEdgeGuiServer(options: EdgeGuiOptions): EdgeGuiServer {
         return;
       }
 
+      if (url.pathname === "/api/update-readiness" && req.method === "GET") {
+        const minIdleParam = url.searchParams.get("minIdleSeconds");
+        const minIdleSeconds =
+          minIdleParam !== null && Number.isFinite(Number(minIdleParam)) ? Math.max(0, Number(minIdleParam)) : 1800;
+        const minUptimeParam = url.searchParams.get("minUptimeSeconds");
+        const minUptimeSeconds =
+          minUptimeParam !== null && Number.isFinite(Number(minUptimeParam)) ? Math.max(0, Number(minUptimeParam)) : 60;
+        const readiness = runtime
+          ? runtime.getUpdateReadiness(minIdleSeconds, minUptimeSeconds)
+          : {
+              ready: true,
+              reason: "idle" as const,
+              ptt: false,
+              engineState: "inactive" as const,
+              uptimeSeconds: minUptimeSeconds,
+              lastActivityTs: null,
+              idleSeconds: null,
+              minIdleSeconds
+            };
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(readiness));
+        return;
+      }
+
       if (url.pathname === "/api/devices" && req.method === "GET") {
         const devices = runtime ? await runtime.listAudioDevices() : options.listAudioDevices ? await options.listAudioDevices() : [];
         res.writeHead(200, { "Content-Type": "application/json" });

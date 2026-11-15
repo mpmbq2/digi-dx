@@ -24,6 +24,8 @@ export interface EdgeTelemetry {
     version: string;
     status: "healthy" | "degraded" | "error";
     engineState: "inactive" | "starting" | "active" | "stopping";
+    lastActivityTs: number | null;
+    idleSeconds: number | null;
   };
   config: {
     callsign: string;
@@ -75,9 +77,20 @@ export function formatMhz(hz: number | null): string {
   return `${(hz / 1e6).toFixed(3)} MHz`;
 }
 
+export interface EdgeUpdateReadiness {
+  ready: boolean;
+  reason: "idle" | "ptt_active" | "engine_transitioning" | "warming_up" | "recent_activity";
+  ptt: boolean;
+  engineState: EdgeTelemetry["program"]["engineState"];
+  uptimeSeconds: number;
+  lastActivityTs: number | null;
+  idleSeconds: number | null;
+  minIdleSeconds: number;
+}
+
 export function createInitialTelemetry(stationId = "unknown"): EdgeTelemetry {
   return {
-    program: { uptimeSeconds: 0, version: "0.1.0", status: "healthy", engineState: "inactive" },
+    program: { uptimeSeconds: 0, version: "0.1.0", status: "healthy", engineState: "inactive", lastActivityTs: null, idleSeconds: null },
     config: { callsign: "N0CALL", grid: "FN31", deviceId: 0, catMode: "rigctld", catPort: 4532, cloudUrl: "ws://127.0.0.1:8795", isConfigured: false },
     server: { status: "unpaired", connected: false, stationId, activeCode: null, codeExpiresInSec: null, pingMs: null, lastHeartbeatTs: null },
     radio: { catConnected: false, freqHz: null, ptt: false, lastCatCheckTs: null, catError: null },
@@ -158,6 +171,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
   private lastDecodeTs: number | null = null;
   private lastCatCheckTs: number | null = null;
   private catError: string | null = null;
+  private lastActivityTs: number | null = null;
   private telemetryTicker: NodeJS.Timeout | null = null;
 
   constructor(options: EdgeRuntimeOptions = {}) {
@@ -263,12 +277,17 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
 
     const codeExpiresInSec = pairing.expiresAt ? Math.max(0, Math.round((pairing.expiresAt - Date.now()) / 1000)) : null;
 
+    const idleSeconds =
+      this.lastActivityTs !== null ? Math.max(0, Math.floor((Date.now() - this.lastActivityTs) / 1000)) : null;
+
     return {
       program: {
         uptimeSeconds,
         version: "0.1.0",
         status: !this.catError && !this.watchdog.hasTimedOut ? "healthy" : "degraded",
-        engineState: engineSnap.state
+        engineState: engineSnap.state,
+        lastActivityTs: this.lastActivityTs,
+        idleSeconds
       },
       config: {
         callsign: this.currentConfig?.callsign ?? "",
@@ -314,6 +333,30 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
     };
   }
 
+  recordActivity(ts = Date.now()): void {
+    this.lastActivityTs = ts;
+  }
+
+  getUpdateReadiness(minIdleSeconds = 1800, minUptimeSeconds = 60): EdgeUpdateReadiness {
+    const telem = this.getTelemetry();
+    const { uptimeSeconds, engineState, lastActivityTs, idleSeconds } = telem.program;
+    const { ptt } = telem.radio;
+
+    if (ptt) {
+      return { ready: false, reason: "ptt_active", ptt, engineState, uptimeSeconds, lastActivityTs, idleSeconds, minIdleSeconds };
+    }
+    if (engineState === "starting" || engineState === "stopping") {
+      return { ready: false, reason: "engine_transitioning", ptt, engineState, uptimeSeconds, lastActivityTs, idleSeconds, minIdleSeconds };
+    }
+    if (uptimeSeconds < minUptimeSeconds) {
+      return { ready: false, reason: "warming_up", ptt, engineState, uptimeSeconds, lastActivityTs, idleSeconds, minIdleSeconds };
+    }
+    if (lastActivityTs !== null && idleSeconds !== null && idleSeconds < minIdleSeconds) {
+      return { ready: false, reason: "recent_activity", ptt, engineState, uptimeSeconds, lastActivityTs, idleSeconds, minIdleSeconds };
+    }
+    return { ready: true, reason: "idle", ptt, engineState, uptimeSeconds, lastActivityTs, idleSeconds, minIdleSeconds };
+  }
+
   async saveConfig(partial: Partial<EdgeStationConfig>): Promise<void> {
     const existing = this.currentConfig ?? {
       mode: "FT8" as const,
@@ -341,6 +384,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
       await persistConfig(updated, this.configPath);
       this.currentConfig = updated;
       this.isConfigured = true;
+      this.recordActivity();
       this.emitTelemetry();
 
       const snap = this.engine.snapshot();
@@ -354,6 +398,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
   }
 
   generatePairingCode(): { code: string; expiresAt: number } {
+    this.recordActivity();
     const result = this.pairingService.generatePairingCode();
     if (this.cloudSocket?.readyState === WebSocket.OPEN) {
       this.cloudSocket.send(
@@ -370,6 +415,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
   }
 
   async testCat(): Promise<{ ok: boolean; freqHz: number | null; catConnected: boolean; error?: string }> {
+    this.recordActivity();
     this.lastCatCheckTs = Date.now();
     const config = this.currentConfig;
     const catPort = config?.cat.port ?? 4532;
@@ -404,6 +450,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
   }
 
   async testPtt(durationMs = 200): Promise<{ ok: boolean; error?: string }> {
+    this.recordActivity();
     const snap = this.engine.snapshot();
     const config = this.currentConfig;
     const catMode = config?.cat.mode ?? "rigctld";
@@ -494,6 +541,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
     const type = String(msg.type ?? "");
 
     if (type === "pairing_complete") {
+      this.recordActivity();
       this.pairingService.verifyAndClaim(this.pairingService.state.activeCode ?? "", String(msg.sessionToken ?? ""));
       this.emitTelemetry();
       return;
@@ -511,6 +559,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
     }
 
     if (type === "transmit") {
+      this.recordActivity();
       const af = Number(msg.af);
       const slot = msg.slot === "even" || msg.slot === "odd" ? msg.slot : "even";
       const message = String(msg.message ?? "");
@@ -520,6 +569,7 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
     }
 
     if (type === "cancel_transmit") {
+      this.recordActivity();
       this.watchdog.disarm();
       void this.engine.cancelTransmit();
     }
@@ -543,6 +593,9 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
 
   private setupEngineListeners(): void {
     this.engine.on("event", (evt) => {
+      if (evt.type === "tx") {
+        this.recordActivity();
+      }
       if (evt.type === "decode") {
         this.totalDecodes += 1;
         this.decodesThisSlot += 1;
@@ -557,7 +610,12 @@ export class EdgeRuntime extends EventEmitter<EdgeRuntimeEvents> {
       this.emitTelemetry();
     });
 
-    this.engine.on("status", () => this.emitTelemetry());
+    this.engine.on("status", () => {
+      if (this.engine.snapshot().ptt) {
+        this.recordActivity();
+      }
+      this.emitTelemetry();
+    });
     this.engine.on("error", (err) => {
       this.logMessage("error", `[edge-runtime] engine error: ${err.message}`);
       this.emitTelemetry();
