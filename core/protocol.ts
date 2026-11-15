@@ -205,4 +205,5 @@ export type DaemonCommand =
   | { type: "start_session"; session?: unknown; demo?: boolean }
   | { type: "stop_session" }
   | { type: "transmit"; af: number; slot: TxSlot; message: string }
-  | { type: "cancel_transmit" };
+  | { type: "cancel_transmit" }
+  | { type: "heartbeat" };

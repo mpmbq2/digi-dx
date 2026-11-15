@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.ui.json",
     "install-engine": "bash scripts/install-engine.sh",
     "digi": "tsx scripts/digi-dx.ts",
+    "edge": "tsx scripts/edge.ts",
     "smoke": "tsx scripts/smoke.ts",
     "smoke:ui": "tsx scripts/smoke-ui.ts",
     "ui": "tsx ui/cli.ts",

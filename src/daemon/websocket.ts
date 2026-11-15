@@ -26,6 +26,8 @@ export interface DaemonWebSocketOptions {
   forceSimulated?: boolean;
   listAudioDevices?: () => Promise<AudioDevice[]>;
   logger?: Pick<Console, "info" | "warn" | "error">;
+  enableWatchdog?: boolean;
+  watchdogTimeoutMs?: number;
 }
 
 export interface DaemonWebSocketServer {
@@ -34,6 +36,9 @@ export interface DaemonWebSocketServer {
 }
 
 export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): DaemonWebSocketServer {
+  if (options.enableWatchdog && typeof options.engine.enablePttWatchdog === "function") {
+    options.engine.enablePttWatchdog(true, options.watchdogTimeoutMs);
+  }
   const server = new WebSocketServer({
     port: options.port ?? 8788,
     host: options.host ?? "0.0.0.0"
@@ -71,6 +76,9 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
       clients.delete(client);
       if (controller === client) {
         controller = null;
+        if (options.engine.snapshot().ptt) {
+          void options.engine.cancelTransmit().catch(() => {});
+        }
         broadcastStatus();
       }
     });
@@ -98,6 +106,10 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
 
       if (typeof type !== "string") {
         throw new DaemonError("INVALID_COMMAND", "command.type is required");
+      }
+
+      if (controller === client) {
+        options.engine.petWatchdog?.();
       }
 
       switch (type) {
@@ -140,6 +152,10 @@ export function createDaemonWebSocketServer(options: DaemonWebSocketOptions): Da
           requireControl(client);
           await options.engine.cancelTransmit();
           broadcastStatus(client, id);
+          return;
+        case "heartbeat":
+          requireControl(client);
+          options.engine.petWatchdog?.();
           return;
         default:
           throw new DaemonError("INVALID_COMMAND", `unknown command type '${type}'`);

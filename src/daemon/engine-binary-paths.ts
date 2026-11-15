@@ -164,7 +164,8 @@ function resolveBinPath(path: string, repoRoot: string): string {
 }
 
 function defaultRepoRoot(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  const candidate = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  return candidate.endsWith("/dist") || candidate.endsWith("\\dist") ? resolve(candidate, "..") : candidate;
 }
 
 function detectUnameMachine(): string {

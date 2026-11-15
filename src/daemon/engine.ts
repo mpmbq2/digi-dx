@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { SlotClock } from "../../core/slot-clock.js";
+import { PttWatchdog } from "../edge/watchdog.js";
 import type { SessionConfig } from "./config.js";
 import {
   driverDecodeToEvent,
@@ -47,6 +48,8 @@ export interface EngineOptions {
   // must fail construction, not key the radio under kind "simulated".
   simulatedDriver: EngineDriver;
   logger?: Pick<Console, "info" | "warn" | "error">;
+  watchdogTimeoutMs?: number;
+  enableWatchdog?: boolean;
 }
 
 export interface EngineApi extends EventEmitter<EngineEvents> {
@@ -56,6 +59,9 @@ export interface EngineApi extends EventEmitter<EngineEvents> {
   transmit(intent: TxIntent): Promise<void>;
   cancelTransmit(): Promise<void>;
   listAudioDevices(kind?: EngineKind): ReturnType<EngineDriver["listAudioDevices"]>;
+  petWatchdog(): void;
+  enablePttWatchdog(enabled?: boolean, timeoutMs?: number): void;
+  isWatchdogArmed(): boolean;
 }
 
 export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
@@ -70,6 +76,8 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
   private bound: EngineDriver | null = null;
   private readonly drivers: Record<EngineKind, EngineDriver>;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
+  private watchdog: PttWatchdog;
+  private enableWatchdog: boolean;
   // Held as fields so they can be unbound again: a driver outlives the session
   // that selected it, and a demo session must not leave listeners on the real
   // driver (or vice versa) once it stops.
@@ -83,6 +91,11 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
     ptt: (active: boolean) => {
       this.txState.markEngineTx(active);
       this.ptt = active;
+      if (active && this.enableWatchdog) {
+        this.watchdog.arm();
+      } else if (!active) {
+        this.watchdog.disarm();
+      }
       this.emit("status");
     },
     crash: () => {
@@ -103,6 +116,23 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
     this.logger = options.logger ?? console;
     this.clock = new SlotClock(this.driver.clock());
     this.txState = this.createTxState();
+    this.enableWatchdog = options.enableWatchdog ?? false;
+    this.watchdog = new PttWatchdog({
+      timeoutMs: options.watchdogTimeoutMs ?? 500,
+      logger: this.logger,
+      onTimeout: async () => {
+        try {
+          await this.cancelTransmit();
+        } catch {
+          // Session might have already ended
+        }
+        this.emit("event", {
+          type: "log",
+          level: "error",
+          message: "fail-safe: watchdog timeout, PTT de-asserted"
+        });
+      }
+    });
   }
 
   snapshot(): EngineSnapshot {
@@ -165,6 +195,7 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
   }
 
   async stop(): Promise<void> {
+    this.watchdog.disarm();
     if (this.state === "inactive") {
       throw new DaemonError("NO_ACTIVE_SESSION", "no active session");
     }
@@ -185,17 +216,55 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
     if (this.state !== "active") {
       throw new DaemonError("NO_ACTIVE_SESSION", "no active session");
     }
+    if (this.enableWatchdog) {
+      this.watchdog.arm();
+    }
     await this.txState.transmit(intent);
     this.emit("status");
   }
 
   async cancelTransmit(): Promise<void> {
+    this.watchdog.disarm();
     if (this.state !== "active") {
       throw new DaemonError("NO_ACTIVE_SESSION", "no active session");
     }
     await this.txState.cancel();
     this.ptt = false;
     this.emit("status");
+  }
+
+  petWatchdog(): void {
+    if (this.enableWatchdog) {
+      this.watchdog.pet();
+    }
+  }
+
+  enablePttWatchdog(enabled = true, timeoutMs?: number): void {
+    this.enableWatchdog = enabled;
+    if (!enabled) {
+      this.watchdog.disarm();
+    } else if (timeoutMs) {
+      this.watchdog = new PttWatchdog({
+        timeoutMs,
+        logger: this.logger,
+        onTimeout: async () => {
+          try {
+            await this.cancelTransmit();
+          } catch {
+            // ignore
+          }
+          this.emit("event", {
+            type: "log",
+            level: "error",
+            message: "fail-safe: watchdog timeout, PTT de-asserted"
+          });
+        }
+      });
+    }
+  }
+
+  isWatchdogArmed(): boolean {
+    return this.watchdog.isArmed;
   }
 
   // Defaults to the currently selected driver, but the first-run setup surface
@@ -245,6 +314,7 @@ export class Engine extends EventEmitter<EngineEvents> implements EngineApi {
   }
 
   private async handleCrash(): Promise<void> {
+    this.watchdog.disarm();
     this.resetLocalState();
     try {
       await this.driver.stop();
