@@ -263,6 +263,8 @@ async fn scaled_time_simulated_qso_completes_and_isolates_adif_export() {
             let txt = read_next_ws_text_frame(&mut ws).await;
             let val: Value = serde_json::from_str(&txt).unwrap();
             if val["type"] == "qso_update" && !val["completed_qso"].is_null() {
+                assert_eq!(val["my_call"], "QQ0DEMO");
+                assert_eq!(val["my_grid"], "FN33");
                 return val["completed_qso"].clone();
             }
         }
@@ -315,6 +317,146 @@ async fn scaled_time_simulated_qso_completes_and_isolates_adif_export() {
 
     drop(ws);
     srv_handle.abort();
+    shutdown.cancel();
+    state.sessions.stop_if_active().await;
+    state.watchdog.disarm_all().await;
+    state.supervisor.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn station_grid_update_propagates_to_qso_sequencer_and_ignores_demo() {
+    use digi_dx::command_bus::{CommandEnvelope, CommandOrigin, CommandStatus};
+    use digi_dx::domain::clock::SlotParity;
+    use digi_dx::qso::sequencer::QsoSequencer;
+
+    let dir = tempdir().unwrap();
+    let cfg = make_cfg(dir.path());
+    let store = StateStore::open(cfg.db_path()).unwrap();
+    let mut sup_cfg = SupervisorConfig::from_daemon_config(&cfg);
+    sup_cfg.timing = fast_test_worker_timing();
+
+    let state = AppState::build_for_test_with_supervisor(
+        cfg,
+        store,
+        make_preflight(),
+        sup_cfg,
+        build_dummy_scanner_for_test(vec![]),
+    );
+    let shutdown = CancellationToken::new();
+    state.supervisor.start(shutdown.clone()).await;
+
+    // 1. Update station config to N1MPM / FN34 via CommandBus and verify DB + sequencer formatting
+    let update_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: None,
+                kind: "station.update_config".into(),
+                issued_at_utc: "2026-11-22T00:00:00Z".into(),
+                payload: json!({ "callsign": "N1MPM", "grid": "FN34" }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(update_ack.status, CommandStatus::Ok, "{update_ack:?}");
+
+    let station = state.store.get_station_config().unwrap();
+    assert_eq!(station.callsign.as_deref(), Some("N1MPM"));
+    assert_eq!(station.grid.as_deref(), Some("FN34"));
+
+    let mut seq = QsoSequencer::new(
+        "rad_1",
+        false,
+        station.callsign.as_deref().unwrap(),
+        station.grid.as_deref().unwrap(),
+    );
+    seq.start_cq(SlotParity::Even, None);
+    let tx = seq.compose_tx_for_slot(SlotParity::Even, 0).unwrap();
+    assert_eq!(tx.message, "CQ N1MPM FN34");
+
+    // 2. While a demo session is active, updating station config must NOT overwrite demo QQ0DEMO / FN33
+    let create_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: None,
+                kind: "radio.create_profile".into(),
+                issued_at_utc: "2026-11-22T00:00:00Z".into(),
+                payload: json!({ "name": "Grid Test Dummy", "hamlib_model": 1, "is_dummy": true, "rigctld_port": 4571 }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(create_ack.status, CommandStatus::Ok);
+    let rad_id = create_ack.result.unwrap()["profile"]["radio_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        if state
+            .supervisor
+            .get_radio_snapshot(&rad_id)
+            .is_some_and(|s| s.lifecycle_state == RadioLifecycleState::Ready)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let claim_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "control.claim_lease".into(),
+                issued_at_utc: "2026-11-22T00:00:00Z".into(),
+                payload: json!({}),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(claim_ack.status, CommandStatus::Ok);
+
+    let start_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "session.start".into(),
+                issued_at_utc: "2026-11-22T00:00:00Z".into(),
+                payload: json!({ "demo": true, "scale": 1.0 }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(start_ack.status, CommandStatus::Ok);
+
+    state
+        .sessions
+        .update_live_station_identity("N1MPM", "FN34")
+        .await;
+    let demo_snap = state.sessions.snapshot();
+    assert_eq!(demo_snap.my_call.as_deref(), Some("QQ0DEMO"));
+    assert_eq!(demo_snap.my_grid.as_deref(), Some("FN33"));
+
     shutdown.cancel();
     state.sessions.stop_if_active().await;
     state.watchdog.disarm_all().await;

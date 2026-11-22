@@ -238,6 +238,8 @@ pub enum WsBroadcastEvent {
         radio_id: Option<String>,
         active: bool,
         is_demo: bool,
+        my_call: Option<String>,
+        my_grid: Option<String>,
         tx_enabled: bool,
         tx_af_hz: u16,
         tx_af_occupied: bool,
@@ -421,7 +423,7 @@ impl CommandBus {
 
     async fn execute_command(&self, envelope: &CommandEnvelope) -> CommandAck {
         match envelope.kind.as_str() {
-            "station.update_config" => self.exec_station_update(envelope),
+            "station.update_config" => self.exec_station_update(envelope).await,
             "radio.create_profile" => self.exec_radio_create(envelope).await,
             "radio.update_profile" => self.exec_radio_update(envelope).await,
             "radio.delete_profile" => self.exec_radio_delete(envelope).await,
@@ -454,7 +456,7 @@ impl CommandBus {
         }
     }
 
-    fn exec_station_update(&self, envelope: &CommandEnvelope) -> CommandAck {
+    async fn exec_station_update(&self, envelope: &CommandEnvelope) -> CommandAck {
         let call_raw = envelope
             .payload
             .get("callsign")
@@ -491,6 +493,9 @@ impl CommandBus {
 
         match self.store.update_station_config(&call, &grid) {
             Ok(cfg) => {
+                self.sessions
+                    .update_live_station_identity(&call, &grid)
+                    .await;
                 let _ = self.ws_tx.send(WsBroadcastEvent::StationUpdated {
                     station_id: cfg.station_id.clone(),
                     callsign: cfg.callsign.clone(),

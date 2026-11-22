@@ -6,7 +6,7 @@ use cpal::{SampleFormat, StreamConfig};
 use tokio::sync::mpsc;
 
 use crate::audio::devices::{
-    enumerate_audio_devices, match_audio_device, resolve_cpal_input_device,
+    enumerate_audio_devices, lock_audio_open, match_audio_device, resolve_cpal_input_device,
     resolve_cpal_output_device, AudioDeviceInfo, AudioMatchOutcome,
 };
 use crate::audio::dsp::{
@@ -279,115 +279,121 @@ fn run_capture_thread(
     ready_tx: std_mpsc::SyncSender<Result<(), AudioError>>,
     stop_rx: std_mpsc::Receiver<()>,
 ) {
-    let Some(dev) = resolve_cpal_input_device(&device_name) else {
-        let _ = ready_tx.send(Err(AudioError::DeviceNotFound(device_name)));
-        return;
-    };
-
-    let (config, fmt) = match select_input_config(&dev) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
+    let stream = {
+        let _open_guard = lock_audio_open();
+        let Some(dev) = resolve_cpal_input_device(&device_name) else {
+            let _ = ready_tx.send(Err(AudioError::DeviceNotFound(device_name)));
             return;
-        }
-    };
+        };
 
-    let sample_rate = config.sample_rate.0;
-    let channels = config.channels as usize;
-    let resampler = match StreamingResampler::new(sample_rate, FT8_SAMPLE_RATE) {
-        Ok(r) => Arc::new(Mutex::new(r)),
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            return;
-        }
-    };
-    let analyzer = Arc::new(Mutex::new(WaterfallAnalyzer::new(sample_rate)));
+        let (config, fmt) = match select_input_config(&dev) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
 
-    let handle_samples = move |mono_in: Vec<f32>| {
-        if mono_in.is_empty() {
-            return;
-        }
-        if let Some(ref tx) = wf_tx {
-            if let Ok(mut wf) = analyzer.lock() {
-                for frame in wf.push_samples(&mono_in) {
-                    let _ = tx.try_send(frame);
+        let sample_rate = config.sample_rate.0;
+        let channels = config.channels as usize;
+        let resampler = match StreamingResampler::new(sample_rate, FT8_SAMPLE_RATE) {
+            Ok(r) => Arc::new(Mutex::new(r)),
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
+        let analyzer = Arc::new(Mutex::new(WaterfallAnalyzer::new(sample_rate)));
+
+        let handle_samples = move |mono_in: Vec<f32>| {
+            if mono_in.is_empty() {
+                return;
+            }
+            if let Some(ref tx) = wf_tx {
+                if let Ok(mut wf) = analyzer.lock() {
+                    for frame in wf.push_samples(&mono_in) {
+                        let _ = tx.try_send(frame);
+                    }
                 }
             }
-        }
-        if let Ok(mut res) = resampler.lock() {
-            if let Ok(pcm_12k) = res.push(&mono_in) {
-                if !pcm_12k.is_empty() {
-                    if let Ok(mut buf) = slot_buffer.lock() {
-                        buf.extend_from_slice(&pcm_12k);
-                        let cap = FT8_SLOT_SAMPLES_12K * 2;
-                        if buf.len() > cap {
-                            let excess = buf.len() - cap;
-                            buf.drain(..excess);
+            if let Ok(mut res) = resampler.lock() {
+                if let Ok(pcm_12k) = res.push(&mono_in) {
+                    if !pcm_12k.is_empty() {
+                        if let Ok(mut buf) = slot_buffer.lock() {
+                            buf.extend_from_slice(&pcm_12k);
+                            let cap = FT8_SLOT_SAMPLES_12K * 2;
+                            if buf.len() > cap {
+                                let excess = buf.len() - cap;
+                                buf.drain(..excess);
+                            }
                         }
                     }
                 }
             }
-        }
-    };
+        };
 
-    let fault_cb = Arc::clone(&on_fault);
-    let err_fn = move |err: cpal::StreamError| {
-        fault_cb(format!("RX audio stream error: {err}"));
-    };
+        let fault_cb = Arc::clone(&on_fault);
+        let err_fn = move |err: cpal::StreamError| {
+            fault_cb(format!("RX audio stream error: {err}"));
+        };
 
-    let stream_res = match fmt {
-        SampleFormat::F32 => {
-            let ch = rx_channel.clone();
-            dev.build_input_stream(
-                &config,
-                move |data: &[f32], _| {
-                    handle_samples(extract_channel(data, channels, &ch));
-                },
-                err_fn,
-                None,
-            )
-        }
-        SampleFormat::I16 => {
-            let ch = rx_channel.clone();
-            dev.build_input_stream(
-                &config,
-                move |data: &[i16], _| {
-                    let f: Vec<f32> = data.iter().map(|&s| (s as f32) / 32768.0).collect();
-                    handle_samples(extract_channel(&f, channels, &ch));
-                },
-                err_fn,
-                None,
-            )
-        }
-        SampleFormat::U16 => {
-            let ch = rx_channel.clone();
-            dev.build_input_stream(
-                &config,
-                move |data: &[u16], _| {
-                    let f: Vec<f32> = data
-                        .iter()
-                        .map(|&s| ((s as f32) - 32768.0) / 32768.0)
-                        .collect();
-                    handle_samples(extract_channel(&f, channels, &ch));
-                },
-                err_fn,
-                None,
-            )
-        }
-        other => {
-            let _ = ready_tx.send(Err(AudioError::UnsupportedConfig(format!(
-                "unsupported RX sample format: {other:?}"
-            ))));
-            return;
-        }
-    };
+        let stream_res = match fmt {
+            SampleFormat::F32 => {
+                let ch = rx_channel.clone();
+                dev.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        handle_samples(extract_channel(data, channels, &ch));
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            SampleFormat::I16 => {
+                let ch = rx_channel.clone();
+                dev.build_input_stream(
+                    &config,
+                    move |data: &[i16], _| {
+                        let f: Vec<f32> = data.iter().map(|&s| (s as f32) / 32768.0).collect();
+                        handle_samples(extract_channel(&f, channels, &ch));
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            SampleFormat::U16 => {
+                let ch = rx_channel.clone();
+                dev.build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        let f: Vec<f32> = data
+                            .iter()
+                            .map(|&s| ((s as f32) - 32768.0) / 32768.0)
+                            .collect();
+                        handle_samples(extract_channel(&f, channels, &ch));
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            other => {
+                let _ = ready_tx.send(Err(AudioError::UnsupportedConfig(format!(
+                    "unsupported RX sample format: {other:?}"
+                ))));
+                return;
+            }
+        };
 
-    let stream = match stream_res {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = ready_tx.send(Err(AudioError::StreamError(e.to_string())));
-            return;
-        }
+        let stream = match stream_res {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready_tx.send(Err(AudioError::StreamError(e.to_string())));
+                return;
+            }
+        };
+        // Drop cpal::Device so ALSA releases the unused playback PCM handle while RX runs.
+        drop(dev);
+        stream
     };
 
     if let Err(e) = stream.play() {
@@ -411,135 +417,142 @@ fn run_playback_thread(
     ready_tx: std_mpsc::SyncSender<Result<(), AudioError>>,
     stop_rx: std_mpsc::Receiver<()>,
 ) {
-    let Some(dev) = resolve_cpal_output_device(&device_name) else {
-        let _ = ready_tx.send(Err(AudioError::DeviceNotFound(device_name)));
-        return;
-    };
-
-    let (config, fmt) = match select_output_config(&dev) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
+    let stream = {
+        let _open_guard = lock_audio_open();
+        let Some(dev) = resolve_cpal_output_device(&device_name) else {
+            let _ = ready_tx.send(Err(AudioError::DeviceNotFound(device_name)));
             return;
-        }
-    };
+        };
 
-    let out_rate = config.sample_rate.0;
-    let channels = config.channels as usize;
-    let mut pcm = match resample_mono(&samples_48k, DSP_SAMPLE_RATE, out_rate) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            return;
-        }
-    };
-    apply_gain_db(&mut pcm, tx_gain_db);
+        let (config, fmt) = match select_output_config(&dev) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
 
-    let cursor = Arc::new(Mutex::new(0_usize));
-    let pcm_arc = Arc::new(pcm);
-    let err_fn = move |err: cpal::StreamError| {
-        on_fault(format!("TX audio stream error: {err}"));
-    };
+        let out_rate = config.sample_rate.0;
+        let channels = config.channels as usize;
+        let mut pcm = match resample_mono(&samples_48k, DSP_SAMPLE_RATE, out_rate) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
+        apply_gain_db(&mut pcm, tx_gain_db);
 
-    let stream_res = match fmt {
-        SampleFormat::F32 => {
-            let cur = Arc::clone(&cursor);
-            let p = Arc::clone(&pcm_arc);
-            let ab = Arc::clone(&abort_flag);
-            let fin = Arc::clone(&finished_flag);
-            dev.build_output_stream(
-                &config,
-                move |data: &mut [f32], _| {
-                    let mut idx = cur.lock().expect("tx cursor poisoned");
-                    for frame in data.chunks_mut(channels) {
-                        let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
-                            fin.store(true, Ordering::SeqCst);
-                            0.0
-                        } else {
-                            let s = p[*idx];
-                            *idx += 1;
-                            if *idx >= p.len() {
+        let cursor = Arc::new(Mutex::new(0_usize));
+        let pcm_arc = Arc::new(pcm);
+        let err_fn = move |err: cpal::StreamError| {
+            on_fault(format!("TX audio stream error: {err}"));
+        };
+
+        let stream_res = match fmt {
+            SampleFormat::F32 => {
+                let cur = Arc::clone(&cursor);
+                let p = Arc::clone(&pcm_arc);
+                let ab = Arc::clone(&abort_flag);
+                let fin = Arc::clone(&finished_flag);
+                dev.build_output_stream(
+                    &config,
+                    move |data: &mut [f32], _| {
+                        let mut idx = cur.lock().expect("tx cursor poisoned");
+                        for frame in data.chunks_mut(channels) {
+                            let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
                                 fin.store(true, Ordering::SeqCst);
-                            }
-                            s
-                        };
-                        frame.fill(val);
-                    }
-                },
-                err_fn,
-                None,
-            )
-        }
-        SampleFormat::I16 => {
-            let cur = Arc::clone(&cursor);
-            let p = Arc::clone(&pcm_arc);
-            let ab = Arc::clone(&abort_flag);
-            let fin = Arc::clone(&finished_flag);
-            dev.build_output_stream(
-                &config,
-                move |data: &mut [i16], _| {
-                    let mut idx = cur.lock().expect("tx cursor poisoned");
-                    for frame in data.chunks_mut(channels) {
-                        let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
-                            fin.store(true, Ordering::SeqCst);
-                            0_i16
-                        } else {
-                            let s = (p[*idx].clamp(-1.0, 1.0) * 32767.0).round() as i16;
-                            *idx += 1;
-                            if *idx >= p.len() {
+                                0.0
+                            } else {
+                                let s = p[*idx];
+                                *idx += 1;
+                                if *idx >= p.len() {
+                                    fin.store(true, Ordering::SeqCst);
+                                }
+                                s
+                            };
+                            frame.fill(val);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            SampleFormat::I16 => {
+                let cur = Arc::clone(&cursor);
+                let p = Arc::clone(&pcm_arc);
+                let ab = Arc::clone(&abort_flag);
+                let fin = Arc::clone(&finished_flag);
+                dev.build_output_stream(
+                    &config,
+                    move |data: &mut [i16], _| {
+                        let mut idx = cur.lock().expect("tx cursor poisoned");
+                        for frame in data.chunks_mut(channels) {
+                            let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
                                 fin.store(true, Ordering::SeqCst);
-                            }
-                            s
-                        };
-                        frame.fill(val);
-                    }
-                },
-                err_fn,
-                None,
-            )
-        }
-        SampleFormat::U16 => {
-            let cur = Arc::clone(&cursor);
-            let p = Arc::clone(&pcm_arc);
-            let ab = Arc::clone(&abort_flag);
-            let fin = Arc::clone(&finished_flag);
-            dev.build_output_stream(
-                &config,
-                move |data: &mut [u16], _| {
-                    let mut idx = cur.lock().expect("tx cursor poisoned");
-                    for frame in data.chunks_mut(channels) {
-                        let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
-                            fin.store(true, Ordering::SeqCst);
-                            32768_u16
-                        } else {
-                            let s = ((p[*idx].clamp(-1.0, 1.0) * 32767.0) + 32768.0).round() as u16;
-                            *idx += 1;
-                            if *idx >= p.len() {
+                                0_i16
+                            } else {
+                                let s = (p[*idx].clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                                *idx += 1;
+                                if *idx >= p.len() {
+                                    fin.store(true, Ordering::SeqCst);
+                                }
+                                s
+                            };
+                            frame.fill(val);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            SampleFormat::U16 => {
+                let cur = Arc::clone(&cursor);
+                let p = Arc::clone(&pcm_arc);
+                let ab = Arc::clone(&abort_flag);
+                let fin = Arc::clone(&finished_flag);
+                dev.build_output_stream(
+                    &config,
+                    move |data: &mut [u16], _| {
+                        let mut idx = cur.lock().expect("tx cursor poisoned");
+                        for frame in data.chunks_mut(channels) {
+                            let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
                                 fin.store(true, Ordering::SeqCst);
-                            }
-                            s
-                        };
-                        frame.fill(val);
-                    }
-                },
-                err_fn,
-                None,
-            )
-        }
-        other => {
-            let _ = ready_tx.send(Err(AudioError::UnsupportedConfig(format!(
-                "unsupported TX sample format: {other:?}"
-            ))));
-            return;
-        }
-    };
+                                32768_u16
+                            } else {
+                                let s =
+                                    ((p[*idx].clamp(-1.0, 1.0) * 32767.0) + 32768.0).round() as u16;
+                                *idx += 1;
+                                if *idx >= p.len() {
+                                    fin.store(true, Ordering::SeqCst);
+                                }
+                                s
+                            };
+                            frame.fill(val);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            other => {
+                let _ = ready_tx.send(Err(AudioError::UnsupportedConfig(format!(
+                    "unsupported TX sample format: {other:?}"
+                ))));
+                return;
+            }
+        };
 
-    let stream = match stream_res {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = ready_tx.send(Err(AudioError::StreamError(e.to_string())));
-            return;
-        }
+        let stream = match stream_res {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready_tx.send(Err(AudioError::StreamError(e.to_string())));
+                return;
+            }
+        };
+        // Drop cpal::Device so unused capture handle is released immediately.
+        drop(dev);
+        stream
     };
 
     if let Err(e) = stream.play() {

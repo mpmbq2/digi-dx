@@ -82,7 +82,7 @@ export function StationAndHardwarePanel({
             <span>Callsign</span>
             <input
               type="text"
-              placeholder="e.g. N1MPM"
+              placeholder="e.g. K1ABC"
               value={callsign}
               onInput={(e) =>
                 setCallsign((e.currentTarget as HTMLInputElement).value.toUpperCase())
@@ -94,7 +94,7 @@ export function StationAndHardwarePanel({
             <span>Maidenhead Grid</span>
             <input
               type="text"
-              placeholder="e.g. FN33"
+              placeholder="e.g. FN42"
               value={grid}
               onInput={(e) =>
                 setGrid((e.currentTarget as HTMLInputElement).value.toUpperCase())

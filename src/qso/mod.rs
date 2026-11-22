@@ -770,11 +770,51 @@ impl SessionManager {
         }
     }
 
+    pub async fn update_live_station_identity(&self, callsign: &str, grid: &str) {
+        let rt_arc = {
+            let guard = self.inner.lock().await;
+            let Some(ref s) = *guard else {
+                return;
+            };
+            if s.is_demo {
+                return;
+            }
+            Arc::clone(&s.runtime)
+        };
+
+        let call = callsign.trim().to_ascii_uppercase();
+        let grid = grid.trim().to_ascii_uppercase();
+        let snap = {
+            let mut rt = rt_arc.lock().await;
+            rt.sequencer.my_call = call.clone();
+            rt.sequencer.my_grid = grid.clone();
+            for q in &mut rt.sequencer.queue {
+                q.my_call = call.clone();
+                q.my_grid = grid.clone();
+            }
+            rt.to_snapshot()
+        };
+        self.update_snapshot_cache(snap.clone());
+        self.broadcast_qso_update(&snap, None);
+    }
+
+    fn emit_tx_error(&self, radio_id: &str, detail: String) {
+        warn!(radio_id, detail = %detail, "live FT8 TX failed");
+        let _ = self.ws_tx.send(WsBroadcastEvent::PreflightAlert {
+            severity: "warn".to_string(),
+            title: "FT8 TX Failed".to_string(),
+            detail,
+            occurred_at_utc: now_utc_str(),
+        });
+    }
+
     fn broadcast_qso_update(&self, snap: &SessionSnapshot, completed: Option<QsoRecord>) {
         let _ = self.ws_tx.send(WsBroadcastEvent::QsoUpdate {
             radio_id: snap.radio_id.clone(),
             active: snap.active,
             is_demo: snap.is_demo,
+            my_call: snap.my_call.clone(),
+            my_grid: snap.my_grid.clone(),
             tx_enabled: snap.tx_enabled,
             tx_af_hz: snap.tx_af_hz,
             tx_af_occupied: snap.tx_af_occupied,
@@ -1113,7 +1153,13 @@ impl SessionManager {
         ) {
             Ok(p) => p,
             Err(e) => {
-                warn!(radio_id, error = %e, "failed to modulate FT8 TX waveform");
+                self.emit_tx_error(
+                    radio_id,
+                    format!(
+                        "Failed to modulate FT8 TX waveform '{}': {e}",
+                        intent.message
+                    ),
+                );
                 return;
             }
         };
@@ -1139,11 +1185,14 @@ impl SessionManager {
         {
             Ok(Ok(pb)) => pb,
             Ok(Err(e)) => {
-                warn!(radio_id, error = %e, "failed to open TX audio playback stream");
+                self.emit_tx_error(
+                    radio_id,
+                    format!("Failed to open TX audio playback stream on '{audio_dev}': {e}"),
+                );
                 return;
             }
             Err(e) => {
-                warn!(radio_id, error = %e, "TX playback spawn error");
+                self.emit_tx_error(radio_id, format!("TX playback task error: {e}"));
                 return;
             }
         };
@@ -1152,7 +1201,7 @@ impl SessionManager {
         if let Err((_, msg)) = self.supervisor.set_ptt(radio_id, true).await {
             let mut pb = playback;
             pb.stop();
-            warn!(radio_id, error = %msg, "failed to assert CAT PTT for TX");
+            self.emit_tx_error(radio_id, format!("Failed to assert CAT PTT for TX: {msg}"));
             return;
         }
 

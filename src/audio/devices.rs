@@ -1,11 +1,22 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::{Deserialize, Serialize};
 
 use crate::supervisor::discovery::read_sysfs_usb_metadata;
+
+static AUDIO_DEVICE_OPEN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes ALSA device enumeration and `cpal::Device` open/close windows so background
+/// enumeration never races with opening an active RX/TX stream.
+pub fn lock_audio_open() -> MutexGuard<'static, ()> {
+    AUDIO_DEVICE_OPEN_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioDeviceInfo {
@@ -150,6 +161,7 @@ pub fn build_persistent_audio_uid(
 }
 
 pub fn enumerate_audio_devices() -> Vec<AudioDeviceInfo> {
+    let _open_guard = lock_audio_open();
     let cards = if cfg!(target_os = "linux") {
         scan_linux_sound_cards(Path::new("/sys/class/sound"))
     } else {

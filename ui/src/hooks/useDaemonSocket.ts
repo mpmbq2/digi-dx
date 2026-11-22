@@ -64,6 +64,8 @@ export interface DaemonState {
   realQsos: QsoLogItem[];
   demoQsos: QsoLogItem[];
   events: EventLogItem[];
+  lastAlert: { severity: string; title: string; detail: string; at: string } | null;
+  clearAlert: () => void;
   refreshAll: (refreshPreflight?: boolean) => Promise<void>;
   refreshQsos: (demo: boolean, band?: string) => Promise<void>;
   sendCommand: (
@@ -83,6 +85,7 @@ export function useDaemonSocket(): DaemonState {
   const leaseTimersRef = useRef<Record<string, number>>({});
   const pendingHbRef = useRef<Record<string, string>>({});
   const authTokenRef = useRef<string>("");
+  const stationRef = useRef<StationConfig | null>(null);
 
   const [authToken, setAuthTokenState] = useState<string>("");
   const [connectionState, setConnectionState] =
@@ -108,6 +111,16 @@ export function useDaemonSocket(): DaemonState {
   const [realQsos, setRealQsos] = useState<QsoLogItem[]>([]);
   const [demoQsos, setDemoQsos] = useState<QsoLogItem[]>([]);
   const [events, setEvents] = useState<EventLogItem[]>([]);
+  const [lastAlert, setLastAlert] = useState<{
+    severity: string;
+    title: string;
+    detail: string;
+    at: string;
+  } | null>(null);
+
+  const clearAlert = useCallback(() => {
+    setLastAlert(null);
+  }, []);
 
   const setAuthToken = useCallback((token: string) => {
     authTokenRef.current = token;
@@ -197,6 +210,7 @@ export function useDaemonSocket(): DaemonState {
         if (pRes.ok) setPreflight((await pRes.json()) as PreflightReport);
         if (sRes.ok) {
           const st = (await sRes.json()) as StationConfig;
+          stationRef.current = st;
           setStation(st);
           if (typeof st.auth_required === "boolean") {
             setAuthRequired(st.auth_required);
@@ -282,7 +296,10 @@ export function useDaemonSocket(): DaemonState {
             const snap = parsed as unknown as SnapshotEvent;
             setSlotClock(snap.slot_clock);
             setPreflight(snap.preflight);
-            if (snap.station) setStation(snap.station);
+            if (snap.station) {
+              stationRef.current = snap.station;
+              setStation(snap.station);
+            }
             if (snap.outbox_stats) setOutboxStats(snap.outbox_stats);
             if (Array.isArray(snap.radios)) setRadios(snap.radios);
             if (Array.isArray(snap.usb_devices)) setUsbDevices(snap.usb_devices);
@@ -304,14 +321,23 @@ export function useDaemonSocket(): DaemonState {
           } else if (evType === "slot_clock_updated") {
             const nextClock = parsed.slot_clock as SlotClockSpec;
             const active = Boolean(parsed.active);
+            const isDemo = Boolean(parsed.is_demo);
             setSlotClock(nextClock);
             setSession((prev) => ({
               active,
               radio_id: (parsed.radio_id as string | null) ?? null,
-              is_demo: Boolean(parsed.is_demo),
+              is_demo: isDemo,
               decoder_backend: (parsed.decoder_backend as string | null) ?? null,
-              my_call: prev?.my_call ?? null,
-              my_grid: prev?.my_grid ?? null,
+              my_call: active
+                ? isDemo
+                  ? "QQ0DEMO"
+                  : stationRef.current?.callsign ?? null
+                : null,
+              my_grid: active
+                ? isDemo
+                  ? "FN33"
+                  : stationRef.current?.grid ?? null
+                : null,
               slot_clock: nextClock,
               tx_af_hz: prev?.tx_af_hz ?? 1500,
               tx_af_occupied: prev?.tx_af_occupied ?? false,
@@ -382,8 +408,16 @@ export function useDaemonSocket(): DaemonState {
               radio_id: (parsed.radio_id as string | null) ?? prev?.radio_id ?? null,
               is_demo: isDemo,
               decoder_backend: prev?.decoder_backend ?? null,
-              my_call: isDemo ? "QQ0DEMO" : prev?.my_call ?? station?.callsign ?? null,
-              my_grid: isDemo ? "FN33" : prev?.my_grid ?? station?.grid ?? null,
+              my_call:
+                (parsed.my_call as string | null) ??
+                (isDemo
+                  ? "QQ0DEMO"
+                  : stationRef.current?.callsign ?? prev?.my_call ?? null),
+              my_grid:
+                (parsed.my_grid as string | null) ??
+                (isDemo
+                  ? "FN33"
+                  : stationRef.current?.grid ?? prev?.my_grid ?? null),
               slot_clock: prev?.slot_clock ?? slotClock ?? {
                 epoch_ms: Date.now(),
                 anchor_wall_ms: Date.now(),
@@ -415,12 +449,14 @@ export function useDaemonSocket(): DaemonState {
             );
             void refreshLiveState();
           } else if (evType === "station_updated") {
-            setStation({
+            const nextStation: StationConfig = {
               station_id: String(parsed.station_id ?? ""),
               callsign: (parsed.callsign as string | null) ?? null,
               grid: (parsed.grid as string | null) ?? null,
               updated_at_utc: String(parsed.updated_at_utc ?? ""),
-            });
+            };
+            stationRef.current = nextStation;
+            setStation(nextStation);
             pushEvent(
               "station_updated",
               `Station updated to ${String(parsed.callsign ?? "—")} (${String(
@@ -518,10 +554,16 @@ export function useDaemonSocket(): DaemonState {
               `Radio ${rid} lease ${held ? `claimed by ${holder}` : "released"}`
             );
           } else if (evType === "preflight_alert") {
-            pushEvent(
-              "preflight_alert",
-              `${String(parsed.title ?? "Alert")}: ${String(parsed.detail ?? "")}`
-            );
+            const severity = String(parsed.severity ?? "info");
+            const title = String(parsed.title ?? "Alert");
+            const detail = String(parsed.detail ?? "");
+            setLastAlert({
+              severity,
+              title,
+              detail,
+              at: String(parsed.occurred_at_utc ?? new Date().toISOString()),
+            });
+            pushEvent("preflight_alert", `${title}: ${detail}`);
             void refreshAll(false);
           } else if (evType === "command_ack") {
             const cmdId = String(parsed.command_id ?? "");
@@ -742,6 +784,8 @@ export function useDaemonSocket(): DaemonState {
     realQsos,
     demoQsos,
     events,
+    lastAlert,
+    clearAlert,
     refreshAll,
     refreshQsos,
     sendCommand,
