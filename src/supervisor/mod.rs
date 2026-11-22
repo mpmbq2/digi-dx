@@ -4,9 +4,10 @@ pub mod rigctld;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
@@ -24,6 +25,7 @@ use crate::supervisor::discovery::{
 use crate::supervisor::radio_worker::{
     CmdResult, RadioLifecycleState, RadioRuntimeSnapshot, RadioWorker, WorkerCmd, WorkerTiming,
 };
+use crate::watchdog::{PttAbortTarget, PttWatchdog};
 
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
@@ -97,6 +99,7 @@ pub struct DeviceSupervisor {
     reconcile_lock: AsyncMutex<()>,
     last_connected_keys: Mutex<Option<Vec<String>>>,
     topology_warned: Mutex<HashSet<String>>,
+    watchdog: Mutex<Option<Weak<PttWatchdog>>>,
     shutdown: Mutex<Option<CancellationToken>>,
     watcher_guards: Mutex<Option<WatcherGuards>>,
 }
@@ -118,9 +121,15 @@ impl DeviceSupervisor {
             reconcile_lock: AsyncMutex::new(()),
             last_connected_keys: Mutex::new(None),
             topology_warned: Mutex::new(HashSet::new()),
+            watchdog: Mutex::new(None),
             shutdown: Mutex::new(None),
             watcher_guards: Mutex::new(None),
         })
+    }
+
+    pub fn attach_watchdog(&self, watchdog: Weak<PttWatchdog>) {
+        let mut guard = self.watchdog.lock().expect("watchdog lock poisoned");
+        *guard = Some(watchdog);
     }
 
     pub async fn start(self: &Arc<Self>, shutdown: CancellationToken) {
@@ -268,6 +277,18 @@ impl DeviceSupervisor {
                             .push((handle.tx.clone(), WorkerCmd::HardwareAmbiguous { reason }));
                     }
                     MatchOutcome::NotFound => {
+                        if let Some(wd) = self
+                            .watchdog
+                            .lock()
+                            .expect("watchdog lock poisoned")
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                        {
+                            let rid = profile.radio_id.clone();
+                            tokio::spawn(async move {
+                                wd.on_device_detached(&rid).await;
+                            });
+                        }
                         worker_cmds.push((handle.tx.clone(), WorkerCmd::DeviceDetached));
                     }
                 }
@@ -463,6 +484,43 @@ impl DeviceSupervisor {
         }
     }
 
+    pub async fn set_ptt(&self, radio_id: &str, active: bool) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::SetPtt {
+            active,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
+    pub async fn watchdog_abort(&self, radio_id: &str, reason: String) {
+        let tx_opt = {
+            let workers = self.workers.lock().await;
+            workers.get(radio_id).map(|h| h.tx.clone())
+        };
+        if let Some(tx) = tx_opt {
+            let _ = tx.send(WorkerCmd::WatchdogAbort { reason }).await;
+        }
+    }
+
+    pub async fn set_session_active(&self, radio_id: &str, active: bool) {
+        let tx_opt = {
+            let workers = self.workers.lock().await;
+            workers.get(radio_id).map(|h| h.tx.clone())
+        };
+        if let Some(tx) = tx_opt {
+            let _ = tx.send(WorkerCmd::SetSessionActive(active)).await;
+        }
+    }
+
     pub async fn shutdown_all(&self) {
         if let Some(cancel) = self.shutdown.lock().expect("shutdown lock poisoned").take() {
             cancel.cancel();
@@ -595,4 +653,11 @@ pub fn build_dummy_scanner_for_test(devices: Vec<ScannedSerialDevice>) -> Arc<dy
     Arc::new(crate::supervisor::discovery::MockDeviceScanner::new(
         devices,
     ))
+}
+
+#[async_trait]
+impl PttAbortTarget for DeviceSupervisor {
+    async fn abort_ptt(&self, radio_id: &str, reason: &str) {
+        self.watchdog_abort(radio_id, reason.to_string()).await;
+    }
 }

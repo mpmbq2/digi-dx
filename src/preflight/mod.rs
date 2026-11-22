@@ -872,7 +872,7 @@ pub fn parse_timesync_offset_ms(text: &str) -> Option<f64> {
     None
 }
 
-fn resolve_executable(
+pub fn resolve_executable(
     name: &str,
     override_path: Option<&Path>,
     extra_candidates: &[&str],

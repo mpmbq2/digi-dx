@@ -1,16 +1,15 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::command_bus::CommandEnvelope;
-use crate::domain::clock::SlotClockSpec;
 use crate::server::routes::build_radio_summaries;
 use crate::server::AppState;
 use crate::store::now_utc_str;
@@ -52,6 +51,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let mut broadcast_rx = state.ws_tx.subscribe();
     let mut session_token: Option<String> = None;
+    let mut seen_actors: HashSet<String> = HashSet::new();
 
     let writer_task = tokio::spawn(async move {
         while let Some(text) = out_rx.recv().await {
@@ -99,6 +99,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 let _ = out_tx.send(reply.to_string()).await;
                             }
                             Ok(WsClientFrame::Command { envelope, token }) => {
+                                if !envelope.actor.trim().is_empty() {
+                                    seen_actors.insert(envelope.actor.clone());
+                                }
                                 let effective_token = token
                                     .as_deref()
                                     .or(session_token.as_deref());
@@ -125,6 +128,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
+    for actor in seen_actors {
+        state.watchdog.on_actor_disconnected(&actor).await;
+    }
+
     writer_task.abort();
 }
 
@@ -139,7 +146,7 @@ fn build_snapshot(state: &AppState) -> String {
     let radios = build_radio_summaries(state).unwrap_or_default();
     let usb_devices = state.supervisor.list_usb_inventory().unwrap_or_default();
     let leases = state.bus.leases().snapshot();
-    let now_ms = Utc::now().timestamp_millis();
+    let session = state.sessions.snapshot();
 
     json!({
         "type": "snapshot",
@@ -147,14 +154,15 @@ fn build_snapshot(state: &AppState) -> String {
         "uptime_sec": state.started_at.elapsed().as_secs(),
         "auth_required": state.bus.auth_required(),
         "station": station,
-        "slot_clock": SlotClockSpec::realtime(now_ms),
+        "slot_clock": session.slot_clock.clone(),
         "preflight": preflight,
         "outbox_stats": outbox_stats,
         "radios": radios,
         "usb_devices": usb_devices,
         "leases": leases,
-        "active_qsos": [],
-        "recent_decodes": [],
+        "session": session,
+        "active_qsos": session.active_qsos,
+        "recent_decodes": session.recent_decodes,
     })
     .to_string()
 }

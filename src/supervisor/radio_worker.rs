@@ -145,6 +145,14 @@ pub enum WorkerCmd {
         passband_hz: u32,
         reply: oneshot::Sender<CmdResult>,
     },
+    SetPtt {
+        active: bool,
+        reply: oneshot::Sender<CmdResult>,
+    },
+    SetSessionActive(bool),
+    WatchdogAbort {
+        reason: String,
+    },
     EmergencyHalt,
     Shutdown,
 }
@@ -244,7 +252,7 @@ impl RadioWorker {
                         self.start_rigctld().await;
                     }
                 }
-                _ = poll_timer.tick(), if self.running.is_some() => {
+                _ = poll_timer.tick(), if self.running.is_some() && !self.snapshot.ptt => {
                     self.poll_rig().await;
                 }
                 maybe_cmd = self.rx.recv() => {
@@ -404,38 +412,42 @@ impl RadioWorker {
                 let res = self.exec_set_mode(&mode, passband_hz).await;
                 let _ = reply.send(res);
             }
-            WorkerCmd::EmergencyHalt => {
-                let mut fail_closed = false;
-                if let Some(ref mut rig) = self.running {
-                    let ptt_off = rig
-                        .client
-                        .set_ptt_with_timeout(0, Duration::from_millis(300))
-                        .await;
-                    let check =
-                        tokio::time::timeout(Duration::from_millis(500), rig.client.get_ptt())
-                            .await;
-                    let tx_still_active_or_unknown = ptt_off.is_err()
-                        || matches!(check, Ok(Ok(Some(true))) | Ok(Err(_)) | Err(_));
-                    if tx_still_active_or_unknown {
-                        fail_closed = true;
-                    }
-                }
-                if fail_closed {
-                    self.pending_recovery_at = None;
-                    self.halted_by_operator = true;
-                    self.teardown_rig("emergency TX halt — releasing serial port")
-                        .await;
-                    self.snapshot.last_error = Some(
-                        "Emergency TX halt stopped rigctld to guarantee serial port release".into(),
-                    );
+            WorkerCmd::SetPtt { active, reply } => {
+                let res = self.exec_set_ptt(active).await;
+                let _ = reply.send(res);
+            }
+            WorkerCmd::SetSessionActive(active) => {
+                if self.running.is_some() {
+                    let target = if active {
+                        RadioLifecycleState::ActiveSession
+                    } else {
+                        RadioLifecycleState::Ready
+                    };
                     self.set_state(
-                        RadioLifecycleState::Configured,
-                        Some("Emergency TX halt stopped rigctld to release serial port".into()),
+                        target,
+                        Some(if active {
+                            "FT8 session active".to_string()
+                        } else {
+                            "FT8 session stopped".to_string()
+                        }),
                     );
-                } else {
-                    self.snapshot.ptt = false;
-                    self.publish_snapshot(Some("Emergency PTT drop (+T 0) confirmed RX".into()));
                 }
+            }
+            WorkerCmd::WatchdogAbort { reason } => {
+                self.fail_closed_drop_ptt(
+                    &format!("watchdog abort ({reason}) — releasing serial port"),
+                    format!("Watchdog PTT drop ({reason}) confirmed RX"),
+                    false,
+                )
+                .await;
+            }
+            WorkerCmd::EmergencyHalt => {
+                self.fail_closed_drop_ptt(
+                    "emergency TX halt — releasing serial port",
+                    "Emergency PTT drop (+T 0) confirmed RX".to_string(),
+                    true,
+                )
+                .await;
             }
             WorkerCmd::Shutdown => {}
         }
@@ -788,6 +800,79 @@ impl RadioWorker {
             "ptt_tested": true,
             "duration_ms": capped_ms,
         }))
+    }
+
+    async fn exec_set_ptt(&mut self, active: bool) -> CmdResult {
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+        let ptt_val: u8 = if !active {
+            0
+        } else if self.profile.ptt_method == "cat_data" {
+            3
+        } else {
+            1
+        };
+
+        rig.client
+            .set_ptt(ptt_val)
+            .await
+            .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+        self.snapshot.ptt = active;
+        self.publish_snapshot(Some(if active {
+            format!("PTT asserted (+T {ptt_val})")
+        } else {
+            "PTT released (+T 0)".to_string()
+        }));
+
+        Ok(json!({
+            "radio_id": self.profile.radio_id,
+            "ptt": active,
+        }))
+    }
+
+    async fn fail_closed_drop_ptt(
+        &mut self,
+        teardown_reason: &str,
+        confirmed_detail: String,
+        halt_auto_restart: bool,
+    ) {
+        let mut fail_closed = false;
+        if let Some(ref mut rig) = self.running {
+            let ptt_off = rig
+                .client
+                .set_ptt_with_timeout(0, Duration::from_millis(300))
+                .await;
+            let check =
+                tokio::time::timeout(Duration::from_millis(500), rig.client.get_ptt()).await;
+            let tx_still_active_or_unknown =
+                ptt_off.is_err() || matches!(check, Ok(Ok(Some(true))) | Ok(Err(_)) | Err(_));
+            if tx_still_active_or_unknown {
+                fail_closed = true;
+            }
+        }
+        if fail_closed {
+            self.pending_recovery_at = None;
+            if halt_auto_restart {
+                self.halted_by_operator = true;
+            }
+            self.teardown_rig(teardown_reason).await;
+            self.snapshot.last_error = Some(teardown_reason.to_string());
+            self.set_state(
+                RadioLifecycleState::Configured,
+                Some(teardown_reason.to_string()),
+            );
+        } else {
+            self.snapshot.ptt = false;
+            self.publish_snapshot(Some(confirmed_detail));
+        }
     }
 
     async fn teardown_rig(&mut self, reason: &str) {

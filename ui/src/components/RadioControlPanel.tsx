@@ -1,5 +1,6 @@
 import { useMemo, useState } from "preact/hooks";
 import type {
+  AudioDeviceSummary,
   CommandAck,
   HamlibModel,
   RadioSummary,
@@ -9,6 +10,7 @@ import type {
 interface Props {
   actor: string;
   usbDevices: UsbInventoryEntry[];
+  audioDevices: AudioDeviceSummary[];
   hamlibModels: HamlibModel[];
   radios: RadioSummary[];
   heldLeases: Record<string, string>;
@@ -70,6 +72,7 @@ function suggestModelForUsb(usb: UsbInventoryEntry): number {
 export function RadioControlPanel({
   actor,
   usbDevices,
+  audioDevices,
   hamlibModels,
   radios,
   heldLeases,
@@ -85,6 +88,9 @@ export function RadioControlPanel({
   const [baudRate, setBaudRate] = useState<number>(9600);
   const [civAddress, setCivAddress] = useState<string>("");
   const [pttMethod, setPttMethod] = useState<string>("cat");
+  const [audioUid, setAudioUid] = useState<string>("");
+  const [audioRxChannel, setAudioRxChannel] = useState<string>("mono");
+  const [audioTxGainDb, setAudioTxGainDb] = useState<number>(-6);
   const [autoConnect, setAutoConnect] = useState<boolean>(true);
   const [formMsg, setFormMsg] = useState<{ ok: boolean; text: string } | null>(
     null
@@ -125,8 +131,14 @@ export function RadioControlPanel({
     setProfileName(`${label} (${usb.usb_serial ?? "CAT"})`);
     setSerialKey(usb.device_key);
     setHamlibModel(suggested);
-    setBaudRate(suggested === 3073 || suggested === 3085 ? 19200 : 9600);
+    setBaudRate(suggested === 3073 || suggested === 3085 ? 115200 : 9600);
     setPttMethod("cat");
+    const usbDuplex = audioDevices.find(
+      (a) => a.supports_input && a.supports_output && Boolean(a.usb_vid)
+    );
+    setAudioUid(usbDuplex?.device_uid ?? "");
+    setAudioRxChannel("mono");
+    setAudioTxGainDb(-6);
     setAutoConnect(true);
     setFormMsg(null);
     setShowForm(true);
@@ -153,6 +165,7 @@ export function RadioControlPanel({
     e.preventDefault();
     setFormMsg(null);
     const isDummy = hamlibModel === 1;
+    const selectedAudio = audioDevices.find((a) => a.device_uid === audioUid);
     const ack = await onSendCommand("radio.create_profile", {
       name: profileName.trim(),
       hamlib_model: Number(hamlibModel),
@@ -161,6 +174,10 @@ export function RadioControlPanel({
       serial_baud_rate: Number(baudRate),
       civ_address: civAddress.trim() ? civAddress.trim() : null,
       ptt_method: pttMethod,
+      audio_device_uid: selectedAudio ? selectedAudio.device_uid : null,
+      audio_device_name: selectedAudio ? selectedAudio.name : null,
+      audio_rx_channel: audioRxChannel,
+      audio_tx_gain_db: Number(audioTxGainDb),
       auto_connect: autoConnect,
     });
     if (ack.status === "ok") {
@@ -349,6 +366,51 @@ export function RadioControlPanel({
               }
             />
           </label>
+          <label>
+            <span>Audio Interface (USB UID)</span>
+            <select
+              value={audioUid}
+              onChange={(e) =>
+                setAudioUid((e.currentTarget as HTMLSelectElement).value)
+              }
+            >
+              <option value="">-- Unassigned / Demo Only --</option>
+              {audioDevices
+                .filter((a) => a.supports_input && a.supports_output)
+                .map((dev) => (
+                  <option key={dev.device_uid} value={dev.device_uid}>
+                    {dev.usb_vid ? `[USB ${dev.usb_vid}:${dev.usb_pid}] ` : ""}
+                    {dev.name}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label>
+            <span>RX Audio Channel</span>
+            <select
+              value={audioRxChannel}
+              onChange={(e) =>
+                setAudioRxChannel((e.currentTarget as HTMLSelectElement).value)
+              }
+            >
+              <option value="mono">Mono Mix</option>
+              <option value="left">Left</option>
+              <option value="right">Right</option>
+            </select>
+          </label>
+          <label>
+            <span>TX Audio Gain (dB)</span>
+            <input
+              type="number"
+              step="1"
+              min="-30"
+              max="0"
+              value={audioTxGainDb}
+              onInput={(e) =>
+                setAudioTxGainDb(Number((e.currentTarget as HTMLInputElement).value))
+              }
+            />
+          </label>
           <label class="checkbox-row">
             <input
               type="checkbox"
@@ -450,6 +512,11 @@ export function RadioControlPanel({
                         {radio.bound_serial_path && (
                           <div class="muted mono" style={{ fontSize: "0.74rem" }}>
                             {radio.bound_serial_path}
+                          </div>
+                        )}
+                        {radio.profile.audio_device_name && (
+                          <div class="muted mono" style={{ fontSize: "0.72rem" }}>
+                            Audio: {radio.profile.audio_device_name} ({radio.profile.audio_rx_channel ?? "mono"})
                           </div>
                         )}
                       </div>
@@ -607,6 +674,18 @@ export function RadioControlPanel({
                         }
                       >
                         Test CAT
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-secondary btn-sm"
+                        disabled={radio.lifecycle_state !== "READY"}
+                        onClick={() =>
+                          void ensureLeaseAndRun(radio, "radio.test_ptt", {
+                            duration_ms: 200,
+                          })
+                        }
+                      >
+                        Test PTT (200ms)
                       </button>
                       <button
                         type="button"

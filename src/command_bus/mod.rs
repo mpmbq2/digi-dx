@@ -10,12 +10,18 @@ use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::domain::adif::QsoRecord;
+use crate::domain::clock::{SlotClockSpec, SlotParity};
 use crate::domain::ft8::{validate_station_callsign, validate_station_grid, validate_tx_message};
+use crate::modem::TxIntent;
+use crate::qso::sequencer::{ActiveQso, QsoAction};
+use crate::qso::SessionManager;
 use crate::store::{
     now_utc_str, CreateRadioProfileInput, StateStore, StoreError, UpdateRadioProfileInput,
 };
 use crate::supervisor::DeviceSupervisor;
 use crate::telemetry::TelemetryEnvelope;
+use crate::watchdog::{PttWatchdog, WatchdogAbortReason};
 
 use self::leases::{ControlLease, ControlLeaseManager, LeaseError};
 
@@ -184,21 +190,81 @@ pub enum WsBroadcastEvent {
     UsbDevicesChanged {
         devices: Value,
     },
+    WatchdogAbort {
+        radio_id: String,
+        reason: String,
+        elapsed_ms: u64,
+        occurred_at_utc: String,
+    },
+    SlotClockUpdated {
+        radio_id: Option<String>,
+        active: bool,
+        is_demo: bool,
+        decoder_backend: Option<String>,
+        slot_clock: SlotClockSpec,
+    },
+    Decode {
+        radio_id: String,
+        ts_sec: i64,
+        slot: String,
+        snr_db: i8,
+        dt_sec: f32,
+        af_hz: u16,
+        mode: String,
+        message: String,
+        decoder_backend: String,
+    },
+    TxState {
+        radio_id: String,
+        state: String,
+        af_hz: Option<u16>,
+        slot: Option<String>,
+        message: Option<String>,
+        ptt_elapsed_ms: u64,
+    },
+    Waterfall {
+        radio_id: String,
+        min_hz: f32,
+        max_hz: f32,
+        bin_hz: f32,
+        bins_db: Vec<f32>,
+        rms_db: f32,
+        peak_db: f32,
+        clipped: bool,
+        even_occupied_hz: Vec<u16>,
+        odd_occupied_hz: Vec<u16>,
+    },
+    QsoUpdate {
+        radio_id: Option<String>,
+        active: bool,
+        is_demo: bool,
+        tx_enabled: bool,
+        tx_af_hz: u16,
+        tx_af_occupied: bool,
+        survey_active: bool,
+        active_qsos: Vec<ActiveQso>,
+        completed_qso: Option<Box<QsoRecord>>,
+    },
 }
 
 pub struct CommandBus {
     store: StateStore,
     leases: Arc<ControlLeaseManager>,
     supervisor: Arc<DeviceSupervisor>,
+    watchdog: Arc<PttWatchdog>,
+    sessions: Arc<SessionManager>,
     auth_token: Option<String>,
     ws_tx: broadcast::Sender<WsBroadcastEvent>,
 }
 
 impl CommandBus {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: StateStore,
         leases: Arc<ControlLeaseManager>,
         supervisor: Arc<DeviceSupervisor>,
+        watchdog: Arc<PttWatchdog>,
+        sessions: Arc<SessionManager>,
         auth_token: Option<String>,
         ws_tx: broadcast::Sender<WsBroadcastEvent>,
     ) -> Self {
@@ -206,6 +272,8 @@ impl CommandBus {
             store,
             leases,
             supervisor,
+            watchdog,
+            sessions,
             auth_token,
             ws_tx,
         }
@@ -364,39 +432,19 @@ impl CommandBus {
             "radio.set_freq" => self.exec_radio_set_freq(envelope).await,
             "radio.set_mode" => self.exec_radio_set_mode(envelope).await,
             "control.claim_lease" => self.exec_claim_lease(envelope),
-            "control.release_lease" => self.exec_release_lease(envelope),
-            "control.heartbeat" => self.exec_heartbeat(envelope),
+            "control.release_lease" => self.exec_release_lease(envelope).await,
+            "control.heartbeat" => self.exec_heartbeat(envelope).await,
             "tx.halt_emergency" => self.exec_halt_emergency(envelope).await,
-            "session.start" | "session.stop" => {
-                let radio_id = resolve_radio_id(envelope).unwrap_or_default();
-                match self.store.get_radio_profile(&radio_id) {
-                    Ok(Some(_)) => CommandAck::err(
-                        envelope.command_id.clone(),
-                        CommandStatus::Failed,
-                        ErrorCode::RadioNotReady,
-                        "Modem/audio session engine activates in Milestone M3",
-                    ),
-                    Ok(None) => CommandAck::err(
-                        envelope.command_id.clone(),
-                        CommandStatus::Rejected,
-                        ErrorCode::RadioNotFound,
-                        format!("Unknown radio_id '{radio_id}'"),
-                    ),
-                    Err(e) => CommandAck::err(
-                        envelope.command_id.clone(),
-                        CommandStatus::Failed,
-                        ErrorCode::InternalError,
-                        e.to_string(),
-                    ),
-                }
-            }
-            "tx.arm" | "tx.cancel" | "qso.call_cq" | "qso.reply" | "qso.action"
-            | "qso.survey_af" | "qso.set_af" | "qso.set_tx_enabled" => CommandAck::err(
-                envelope.command_id.clone(),
-                CommandStatus::Failed,
-                ErrorCode::NoActiveSession,
-                "Modem/QSO session engine activates in Milestone M3/M4",
-            ),
+            "session.start" => self.exec_session_start(envelope).await,
+            "session.stop" => self.exec_session_stop(envelope).await,
+            "tx.arm" => self.exec_tx_arm(envelope).await,
+            "tx.cancel" => self.exec_tx_cancel(envelope).await,
+            "qso.call_cq" => self.exec_qso_call_cq(envelope).await,
+            "qso.reply" => self.exec_qso_reply(envelope).await,
+            "qso.action" => self.exec_qso_action(envelope).await,
+            "qso.survey_af" => self.exec_qso_survey_af(envelope).await,
+            "qso.set_af" => self.exec_qso_set_af(envelope).await,
+            "qso.set_tx_enabled" => self.exec_qso_set_tx_enabled(envelope).await,
             other => CommandAck::err(
                 envelope.command_id.clone(),
                 CommandStatus::Rejected,
@@ -768,7 +816,7 @@ impl CommandBus {
         }
     }
 
-    fn exec_release_lease(&self, envelope: &CommandEnvelope) -> CommandAck {
+    async fn exec_release_lease(&self, envelope: &CommandEnvelope) -> CommandAck {
         let Some(radio_id) = resolve_radio_id(envelope) else {
             return CommandAck::err(
                 envelope.command_id.clone(),
@@ -777,6 +825,11 @@ impl CommandBus {
                 "radio_id is required",
             );
         };
+
+        self.sessions.abort_active_tx(&radio_id).await;
+        self.watchdog
+            .trigger_abort(&radio_id, WatchdogAbortReason::LeaseReleased)
+            .await;
 
         match self.leases.release(&radio_id, &envelope.actor) {
             Ok(()) => {
@@ -800,7 +853,7 @@ impl CommandBus {
         }
     }
 
-    fn exec_heartbeat(&self, envelope: &CommandEnvelope) -> CommandAck {
+    async fn exec_heartbeat(&self, envelope: &CommandEnvelope) -> CommandAck {
         let Some(radio_id) = resolve_radio_id(envelope) else {
             return CommandAck::err(
                 envelope.command_id.clone(),
@@ -824,15 +877,20 @@ impl CommandBus {
         };
 
         match self.leases.heartbeat(&radio_id, &envelope.actor, lease_id) {
-            Ok(lease) => CommandAck::ok(
-                envelope.command_id.clone(),
-                json!({
-                    "kind": "control.heartbeat",
-                    "radio_id": lease.radio_id,
-                    "lease_id": lease.lease_id,
-                    "expires_at_utc": lease.expires_at_utc,
-                }),
-            ),
+            Ok(lease) => {
+                self.watchdog
+                    .pet_heartbeat(&radio_id, &envelope.actor)
+                    .await;
+                CommandAck::ok(
+                    envelope.command_id.clone(),
+                    json!({
+                        "kind": "control.heartbeat",
+                        "radio_id": lease.radio_id,
+                        "lease_id": lease.lease_id,
+                        "expires_at_utc": lease.expires_at_utc,
+                    }),
+                )
+            }
             Err(e) => {
                 let (code, msg) = map_lease_error(e);
                 CommandAck::err(
@@ -847,6 +905,15 @@ impl CommandBus {
 
     async fn exec_halt_emergency(&self, envelope: &CommandEnvelope) -> CommandAck {
         let radio_id = resolve_radio_id(envelope);
+        self.sessions.emergency_halt(radio_id.as_deref()).await;
+        let aborted_via_wd = match radio_id {
+            Some(ref rid) => {
+                self.watchdog
+                    .trigger_abort(rid, WatchdogAbortReason::EmergencyHalt)
+                    .await
+            }
+            None => false,
+        };
         self.supervisor.emergency_halt(radio_id.as_deref()).await;
         if let Some(ref rid) = radio_id {
             self.leases.force_clear(rid);
@@ -859,19 +926,21 @@ impl CommandBus {
         }
 
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        if let Ok(station) = self.store.get_station_config() {
-            let ev = TelemetryEnvelope::new(
-                station.station_id,
-                radio_id.clone(),
-                "watchdog.abort",
-                false,
-                json!({
-                    "reason": "tx.halt_emergency",
-                    "actor": envelope.actor,
-                    "origin": envelope.origin.as_str(),
-                }),
-            );
-            let _ = self.store.enqueue_telemetry(&ev);
+        if !aborted_via_wd {
+            if let Ok(station) = self.store.get_station_config() {
+                let ev = TelemetryEnvelope::new(
+                    station.station_id,
+                    radio_id.clone(),
+                    "watchdog.abort",
+                    false,
+                    json!({
+                        "reason": "tx.halt_emergency",
+                        "actor": envelope.actor,
+                        "origin": envelope.origin.as_str(),
+                    }),
+                );
+                let _ = self.store.enqueue_telemetry(&ev);
+            }
         }
 
         let _ = self.ws_tx.send(WsBroadcastEvent::PreflightAlert {
@@ -893,6 +962,316 @@ impl CommandBus {
                 "radio_id": radio_id,
             }),
         )
+    }
+
+    async fn exec_session_start(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let demo = envelope
+            .payload
+            .get("demo")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let scale = envelope.payload.get("scale").and_then(Value::as_f64);
+        match self
+            .sessions
+            .start_session(&radio_id, &envelope.actor, demo, scale)
+            .await
+        {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_session_stop(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let radio_id = resolve_radio_id(envelope);
+        match self.sessions.stop_session(radio_id.as_deref()).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_tx_arm(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let af_hz = envelope
+            .payload
+            .get("af_hz")
+            .and_then(Value::as_u64)
+            .unwrap_or(1500) as u16;
+        let slot = match envelope
+            .payload
+            .get("slot")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+        {
+            "even" => SlotParity::Even,
+            _ => SlotParity::Odd,
+        };
+        let raw_msg = envelope
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let message = match validate_tx_message(raw_msg) {
+            Ok(m) => m,
+            Err(e) => {
+                return CommandAck::err(
+                    envelope.command_id.clone(),
+                    CommandStatus::Rejected,
+                    ErrorCode::ValidationFailed,
+                    e,
+                );
+            }
+        };
+        match self
+            .sessions
+            .arm_tx(
+                &radio_id,
+                TxIntent {
+                    af_hz,
+                    slot,
+                    message,
+                },
+            )
+            .await
+        {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_tx_cancel(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        match self.sessions.cancel_tx(&radio_id).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_qso_call_cq(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let slot = match envelope.payload.get("slot").and_then(Value::as_str) {
+            Some("even") => Some(SlotParity::Even),
+            Some("odd") => Some(SlotParity::Odd),
+            _ => None,
+        };
+        let directed = envelope
+            .payload
+            .get("directed")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match self.sessions.call_cq(&radio_id, slot, directed).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_qso_reply(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let callsign = envelope
+            .payload
+            .get("callsign")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let their_grid = envelope
+            .payload
+            .get("their_grid")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let rx_slot = match envelope
+            .payload
+            .get("rx_slot")
+            .and_then(Value::as_str)
+            .unwrap_or("even")
+        {
+            "odd" => SlotParity::Odd,
+            _ => SlotParity::Even,
+        };
+        let snr_db = envelope
+            .payload
+            .get("snr_db")
+            .and_then(Value::as_i64)
+            .map(|n| n.clamp(-50, 49) as i8);
+        match self
+            .sessions
+            .reply_qso(&radio_id, callsign, their_grid, rx_slot, snr_db)
+            .await
+        {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_qso_action(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let qso_id = envelope
+            .payload
+            .get("qso_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let action_str = envelope
+            .payload
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Ok(action) = QsoAction::parse(action_str) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                format!("Invalid qso.action '{action_str}'"),
+            );
+        };
+        match self.sessions.qso_action(&radio_id, qso_id, action).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_qso_survey_af(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        match self.sessions.survey_af(&radio_id).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_qso_set_af(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let af_hz = envelope
+            .payload
+            .get("af_hz")
+            .and_then(Value::as_u64)
+            .unwrap_or(1500) as u16;
+        match self.sessions.set_af(&radio_id, af_hz).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_qso_set_tx_enabled(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let enabled = envelope
+            .payload
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        match self.sessions.set_tx_enabled(&radio_id, enabled).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
     }
 
     fn broadcast_lease(&self, lease: &ControlLease) {
@@ -1151,6 +1530,89 @@ fn validate_command(envelope: &CommandEnvelope) -> Result<(), (ErrorCode, String
                         format!("invalid ptt_method '{ptt}'"),
                     ));
                 }
+            }
+            Ok(())
+        }
+        "session.start" => {
+            if let Some(scale) = envelope.payload.get("scale").and_then(Value::as_f64) {
+                if !scale.is_finite() || scale <= 0.0 || scale > 100.0 {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        "scale must be a finite value between 0 and 100".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "qso.call_cq" => {
+            if let Some(slot) = envelope.payload.get("slot").and_then(Value::as_str) {
+                if slot != "even" && slot != "odd" {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        "slot must be 'even' or 'odd'".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "qso.reply" => {
+            let call = envelope
+                .payload
+                .get("callsign")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if call.is_empty() {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "callsign is required for qso.reply".to_string(),
+                ));
+            }
+            let rx_slot = envelope
+                .payload
+                .get("rx_slot")
+                .and_then(Value::as_str)
+                .unwrap_or("even");
+            if rx_slot != "even" && rx_slot != "odd" {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "rx_slot must be 'even' or 'odd'".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "qso.action" => {
+            let qid = envelope
+                .payload
+                .get("qso_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if qid.is_empty() {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "qso_id is required for qso.action".to_string(),
+                ));
+            }
+            let act = envelope
+                .payload
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            QsoAction::parse(act).map_err(|e| (ErrorCode::ValidationFailed, e))?;
+            Ok(())
+        }
+        "qso.set_tx_enabled" => {
+            if envelope
+                .payload
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .is_none()
+            {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "enabled boolean is required".to_string(),
+                ));
             }
             Ok(())
         }

@@ -5,8 +5,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
-use cpal::traits::{DeviceTrait, HostTrait};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::command_bus::{CommandEnvelope, CommandStatus, ErrorCode, WsBroadcastEvent};
@@ -109,21 +108,10 @@ pub async fn station(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct AudioDeviceSummary {
-    pub index: usize,
-    pub name: String,
-    pub supports_input: bool,
-    pub supports_output: bool,
-    pub max_input_channels: u16,
-    pub max_output_channels: u16,
-    pub supports_48khz: bool,
-    pub default_sample_rate: Option<u32>,
-    pub host_name: String,
-}
+pub use crate::audio::devices::AudioDeviceInfo as AudioDeviceSummary;
 
 pub async fn devices_audio() -> impl IntoResponse {
-    let res = tokio::task::spawn_blocking(enumerate_audio_devices).await;
+    let res = tokio::task::spawn_blocking(crate::audio::devices::enumerate_audio_devices).await;
     match res {
         Ok(list) => (StatusCode::OK, Json(json!({ "devices": list }))).into_response(),
         Err(e) => (
@@ -132,107 +120,6 @@ pub async fn devices_audio() -> impl IntoResponse {
         )
             .into_response(),
     }
-}
-
-fn enumerate_audio_devices() -> Vec<AudioDeviceSummary> {
-    use std::collections::BTreeMap;
-
-    let host = cpal::default_host();
-    let host_name = host.id().name().to_string();
-    let mut by_name: BTreeMap<String, AudioDeviceSummary> = BTreeMap::new();
-
-    if let Ok(inputs) = host.input_devices() {
-        for (idx, dev) in inputs.enumerate() {
-            let name = dev.name().unwrap_or_else(|_| format!("Input #{idx}"));
-            let mut max_in = 0_u16;
-            let mut supports_48k = false;
-            let mut default_rate = None;
-
-            if let Ok(cfg) = dev.default_input_config() {
-                max_in = cfg.channels();
-                default_rate = Some(cfg.sample_rate().0);
-            }
-            if let Ok(ranges) = dev.supported_input_configs() {
-                for r in ranges {
-                    max_in = max_in.max(r.channels());
-                    if r.min_sample_rate().0 <= 48_000 && r.max_sample_rate().0 >= 48_000 {
-                        supports_48k = true;
-                    }
-                }
-            }
-
-            let entry = by_name
-                .entry(name.clone())
-                .or_insert_with(|| AudioDeviceSummary {
-                    index: idx,
-                    name,
-                    supports_input: false,
-                    supports_output: false,
-                    max_input_channels: 0,
-                    max_output_channels: 0,
-                    supports_48khz: false,
-                    default_sample_rate: None,
-                    host_name: host_name.clone(),
-                });
-            entry.supports_input = true;
-            entry.max_input_channels = entry.max_input_channels.max(max_in);
-            entry.supports_48khz |= supports_48k;
-            if entry.default_sample_rate.is_none() {
-                entry.default_sample_rate = default_rate;
-            }
-        }
-    }
-
-    if let Ok(outputs) = host.output_devices() {
-        for (idx, dev) in outputs.enumerate() {
-            let name = dev.name().unwrap_or_else(|_| format!("Output #{idx}"));
-            let mut max_out = 0_u16;
-            let mut supports_48k = false;
-            let mut default_rate = None;
-
-            if let Ok(cfg) = dev.default_output_config() {
-                max_out = cfg.channels();
-                default_rate = Some(cfg.sample_rate().0);
-            }
-            if let Ok(ranges) = dev.supported_output_configs() {
-                for r in ranges {
-                    max_out = max_out.max(r.channels());
-                    if r.min_sample_rate().0 <= 48_000 && r.max_sample_rate().0 >= 48_000 {
-                        supports_48k = true;
-                    }
-                }
-            }
-
-            let entry = by_name
-                .entry(name.clone())
-                .or_insert_with(|| AudioDeviceSummary {
-                    index: idx,
-                    name,
-                    supports_input: false,
-                    supports_output: false,
-                    max_input_channels: 0,
-                    max_output_channels: 0,
-                    supports_48khz: false,
-                    default_sample_rate: None,
-                    host_name: host_name.clone(),
-                });
-            entry.supports_output = true;
-            entry.max_output_channels = entry.max_output_channels.max(max_out);
-            entry.supports_48khz |= supports_48k;
-            if entry.default_sample_rate.is_none() {
-                entry.default_sample_rate = default_rate;
-            }
-        }
-    }
-
-    by_name
-        .into_values()
-        .enumerate()
-        .map(|(i, mut d)| {
-            d.index = i;
-            d
-        })
-        .collect()
 }
 
 pub async fn devices_usb(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -318,6 +205,8 @@ pub async fn radio_detail(
                 .as_ref()
                 .map(|s| s.lifecycle_state.as_str())
                 .unwrap_or("CONFIGURED");
+            let session = state.sessions.snapshot();
+            let for_this = session.radio_id.as_deref() == Some(radio_id.as_str());
             (
                 StatusCode::OK,
                 Json(json!({
@@ -325,8 +214,9 @@ pub async fn radio_detail(
                     "lifecycle_state": lifecycle_state,
                     "snapshot": snap,
                     "lease": lease,
-                    "active_qsos": [],
-                    "recent_decodes": [],
+                    "session": if for_this { json!(session) } else { json!(null) },
+                    "active_qsos": if for_this { json!(session.active_qsos) } else { json!([]) },
+                    "recent_decodes": if for_this { json!(session.recent_decodes) } else { json!([]) },
                 })),
             )
                 .into_response()

@@ -19,6 +19,7 @@ use crate::command_bus::leases::ControlLeaseManager;
 use crate::command_bus::{CommandBus, WsBroadcastEvent};
 use crate::config::DaemonConfig;
 use crate::preflight::{print_human_report, run_preflight, PreflightReport};
+use crate::qso::SessionManager;
 use crate::store::StateStore;
 use crate::supervisor::discovery::{DeviceScanner, OsDeviceScanner};
 use crate::supervisor::radio_worker::WorkerTiming;
@@ -27,12 +28,15 @@ use crate::supervisor::{build_dummy_scanner_for_test, DeviceSupervisor, Supervis
 use crate::telemetry::{
     GcpPubSubSinkStub, NoopTelemetrySink, TelemetryEnvelope, TelemetryOutboxWorker, TelemetrySink,
 };
+use crate::watchdog::{PttAbortTarget, PttWatchdog, PttWatchdogConfig};
 
 pub struct AppState {
     pub config: DaemonConfig,
     pub store: StateStore,
     pub bus: Arc<CommandBus>,
     pub supervisor: Arc<DeviceSupervisor>,
+    pub watchdog: Arc<PttWatchdog>,
+    pub sessions: Arc<SessionManager>,
     pub hamlib_models: Arc<Vec<HamlibModelEntry>>,
     pub preflight: Arc<RwLock<PreflightReport>>,
     pub ws_tx: broadcast::Sender<WsBroadcastEvent>,
@@ -61,17 +65,51 @@ impl AppState {
         config: DaemonConfig,
         store: StateStore,
         preflight: PreflightReport,
+        sup_cfg: SupervisorConfig,
+        scanner: Arc<dyn DeviceScanner>,
+    ) -> Arc<Self> {
+        Self::build_for_test_with_watchdog(
+            config,
+            store,
+            preflight,
+            sup_cfg,
+            scanner,
+            PttWatchdogConfig::default(),
+        )
+    }
+
+    pub fn build_for_test_with_watchdog(
+        config: DaemonConfig,
+        store: StateStore,
+        preflight: PreflightReport,
         mut sup_cfg: SupervisorConfig,
         scanner: Arc<dyn DeviceScanner>,
+        watchdog_cfg: PttWatchdogConfig,
     ) -> Arc<Self> {
         sup_cfg.enable_os_netlink = false;
         let (ws_tx, _) = broadcast::channel(256);
         let leases = Arc::new(ControlLeaseManager::new());
         let supervisor = DeviceSupervisor::new(store.clone(), ws_tx.clone(), sup_cfg, scanner);
+        let watchdog = PttWatchdog::new(
+            watchdog_cfg,
+            Arc::clone(&supervisor) as Arc<dyn PttAbortTarget>,
+            store.clone(),
+            ws_tx.clone(),
+        );
+        supervisor.attach_watchdog(Arc::downgrade(&watchdog));
+        let sessions = SessionManager::new(
+            store.clone(),
+            Arc::clone(&supervisor),
+            Arc::clone(&watchdog),
+            ws_tx.clone(),
+            config.jt9_path.as_deref(),
+        );
         let bus = Arc::new(CommandBus::new(
             store.clone(),
             leases,
             Arc::clone(&supervisor),
+            Arc::clone(&watchdog),
+            Arc::clone(&sessions),
             config.auth_token.clone(),
             ws_tx.clone(),
         ));
@@ -80,6 +118,8 @@ impl AppState {
             store,
             bus,
             supervisor,
+            watchdog,
+            sessions,
             hamlib_models: Arc::new(vec![HamlibModelEntry {
                 id: 1,
                 manufacturer: "Hamlib".into(),
@@ -206,10 +246,27 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
     );
     supervisor.start(shutdown.clone()).await;
 
+    let watchdog = PttWatchdog::new(
+        PttWatchdogConfig::default(),
+        Arc::clone(&supervisor) as Arc<dyn PttAbortTarget>,
+        store.clone(),
+        ws_tx.clone(),
+    );
+    supervisor.attach_watchdog(Arc::downgrade(&watchdog));
+    let sessions = SessionManager::new(
+        store.clone(),
+        Arc::clone(&supervisor),
+        Arc::clone(&watchdog),
+        ws_tx.clone(),
+        config.jt9_path.as_deref(),
+    );
+
     let bus = Arc::new(CommandBus::new(
         store.clone(),
         leases,
         Arc::clone(&supervisor),
+        Arc::clone(&watchdog),
+        Arc::clone(&sessions),
         config.auth_token.clone(),
         ws_tx.clone(),
     ));
@@ -219,6 +276,8 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
         store,
         bus,
         supervisor: Arc::clone(&supervisor),
+        watchdog: Arc::clone(&watchdog),
+        sessions: Arc::clone(&sessions),
         hamlib_models,
         preflight: Arc::new(RwLock::new(preflight_report)),
         ws_tx,
@@ -242,6 +301,8 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
         .await?;
 
     shutdown.cancel();
+    sessions.stop_if_active().await;
+    watchdog.disarm_all().await;
     supervisor.shutdown_all().await;
     let _ = worker_handle.await;
     info!("Digi-Dx v2 daemon exited cleanly");

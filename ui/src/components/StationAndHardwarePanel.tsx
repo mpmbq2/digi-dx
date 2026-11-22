@@ -148,6 +148,8 @@ export function StationAndHardwarePanel({
                     {dev.host_name} · in:{dev.max_input_channels}ch · out:
                     {dev.max_output_channels}ch ·{" "}
                     {dev.default_sample_rate ? `${dev.default_sample_rate} Hz` : "rate n/a"}
+                    {" · "}
+                    {dev.device_uid}
                   </div>
                 </div>
                 <div class="hw-badges">

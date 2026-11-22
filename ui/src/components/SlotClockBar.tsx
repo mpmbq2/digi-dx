@@ -9,7 +9,7 @@ export function SlotClockBar({ spec }: Props) {
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   useEffect(() => {
-    const id = window.setInterval(() => setNowMs(Date.now()), 200);
+    const id = window.setInterval(() => setNowMs(Date.now()), 100);
     return () => window.clearInterval(id);
   }, []);
 
@@ -32,7 +32,7 @@ export function SlotClockBar({ spec }: Props) {
           {isEven ? "EVEN SLOT" : "ODD SLOT"}
         </span>
         <span class="mono utc-readout">{utcStr} UTC</span>
-        <span class="slot-countdown mono">
+        <span class="slot-countdown mono" data-testid="slot-countdown">
           Next slot in {remainingSec.toFixed(1)}s
         </span>
         <span class="muted">
