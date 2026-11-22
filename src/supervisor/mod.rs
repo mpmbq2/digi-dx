@@ -86,6 +86,7 @@ pub struct UsbInventoryEntry {
 
 struct WorkerHandle {
     tx: mpsc::Sender<WorkerCmd>,
+    cancel: CancellationToken,
     join: JoinHandle<()>,
 }
 
@@ -221,6 +222,7 @@ impl DeviceSupervisor {
                 .collect();
             for stale_id in stale_ids {
                 if let Some(h) = workers.remove(&stale_id) {
+                    h.cancel.cancel();
                     let _ = h.tx.send(WorkerCmd::Shutdown).await;
                     let _ = h.join.await;
                 }
@@ -311,12 +313,13 @@ impl DeviceSupervisor {
 
     fn spawn_worker(&self, profile: RadioProfile) -> WorkerHandle {
         let (tx, rx) = mpsc::channel(32);
-        let cancel = self
+        let root_cancel = self
             .shutdown
             .lock()
             .expect("shutdown lock poisoned")
             .clone()
             .unwrap_or_default();
+        let worker_cancel = root_cancel.child_token();
 
         let worker = RadioWorker::new(
             profile,
@@ -326,10 +329,14 @@ impl DeviceSupervisor {
             self.ws_tx.clone(),
             Arc::clone(&self.snapshots),
             rx,
-            cancel,
+            worker_cancel.clone(),
         );
         let join = tokio::spawn(worker.run());
-        WorkerHandle { tx, join }
+        WorkerHandle {
+            tx,
+            cancel: worker_cancel,
+            join,
+        }
     }
 
     pub async fn on_profile_created(&self, profile: RadioProfile) {
@@ -360,6 +367,7 @@ impl DeviceSupervisor {
             workers.remove(radio_id)
         };
         if let Some(h) = removed {
+            h.cancel.cancel();
             let _ = h.tx.send(WorkerCmd::Shutdown).await;
             let _ = h.join.await;
         }

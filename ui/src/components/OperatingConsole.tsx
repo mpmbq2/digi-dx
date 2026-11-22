@@ -185,7 +185,7 @@ export function OperatingConsole({ daemon }: Props) {
             <h2>Operating Console</h2>
             <p class="muted mono">
               {selectedRadio
-                ? `${selectedRadio.profile.name} · ${selectedRadio.lifecycle_state} · ${
+                ? `${selectedRadio.profile.name} · ${selectedRadio.lifecycle_state.replace(/_/g, " ")} · ${
                     selectedRadio.freq_hz
                       ? `${(selectedRadio.freq_hz / 1_000_000).toFixed(6)} MHz`
                       : "no VFO"
@@ -209,7 +209,7 @@ export function OperatingConsole({ daemon }: Props) {
               ) : (
                 daemon.radios.map((r) => (
                   <option key={r.profile.radio_id} value={r.profile.radio_id}>
-                    {r.profile.name} ({r.lifecycle_state})
+                    {r.profile.name} ({r.lifecycle_state.replace(/_/g, " ")})
                   </option>
                 ))
               )}

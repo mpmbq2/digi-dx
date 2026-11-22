@@ -780,3 +780,323 @@ async fn lease_persists_across_test_cat_and_heartbeats() {
 
     state.supervisor.shutdown_all().await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn powered_off_radio_detected_and_auto_recovers_on_power_on() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let cfg = make_cfg(dir.path());
+    let store = StateStore::open(cfg.db_path()).unwrap();
+
+    let state_file = dir.path().join("rig_power_state.txt");
+    std::fs::write(&state_file, "OFF").unwrap();
+
+    let mock_serial = dir.path().join("usb-Icom_IC-7300_TEST-if00-port0");
+    std::fs::write(&mock_serial, b"").unwrap();
+    std::fs::set_permissions(&mock_serial, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mock_rigctld = dir.path().join("mock_rigctld.py");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import signal, socket, sys
+
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+port = 4557
+args = sys.argv[1:]
+for i, a in enumerate(args):
+    if a == "-t" and i + 1 < len(args):
+        port = int(args[i + 1])
+
+STATE_PATH = {state_path:?}
+
+def read_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return "OFF"
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(4)
+
+while True:
+    conn, _ = srv.accept()
+    with conn:
+        buf = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                cmd = line.decode("utf-8", errors="replace").strip()
+                st = read_state()
+                if cmd == "+\\get_powerstat":
+                    if st == "ON":
+                        conn.sendall(b"get_powerstat:\nPower Status: 1\nRPRT 0\n")
+                    elif st == "TIMEOUT":
+                        conn.sendall(b"get_powerstat:\nRPRT -5\n")
+                    else:
+                        conn.sendall(b"get_powerstat:\nPower Status: 0\nRPRT 0\n")
+                elif cmd == "+f":
+                    if st == "ON":
+                        conn.sendall(b"get_freq:\nFrequency: 14074000\nRPRT 0\n")
+                    elif st == "TIMEOUT":
+                        conn.sendall(b"get_freq:\nRPRT -5\n")
+                    else:
+                        conn.sendall(b"get_freq:\nRPRT -20\n")
+                elif cmd == "+m":
+                    conn.sendall(b"get_mode:\nMode: PKTUSB\nPassband: 2400\nRPRT 0\n")
+                elif cmd == "+t":
+                    conn.sendall(b"get_ptt:\nPTT: 0\nRPRT 0\n")
+                elif cmd.startswith("+T"):
+                    conn.sendall(b"set_ptt: 0\nRPRT 0\n")
+                else:
+                    conn.sendall(b"RPRT 0\n")
+"#,
+        state_path = state_file.display().to_string()
+    );
+    std::fs::write(&mock_rigctld, script).unwrap();
+    std::fs::set_permissions(&mock_rigctld, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut sup_cfg = SupervisorConfig::from_daemon_config(&cfg);
+    sup_cfg.rigctld_bin = mock_rigctld.display().to_string();
+    sup_cfg.timing = fast_test_worker_timing();
+    sup_cfg.reconcile_interval = Duration::from_secs(30);
+
+    let dev_key = mock_serial.display().to_string();
+    let scanner = Arc::new(MockDeviceScanner::new(vec![ScannedSerialDevice {
+        device_key: dev_key.clone(),
+        os_path: dev_key.clone(),
+        real_tty_path: Some(dev_key.clone()),
+        usb_vid: Some("10c4".into()),
+        usb_pid: Some("ea60".into()),
+        usb_serial: Some("IC-7300_TEST".into()),
+        usb_interface: Some("00".into()),
+        usb_topology_path: Some("3-1".into()),
+        manufacturer: Some("Silicon Labs".into()),
+        product: Some("CP2102".into()),
+    }]));
+
+    let state = AppState::build_for_test_with_supervisor(
+        cfg,
+        store,
+        make_preflight(),
+        sup_cfg,
+        scanner.clone(),
+    );
+    let shutdown = CancellationToken::new();
+    state.supervisor.start(shutdown.clone()).await;
+
+    let ack = state
+        .bus
+        .dispatch(
+            cmd(
+                "tester",
+                None,
+                "radio.create_profile",
+                json!({
+                    "name": "Mock IC-7300",
+                    "hamlib_model": 3073,
+                    "is_dummy": false,
+                    "rigctld_port": 4557,
+                    "serial_device_key": dev_key,
+                    "serial_baud_rate": 115200,
+                    "auto_connect": true
+                }),
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(ack.status, CommandStatus::Ok);
+    let rid = ack.result.unwrap()["profile"]["radio_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 1. Radio OFF with USB cable plugged -> POWERED_OFF (no error banner, no leaked PID)
+    let off_snap = wait_for_state(
+        &state,
+        &rid,
+        RadioLifecycleState::PoweredOff,
+        Duration::from_secs(4),
+    )
+    .await;
+    assert!(off_snap.last_error.is_none());
+    assert!(off_snap.rigctld_pid.is_none());
+
+    let inv_off = state.supervisor.list_usb_inventory().unwrap();
+    let entry_off = inv_off
+        .iter()
+        .find(|u| u.device_key == dev_key)
+        .expect("USB entry present");
+    assert!(entry_off.is_connected);
+    assert_eq!(entry_off.device_state, "POWERED_OFF");
+
+    // 2. Wait across >2 standby probes (300ms each) -> no flicker or duplicate outbox rows
+    let outbox_before = state
+        .store
+        .list_outbox_rows(100)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.event_type == "radio.lifecycle")
+        .count();
+    sleep(Duration::from_millis(750)).await;
+    let still_off = state.supervisor.get_radio_snapshot(&rid).unwrap();
+    assert_eq!(still_off.lifecycle_state, RadioLifecycleState::PoweredOff);
+    let outbox_after = state
+        .store
+        .list_outbox_rows(100)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.event_type == "radio.lifecycle")
+        .count();
+    assert_eq!(outbox_before, outbox_after);
+
+    // 3. Turn radio ON -> auto-transitions to READY with live VFO frequency
+    std::fs::write(&state_file, "ON").unwrap();
+    let on_snap = wait_for_state(
+        &state,
+        &rid,
+        RadioLifecycleState::Ready,
+        Duration::from_secs(4),
+    )
+    .await;
+    assert_eq!(on_snap.freq_hz, Some(14_074_000));
+    let inv_on = state.supervisor.list_usb_inventory().unwrap();
+    let entry_on = inv_on.iter().find(|u| u.device_key == dev_key).unwrap();
+    assert_eq!(entry_on.device_state, "READY");
+
+    // 4. Radio stops answering CAT (RPRT -5 timeout) -> transitions cleanly to POWERED_OFF, not DEGRADED
+    std::fs::write(&state_file, "TIMEOUT").unwrap();
+    let timeout_off = wait_for_state(
+        &state,
+        &rid,
+        RadioLifecycleState::PoweredOff,
+        Duration::from_secs(4),
+    )
+    .await;
+    assert!(timeout_off.last_error.is_none());
+
+    // 5. Turn radio back ON -> auto-recovers to READY
+    std::fs::write(&state_file, "ON").unwrap();
+    wait_for_state(
+        &state,
+        &rid,
+        RadioLifecycleState::Ready,
+        Duration::from_secs(4),
+    )
+    .await;
+
+    // 6. Unplug USB cable -> DISCONNECTED
+    scanner.remove_device(&dev_key);
+    state.supervisor.reconcile_now().await;
+    wait_for_state(
+        &state,
+        &rid,
+        RadioLifecycleState::Disconnected,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    state.supervisor.shutdown_all().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serial_permission_denied_reports_degraded_not_powered_off() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: geteuid() is always safe to call.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    let cfg = make_cfg(dir.path());
+    let store = StateStore::open(cfg.db_path()).unwrap();
+
+    let locked_serial = dir.path().join("usb-Locked_Port-if00-port0");
+    std::fs::write(&locked_serial, b"").unwrap();
+    std::fs::set_permissions(&locked_serial, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut sup_cfg = SupervisorConfig::from_daemon_config(&cfg);
+    sup_cfg.timing = fast_test_worker_timing();
+    sup_cfg.reconcile_interval = Duration::from_secs(30);
+
+    let dev_key = locked_serial.display().to_string();
+    let scanner = Arc::new(MockDeviceScanner::new(vec![ScannedSerialDevice {
+        device_key: dev_key.clone(),
+        os_path: dev_key.clone(),
+        real_tty_path: Some(dev_key.clone()),
+        usb_vid: Some("10c4".into()),
+        usb_pid: Some("ea60".into()),
+        usb_serial: Some("LOCKED1".into()),
+        usb_interface: Some("00".into()),
+        usb_topology_path: Some("3-2".into()),
+        manufacturer: Some("Silicon Labs".into()),
+        product: Some("CP2102".into()),
+    }]));
+
+    let state =
+        AppState::build_for_test_with_supervisor(cfg, store, make_preflight(), sup_cfg, scanner);
+    let shutdown = CancellationToken::new();
+    state.supervisor.start(shutdown.clone()).await;
+
+    let ack = state
+        .bus
+        .dispatch(
+            cmd(
+                "tester",
+                None,
+                "radio.create_profile",
+                json!({
+                    "name": "Locked Serial Rig",
+                    "hamlib_model": 3073,
+                    "is_dummy": false,
+                    "rigctld_port": 4558,
+                    "serial_device_key": dev_key,
+                    "serial_baud_rate": 115200,
+                    "auto_connect": true
+                }),
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(ack.status, CommandStatus::Ok);
+    let rid = ack.result.unwrap()["profile"]["radio_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let snap = loop {
+        if let Some(s) = state.supervisor.get_radio_snapshot(&rid) {
+            if s.last_error.is_some() {
+                break s;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for permission-denied error on {rid}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_ne!(snap.lifecycle_state, RadioLifecycleState::PoweredOff);
+    let err = snap.last_error.unwrap();
+    assert!(
+        err.contains("permission denied") || err.contains("dialout"),
+        "expected permission denied / dialout hint, got: {err}"
+    );
+
+    state.supervisor.shutdown_all().await;
+    let _ = std::fs::set_permissions(&locked_serial, std::fs::Permissions::from_mode(0o600));
+}

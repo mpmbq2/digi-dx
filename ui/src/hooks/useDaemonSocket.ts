@@ -297,7 +297,7 @@ export function useDaemonSocket(): DaemonState {
               "snapshot",
               `Snapshot v${snap.server_version} (${snap.radios?.length ?? 0} radio(s), ${
                 snap.usb_devices?.filter((d) => d.is_connected).length ?? 0
-              } USB connected)`
+              } USB plugged)`
             );
           } else if (evType === "pong") {
             pushEvent("pong", `Heartbeat ${String(parsed.server_time_utc ?? "")}`);
@@ -430,13 +430,26 @@ export function useDaemonSocket(): DaemonState {
           } else if (evType === "usb_devices_changed") {
             const devices = (parsed.devices as UsbInventoryEntry[]) ?? [];
             setUsbDevices(devices);
-            const online = devices.filter((d) => d.is_connected).length;
+            const plugged = devices.filter((d) => d.is_connected).length;
             pushEvent(
               "usb_devices",
-              `USB hot-plug update: ${online} online (${devices.length} known)`
+              `USB hot-plug update: ${plugged} plugged (${devices.length} known)`
             );
           } else if (evType === "radio_state") {
             const rid = String(parsed.radio_id ?? "");
+            const nextLifecycle =
+              typeof parsed.lifecycle_state === "string"
+                ? parsed.lifecycle_state
+                : null;
+            if (nextLifecycle) {
+              setUsbDevices((prev) =>
+                prev.map((u) =>
+                  u.assigned_radio_id === rid && u.is_connected
+                    ? { ...u, device_state: nextLifecycle }
+                    : u
+                )
+              );
+            }
             setRadios((prev) =>
               prev.map((r) => {
                 if (r.profile.radio_id !== rid) return r;

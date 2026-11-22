@@ -12,7 +12,9 @@ use tracing::{debug, info, warn};
 use crate::command_bus::{ErrorCode, WsBroadcastEvent};
 use crate::domain::bands::derive_band;
 use crate::store::{now_utc_str, RadioProfile, StateStore};
-use crate::supervisor::rigctld::{RigctldClient, RigctldError, RigctldProcess};
+use crate::supervisor::rigctld::{
+    is_cat_powered_off_error, RigctldClient, RigctldError, RigctldProcess,
+};
 use crate::telemetry::TelemetryEnvelope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +28,7 @@ pub enum RadioLifecycleState {
     ActiveSession,
     Degraded,
     Recovering,
+    PoweredOff,
     Disconnected,
 }
 
@@ -40,6 +43,7 @@ impl RadioLifecycleState {
             Self::ActiveSession => "ACTIVE_SESSION",
             Self::Degraded => "DEGRADED",
             Self::Recovering => "RECOVERING",
+            Self::PoweredOff => "POWERED_OFF",
             Self::Disconnected => "DISCONNECTED",
         }
     }
@@ -94,6 +98,7 @@ impl RadioRuntimeSnapshot {
 pub struct WorkerTiming {
     pub poll_interval: Duration,
     pub recovery_backoffs: Vec<Duration>,
+    pub standby_poll_interval: Duration,
 }
 
 impl Default for WorkerTiming {
@@ -107,6 +112,7 @@ impl Default for WorkerTiming {
                 Duration::from_secs(15),
                 Duration::from_secs(15),
             ],
+            standby_poll_interval: Duration::from_secs(10),
         }
     }
 }
@@ -176,6 +182,7 @@ pub struct RadioWorker {
     serial_attached: bool,
     halted_by_operator: bool,
     pending_recovery_at: Option<Instant>,
+    pending_standby_probe_at: Option<Instant>,
 }
 
 impl RadioWorker {
@@ -211,13 +218,14 @@ impl RadioWorker {
             serial_attached,
             halted_by_operator: false,
             pending_recovery_at: None,
+            pending_standby_probe_at: None,
         }
     }
 
     pub async fn run(mut self) {
         if self.profile.is_dummy || self.profile.hamlib_model == 1 {
             if self.profile.auto_connect {
-                self.start_rigctld().await;
+                self.start_rigctld(false).await;
             } else {
                 self.set_state(
                     RadioLifecycleState::Configured,
@@ -241,6 +249,12 @@ impl RadioWorker {
                     None => std::future::pending::<()>().await,
                 }
             };
+            let standby_probe_fut = async {
+                match self.pending_standby_probe_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
 
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
@@ -249,7 +263,17 @@ impl RadioWorker {
                 _ = recovery_fut => {
                     self.pending_recovery_at = None;
                     if self.can_run_rigctld() {
-                        self.start_rigctld().await;
+                        self.start_rigctld(false).await;
+                    }
+                }
+                _ = standby_probe_fut => {
+                    self.pending_standby_probe_at = None;
+                    if self.can_run_rigctld()
+                        && self.profile.auto_connect
+                        && !self.halted_by_operator
+                        && self.running.is_none()
+                    {
+                        self.start_rigctld(true).await;
                     }
                 }
                 _ = poll_timer.tick(), if self.running.is_some() && !self.snapshot.ptt => {
@@ -297,11 +321,12 @@ impl RadioWorker {
                 {
                     self.snapshot.recovery_attempts = 0;
                     self.pending_recovery_at = None;
+                    self.pending_standby_probe_at = None;
                     self.set_state(
                         RadioLifecycleState::Recovering,
                         Some(format!("Serial device attached at {serial_path}")),
                     );
-                    self.start_rigctld().await;
+                    self.start_rigctld(false).await;
                 } else if changed {
                     self.publish_snapshot(Some(format!("Serial device attached at {serial_path}")));
                 }
@@ -310,6 +335,7 @@ impl RadioWorker {
                 if self.serial_attached || self.running.is_some() {
                     self.serial_attached = false;
                     self.pending_recovery_at = None;
+                    self.pending_standby_probe_at = None;
                     self.snapshot.recovery_attempts = 0;
                     self.snapshot.bound_serial_path = None;
                     self.snapshot.last_error = Some("USB serial cable detached".into());
@@ -323,6 +349,7 @@ impl RadioWorker {
             WorkerCmd::HardwareAmbiguous { reason } => {
                 self.serial_attached = false;
                 self.pending_recovery_at = None;
+                self.pending_standby_probe_at = None;
                 self.teardown_rig(&reason).await;
                 self.snapshot.last_error = Some(reason.clone());
                 self.set_state(RadioLifecycleState::Degraded, Some(reason));
@@ -339,25 +366,28 @@ impl RadioWorker {
 
                 self.profile = updated;
                 self.halted_by_operator = false;
+                self.pending_standby_probe_at = None;
                 if self.profile.is_dummy || self.profile.hamlib_model == 1 {
                     self.serial_attached = true;
                 }
                 if needs_restart && self.can_run_rigctld() && self.profile.auto_connect {
                     self.teardown_rig("profile updated").await;
                     self.snapshot.recovery_attempts = 0;
-                    self.start_rigctld().await;
+                    self.pending_recovery_at = None;
+                    self.start_rigctld(false).await;
                 } else {
                     self.publish_snapshot(Some("Radio profile updated".into()));
                 }
             }
             WorkerCmd::Restart { reply } => {
                 self.pending_recovery_at = None;
+                self.pending_standby_probe_at = None;
                 self.halted_by_operator = false;
                 self.snapshot.recovery_attempts = 0;
                 self.snapshot.last_error = None;
                 self.teardown_rig("operator restart").await;
                 if self.can_run_rigctld() {
-                    self.start_rigctld().await;
+                    self.start_rigctld(false).await;
                     if let Some(tx) = reply {
                         let _ = tx.send(Ok(
                             serde_json::to_value(&self.snapshot).unwrap_or(Value::Null)
@@ -378,6 +408,7 @@ impl RadioWorker {
             }
             WorkerCmd::Stop { reply } => {
                 self.pending_recovery_at = None;
+                self.pending_standby_probe_at = None;
                 self.halted_by_operator = true;
                 self.snapshot.recovery_attempts = 0;
                 self.snapshot.last_error = None;
@@ -453,14 +484,16 @@ impl RadioWorker {
         }
     }
 
-    async fn start_rigctld(&mut self) {
-        self.set_state(
-            RadioLifecycleState::StartingRigctld,
-            Some(format!(
-                "Spawning rigctld -m {} on 127.0.0.1:{}",
-                self.profile.hamlib_model, self.profile.rigctld_port
-            )),
-        );
+    async fn start_rigctld(&mut self, is_standby_probe: bool) {
+        if !is_standby_probe {
+            self.set_state(
+                RadioLifecycleState::StartingRigctld,
+                Some(format!(
+                    "Spawning rigctld -m {} on 127.0.0.1:{}",
+                    self.profile.hamlib_model, self.profile.rigctld_port
+                )),
+            );
+        }
 
         let serial_path = self.snapshot.bound_serial_path.clone();
         match RigctldProcess::spawn_and_connect(
@@ -472,6 +505,7 @@ impl RadioWorker {
         .await
         {
             Ok((process, mut client)) => {
+                self.pending_standby_probe_at = None;
                 let pid = process.pid();
                 let freq = client.get_freq().await.ok();
                 let mode_pair = client.get_mode().await.ok();
@@ -538,6 +572,10 @@ impl RadioWorker {
                     )),
                 );
             }
+            Err(RigctldError::RadioPoweredOff(reason)) => {
+                debug!(radio_id = %self.profile.radio_id, reason = %reason, "transceiver powered off / CAT unresponsive");
+                self.handle_rig_powered_off(reason, is_standby_probe);
+            }
             Err(err) => {
                 let msg = err.to_string();
                 warn!(radio_id = %self.profile.radio_id, error = %msg, "rigctld start failed");
@@ -569,9 +607,24 @@ impl RadioWorker {
         let freq = match rig.client.get_freq().await {
             Ok(f) => f,
             Err(err) => {
-                self.teardown_rig("CAT poll failed").await;
-                self.handle_rig_failure(format!("CAT poll failed: {err}"))
-                    .await;
+                let rig_alive = rig.process.is_alive();
+                let is_dummy = self.profile.is_dummy || self.profile.hamlib_model == 1;
+                let powered_off = is_cat_powered_off_error(&err, is_dummy, rig_alive)
+                    || (matches!(err, RigctldError::ProtocolError(ref m) if m.contains("missing Frequency"))
+                        && matches!(rig.client.get_powerstat().await, Ok(Some(false))));
+
+                if powered_off {
+                    self.teardown_rig("transceiver powered off / CAT unresponsive")
+                        .await;
+                    self.handle_rig_powered_off(
+                        format!("Transceiver powered off or CAT stopped responding ({err})"),
+                        false,
+                    );
+                } else {
+                    self.teardown_rig("CAT poll failed").await;
+                    self.handle_rig_failure(format!("CAT poll failed: {err}"))
+                        .await;
+                }
                 return;
             }
         };
@@ -612,7 +665,28 @@ impl RadioWorker {
         }
     }
 
+    fn handle_rig_powered_off(&mut self, detail: String, was_standby_probe: bool) {
+        self.snapshot.rigctld_pid = None;
+        self.snapshot.ptt = false;
+        self.snapshot.recovery_attempts = 0;
+        self.snapshot.last_error = None;
+        self.pending_recovery_at = None;
+        self.pending_standby_probe_at =
+            if self.can_run_rigctld() && self.profile.auto_connect && !self.halted_by_operator {
+                Some(Instant::now() + self.timing.standby_poll_interval)
+            } else {
+                None
+            };
+
+        if !was_standby_probe || self.snapshot.lifecycle_state != RadioLifecycleState::PoweredOff {
+            self.set_state(RadioLifecycleState::PoweredOff, Some(detail));
+        } else {
+            self.sync_shared_snapshot();
+        }
+    }
+
     async fn handle_rig_failure(&mut self, err_msg: String) {
+        self.pending_standby_probe_at = None;
         self.snapshot.last_error = Some(err_msg.clone());
         self.snapshot.rigctld_pid = None;
         self.snapshot.ptt = false;
@@ -860,6 +934,7 @@ impl RadioWorker {
         }
         if fail_closed {
             self.pending_recovery_at = None;
+            self.pending_standby_probe_at = None;
             if halt_auto_restart {
                 self.halted_by_operator = true;
             }
@@ -941,7 +1016,9 @@ impl RadioWorker {
 fn map_rigctld_err(err: RigctldError, default_code: ErrorCode) -> (ErrorCode, String) {
     match err {
         RigctldError::PortBusy(_) => (ErrorCode::PortUnavailable, err.to_string()),
-        RigctldError::Timeout(_) => (ErrorCode::CatUnavailable, err.to_string()),
+        RigctldError::RadioPoweredOff(_)
+        | RigctldError::PermissionDenied(_)
+        | RigctldError::Timeout(_) => (ErrorCode::CatUnavailable, err.to_string()),
         _ => (default_code, err.to_string()),
     }
 }

@@ -142,6 +142,7 @@ pub fn fast_test_worker_timing() -> WorkerTiming {
             Duration::from_millis(200),
             Duration::from_millis(400),
         ],
+        standby_poll_interval: Duration::from_millis(300),
     }
 }
 

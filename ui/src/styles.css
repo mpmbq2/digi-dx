@@ -291,6 +291,11 @@ body {
   background: var(--info-bg);
 }
 
+.badge-muted {
+  color: var(--muted);
+  background: rgba(142, 160, 181, 0.14);
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -643,6 +648,15 @@ body {
   border-radius: 6px;
   padding: 0.4rem 0.6rem;
   word-break: break-word;
+}
+
+.radio-standby {
+  font-size: 0.78rem;
+  color: #fcd34d;
+  background: var(--warn-bg);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: 6px;
+  padding: 0.45rem 0.65rem;
 }
 
 .preset-row,

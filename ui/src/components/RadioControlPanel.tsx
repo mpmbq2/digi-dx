@@ -37,18 +37,35 @@ const FT8_BAND_PRESETS: Array<{ band: string; hz: number; mhz: string }> = [
 
 const POPULAR_MODEL_IDS = [1, 2016, 2031, 3073, 3085, 1035, 1042, 2045];
 
+function formatLifecycleLabel(state: string): string {
+  switch (state) {
+    case "POWERED_OFF":
+      return "POWERED OFF";
+    case "ACTIVE_SESSION":
+      return "ACTIVE SESSION";
+    case "STARTING_RIGCTLD":
+      return "STARTING";
+    default:
+      return state;
+  }
+}
+
 function lifecycleBadgeClass(state: string): string {
   switch (state) {
     case "READY":
     case "ACTIVE_SESSION":
       return "badge-ok";
+    case "POWERED_OFF":
+    case "DISCONNECTED":
+      return "badge-warn";
     case "STARTING_RIGCTLD":
     case "RECOVERING":
     case "CONFIGURED":
       return "badge-info";
     case "DEGRADED":
       return "badge-fail";
-    case "DISCONNECTED":
+    case "UNCONFIGURED":
+      return "badge-muted";
     default:
       return "badge-warn";
   }
@@ -294,7 +311,7 @@ export function RadioControlPanel({
               <option value="">-- Dummy / No Serial Port --</option>
               {usbDevices.map((usb) => (
                 <option key={usb.device_key} value={usb.device_key}>
-                  {usb.os_path} ({usb.is_connected ? "ONLINE" : "OFFLINE"})
+                  {usb.os_path} ({usb.is_connected ? "USB PLUGGED" : "UNPLUGGED"})
                 </option>
               ))}
             </select>
@@ -441,38 +458,55 @@ export function RadioControlPanel({
             </p>
           ) : (
             <ul class="hw-list">
-              {usbDevices.map((usb) => (
-                <li key={usb.device_key} class="hw-item usb-item">
-                  <div class="usb-meta-col">
-                    <div class="hw-name mono">{usb.os_path}</div>
-                    <div class="muted mono hw-meta">
-                      {usb.real_tty_path ?? "unmapped"} ·{" "}
-                      {usb.usb_vid && usb.usb_pid
-                        ? `${usb.usb_vid}:${usb.usb_pid}`
-                        : "vid:pid n/a"}
-                      {usb.usb_serial ? ` · sn:${usb.usb_serial}` : ""}
-                      {usb.product ? ` · ${usb.product}` : ""}
+              {usbDevices.map((usb) => {
+                const assignedRadio = usb.assigned_radio_id
+                  ? radios.find((r) => r.profile.radio_id === usb.assigned_radio_id)
+                  : undefined;
+                const liveState = !usb.is_connected
+                  ? "DISCONNECTED"
+                  : assignedRadio
+                  ? assignedRadio.lifecycle_state
+                  : usb.device_state;
+                return (
+                  <li key={usb.device_key} class="hw-item usb-item">
+                    <div class="usb-meta-col">
+                      <div class="hw-name mono">{usb.os_path}</div>
+                      <div class="muted mono hw-meta">
+                        {usb.real_tty_path ?? "unmapped"} ·{" "}
+                        {usb.usb_vid && usb.usb_pid
+                          ? `${usb.usb_vid}:${usb.usb_pid}`
+                          : "vid:pid n/a"}
+                        {usb.usb_serial ? ` · sn:${usb.usb_serial}` : ""}
+                        {usb.product ? ` · ${usb.product}` : ""}
+                      </div>
+                      {usb.is_connected && !usb.assigned_radio_id && (
+                        <div class="muted" style={{ fontSize: "0.74rem", marginTop: "0.18rem" }}>
+                          USB-UART bridge detected — assign a rig profile to check radio power/CAT
+                        </div>
+                      )}
                     </div>
-                  </div>
-                  <div class="hw-badges">
-                    <span
-                      class={`badge ${usb.is_connected ? "badge-ok" : "badge-warn"}`}
-                    >
-                      {usb.is_connected ? "ONLINE" : "OFFLINE"}
-                    </span>
-                    <span class="badge badge-info">{usb.device_state}</span>
-                    {!usb.assigned_radio_id && (
-                      <button
-                        class="btn btn-secondary btn-sm"
-                        type="button"
-                        onClick={() => openAssignFormForUsb(usb)}
+                    <div class="hw-badges">
+                      <span
+                        class={`badge ${usb.is_connected ? "badge-info" : "badge-muted"}`}
                       >
-                        Assign Rig
-                      </button>
-                    )}
-                  </div>
-                </li>
-              ))}
+                        {usb.is_connected ? "USB PLUGGED" : "UNPLUGGED"}
+                      </span>
+                      <span class={`badge ${lifecycleBadgeClass(liveState)}`}>
+                        {formatLifecycleLabel(liveState)}
+                      </span>
+                      {!usb.assigned_radio_id && (
+                        <button
+                          class="btn btn-secondary btn-sm"
+                          type="button"
+                          onClick={() => openAssignFormForUsb(usb)}
+                        >
+                          Assign Rig
+                        </button>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </div>
@@ -524,13 +558,17 @@ export function RadioControlPanel({
                         <span
                           class={`badge ${lifecycleBadgeClass(radio.lifecycle_state)}`}
                         >
-                          {radio.lifecycle_state}
+                          {formatLifecycleLabel(radio.lifecycle_state)}
                         </span>
-                        <span
-                          class={`badge ${radio.ptt ? "badge-fail" : "badge-ok"}`}
-                        >
-                          {radio.ptt ? "TX" : "RX"}
-                        </span>
+                        {(radio.ptt ||
+                          radio.lifecycle_state === "READY" ||
+                          radio.lifecycle_state === "ACTIVE_SESSION") && (
+                          <span
+                            class={`badge ${radio.ptt ? "badge-fail" : "badge-ok"}`}
+                          >
+                            {radio.ptt ? "TX" : "RX"}
+                          </span>
+                        )}
                       </div>
                     </div>
 
@@ -556,6 +594,12 @@ export function RadioControlPanel({
 
                     {radio.last_error && (
                       <div class="radio-error mono">{radio.last_error}</div>
+                    )}
+
+                    {radio.lifecycle_state === "POWERED_OFF" && (
+                      <div class="radio-standby">
+                        USB cable is plugged in, but transceiver is not responding to CAT (appears powered off — if turned on, verify baud rate &amp; CI-V). Auto-connecting when powered on…
+                      </div>
                     )}
 
                     <div class="preset-row">
@@ -694,7 +738,11 @@ export function RadioControlPanel({
                           void runRadioCmd(rid, "radio.restart", {})
                         }
                       >
-                        {radio.rigctld_pid ? "Restart Worker" : "Start Worker"}
+                        {radio.rigctld_pid
+                          ? "Restart Worker"
+                          : radio.lifecycle_state === "POWERED_OFF"
+                          ? "Probe Now"
+                          : "Start Worker"}
                       </button>
                       <button
                         type="button"

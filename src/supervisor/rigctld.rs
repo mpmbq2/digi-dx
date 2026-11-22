@@ -34,6 +34,10 @@ pub enum RigctldError {
     ProtocolError(String),
     #[error("Hamlib error on '{cmd}': RPRT {code}")]
     HamlibError { cmd: String, code: i32 },
+    #[error("serial port permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("transceiver powered off or CAT unresponsive: {0}")]
+    RadioPoweredOff(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +192,58 @@ impl RigctldClient {
             .await?;
         Ok(())
     }
+
+    /// Queries transceiver power status (`+\get_powerstat`).
+    /// Returns `Ok(Some(true))` for ON/OPERATE (1/4), `Ok(Some(false))` for OFF/STANDBY (0/2 or `RPRT -20`),
+    /// and `Ok(None)` when unsupported (`RPRT -4`/`-11`) or unknown.
+    pub async fn get_powerstat(&mut self) -> Result<Option<bool>, RigctldError> {
+        match self
+            .send_extended("+\\get_powerstat", DEFAULT_CAT_TIMEOUT)
+            .await
+        {
+            Ok(resp) => {
+                let val = resp
+                    .values
+                    .get("Power Status")
+                    .and_then(|s| s.parse::<i32>().ok());
+                match val {
+                    Some(0 | 2) => Ok(Some(false)),
+                    Some(1 | 4) => Ok(Some(true)),
+                    _ => Ok(None),
+                }
+            }
+            Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
+            Err(RigctldError::HamlibError { code: -20, .. }) => Ok(Some(false)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+pub fn is_cat_powered_off_error(err: &RigctldError, is_dummy: bool, rigctld_alive: bool) -> bool {
+    match err {
+        RigctldError::RadioPoweredOff(_) => true,
+        RigctldError::HamlibError { code: -20, .. } => true,
+        RigctldError::HamlibError { code: -5, .. } | RigctldError::Timeout(_) => {
+            !is_dummy && rigctld_alive
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+pub fn check_serial_rw_access(dev_path: &str) -> Result<(), RigctldError> {
+    let c_path = std::ffi::CString::new(dev_path).map_err(|_| {
+        RigctldError::SpawnFailed(format!("invalid serial device path '{dev_path}'"))
+    })?;
+    // SAFETY: c_path is a valid NUL-terminated string; access(2) checks permissions without opening the tty.
+    let rc = unsafe { libc::access(c_path.as_ptr(), libc::R_OK | libc::W_OK) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(RigctldError::PermissionDenied(format!(
+            "cannot access serial device '{dev_path}': {err} (ensure your user/session is in the dialout/uucp group; restart tmux/shell after group changes)"
+        )));
+    }
+    Ok(())
 }
 
 pub fn normalize_civ_address(raw: &str) -> String {
@@ -346,13 +402,16 @@ impl RigctldProcess {
         }
 
         let args = build_rigctld_args(profile, serial_path)?;
-        if !(profile.is_dummy || profile.hamlib_model == 1) {
+        let is_dummy = profile.is_dummy || profile.hamlib_model == 1;
+        if !is_dummy {
             if let Some(dev_path) = serial_path.map(str::trim).filter(|s| !s.is_empty()) {
                 if !std::path::Path::new(dev_path).exists() {
                     return Err(RigctldError::SpawnFailed(format!(
                         "serial device path '{dev_path}' does not exist"
                     )));
                 }
+                #[cfg(unix)]
+                check_serial_rw_access(dev_path)?;
             }
         }
         let mut cmd = Command::new(rigctld_bin);
@@ -395,9 +454,36 @@ impl RigctldProcess {
             }
 
             if let Ok(mut client) = RigctldClient::connect(port).await {
+                match client.get_powerstat().await {
+                    Ok(Some(false)) => {
+                        proc_handle.shutdown_gracefully(None).await;
+                        return Err(RigctldError::RadioPoweredOff(
+                            "transceiver reported power OFF / standby".to_string(),
+                        ));
+                    }
+                    Ok(Some(true)) | Ok(None) => {}
+                    Err(e) => {
+                        let alive = proc_handle.is_alive();
+                        if is_cat_powered_off_error(&e, is_dummy, alive) {
+                            proc_handle.shutdown_gracefully(None).await;
+                            return Err(RigctldError::RadioPoweredOff(format!(
+                                "USB serial connected, CAT power probe unresponsive ({e})"
+                            )));
+                        }
+                        proc_handle.shutdown_gracefully(Some(&mut client)).await;
+                        return Err(e);
+                    }
+                }
                 match client.get_freq().await {
                     Ok(_) => return Ok((proc_handle, client)),
                     Err(e) => {
+                        let alive = proc_handle.is_alive();
+                        if is_cat_powered_off_error(&e, is_dummy, alive) {
+                            proc_handle.shutdown_gracefully(None).await;
+                            return Err(RigctldError::RadioPoweredOff(format!(
+                                "USB serial connected, transceiver did not respond to CAT ({e})"
+                            )));
+                        }
                         proc_handle.shutdown_gracefully(Some(&mut client)).await;
                         return Err(e);
                     }
@@ -407,9 +493,28 @@ impl RigctldProcess {
             sleep(Duration::from_millis(50)).await;
         }
 
+        if let Some(status) = proc_handle.child.try_wait()? {
+            let stderr_msg = proc_handle.read_stderr_snippet().await;
+            return Err(RigctldError::ExitedEarly(format!(
+                "exited with {status}{}",
+                if stderr_msg.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr_msg}")
+                }
+            )));
+        }
+
         proc_handle.shutdown_gracefully(None).await;
+        if !is_dummy {
+            return Err(RigctldError::RadioPoweredOff(format!(
+                "USB serial port is openable, but transceiver did not answer CAT init within {}ms (likely powered off or wrong baud/CI-V)",
+                STARTUP_TIMEOUT.as_millis()
+            )));
+        }
         Err(RigctldError::Timeout(format!(
-            "rigctld failed to listen on 127.0.0.1:{port} within 5000ms"
+            "rigctld failed to listen on 127.0.0.1:{port} within {}ms",
+            STARTUP_TIMEOUT.as_millis()
         )))
     }
 
@@ -435,6 +540,10 @@ impl RigctldProcess {
 
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
         self.child.try_wait()
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     pub async fn shutdown_gracefully(mut self, client: Option<&mut RigctldClient>) {
@@ -717,5 +826,75 @@ mod tests {
         assert_eq!(parsed[1].model, "MARK-V FT-1000MP");
         assert_eq!(parsed[2].id, 2016);
         assert_eq!(parsed[3].manufacturer, "Icom");
+    }
+
+    #[test]
+    fn classifies_powered_off_vs_fault_errors() {
+        let pwr_err = RigctldError::RadioPoweredOff("off".into());
+        assert!(is_cat_powered_off_error(&pwr_err, false, true));
+        assert!(is_cat_powered_off_error(&pwr_err, true, false));
+
+        let rprt_20 = RigctldError::HamlibError {
+            cmd: "+f".into(),
+            code: -20,
+        };
+        assert!(is_cat_powered_off_error(&rprt_20, false, true));
+        assert!(is_cat_powered_off_error(&rprt_20, true, false));
+
+        let rprt_5 = RigctldError::HamlibError {
+            cmd: "+f".into(),
+            code: -5,
+        };
+        assert!(is_cat_powered_off_error(&rprt_5, false, true));
+        assert!(!is_cat_powered_off_error(&rprt_5, true, true));
+        assert!(!is_cat_powered_off_error(&rprt_5, false, false));
+
+        let timeout_err = RigctldError::Timeout("+f".into());
+        assert!(is_cat_powered_off_error(&timeout_err, false, true));
+        assert!(!is_cat_powered_off_error(&timeout_err, true, true));
+        assert!(!is_cat_powered_off_error(&timeout_err, false, false));
+
+        let io_err = RigctldError::HamlibError {
+            cmd: "+f".into(),
+            code: -6,
+        };
+        assert!(!is_cat_powered_off_error(&io_err, false, true));
+        assert!(!is_cat_powered_off_error(
+            &RigctldError::PermissionDenied("denied".into()),
+            false,
+            true
+        ));
+        assert!(!is_cat_powered_off_error(
+            &RigctldError::PortBusy(4532),
+            false,
+            true
+        ));
+        assert!(!is_cat_powered_off_error(
+            &RigctldError::ExitedEarly("crash".into()),
+            false,
+            false
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checks_serial_rw_access_without_opening() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("mock_tty");
+        std::fs::write(&file_path, b"").unwrap();
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let path_str = file_path.to_str().unwrap();
+        assert!(check_serial_rw_access(path_str).is_ok());
+
+        // SAFETY: geteuid() is always safe to call.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let res = check_serial_rw_access(path_str);
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(matches!(res, Err(RigctldError::PermissionDenied(_))));
+        }
     }
 }
