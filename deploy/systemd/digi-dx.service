@@ -1,0 +1,33 @@
+[Unit]
+Description=Digi-Dx v2 Local FT8 & Transceiver Daemon
+Documentation=https://github.com/mpmbq2/digi-dx
+After=network-online.target sound.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=digi-dx
+Group=digi-dx
+SupplementaryGroups=dialout plugdev audio
+EnvironmentFile=-/etc/digi-dx/digi-dx.env
+Environment=DIGI_DX_BIND=0.0.0.0
+Environment=DIGI_DX_PORT=8788
+Environment=DIGI_DX_DATA_DIR=/var/lib/digi-dx
+Environment=RUST_LOG=info,digi_dx=info
+ExecStartPre=/usr/local/bin/digi-dx preflight --fail-on-fatal
+ExecStart=/usr/local/bin/digi-dx serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+KillMode=mixed
+
+# Hardening while preserving /dev serial + audio access and local state writes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=false
+ReadWritePaths=/var/lib/digi-dx /tmp
+DevicePolicy=auto
+
+[Install]
+WantedBy=multi-user.target

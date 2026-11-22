@@ -1,0 +1,27 @@
+# Digi-Dx v2 — Amateur Radio USB-Serial CAT & USB Audio Device Permissions
+# Grants non-root access to serial CAT interfaces (dialout) and audio interfaces (audio),
+# and tags devices with uaccess for active local desktop sessions.
+
+# --- Common USB-to-Serial Bridges (CAT / PTT Control) ---
+# FTDI (FT232R, FT232H, FT2232D/H — Elecraft, Yaesu SCU-17, SignaLink/RT Systems cables)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{DIGI_DX_CAT_CANDIDATE}="1"
+
+# Silicon Labs CP210x (Icom IC-7300/705/9700, Yaesu FT-991A/FTDX10, Kenwood TS-590/890)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60|ea70|ea71", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{DIGI_DX_CAT_CANDIDATE}="1"
+
+# Prolific PL2303 (older Kenwood TS-570S/2000 USB-RS232 adapters)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="2303|23a3|23c3", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{DIGI_DX_CAT_CANDIDATE}="1"
+
+# WCH CH340 / CH341 (budget CAT cables, QRP transceivers, DigiRig Lite)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523|5523|55d4", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{DIGI_DX_CAT_CANDIDATE}="1"
+
+# Microchip / Generic CDC-ACM (QRP Labs QMX/QDX, Flex/SDR bridges)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="04d8|0483|2e8a", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{DIGI_DX_CAT_CANDIDATE}="1"
+
+# --- Common Ham USB Audio Codecs (SignaLink USB, DigiRig, Transceiver Built-in Audio) ---
+# Texas Instruments PCM2900/2901/2902/2904/2906 (SignaLink USB, Icom IC-7300/7100, Kenwood)
+SUBSYSTEM=="sound", ATTRS{idVendor}=="08bb", MODE="0660", GROUP="audio", TAG+="uaccess", ENV{DIGI_DX_AUDIO_CANDIDATE}="1"
+
+# C-Media CM108/CM119/CM6206 (DigiRig Mobile, AllStar/RIM audio interfaces)
+SUBSYSTEM=="sound", ATTRS{idVendor}=="0d8c", MODE="0660", GROUP="audio", TAG+="uaccess", ENV{DIGI_DX_AUDIO_CANDIDATE}="1"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0d8c", MODE="0660", GROUP="plugdev", TAG+="uaccess"
