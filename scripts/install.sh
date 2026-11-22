@@ -699,8 +699,7 @@ verify_installation() {
 
   if [[ $NO_SERVICE -eq 0 ]]; then
     local ok=0
-    local i
-    for i in 1 2 3 4 5; do
+    for _ in 1 2 3 4 5; do
       if curl -fsS http://127.0.0.1:8788/api/v1/health >/dev/null 2>&1; then
         ok=1
         break

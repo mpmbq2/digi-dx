@@ -6,13 +6,18 @@ import path from "node:path";
 import { chromium } from "playwright-core";
 
 function findBrowserExecutable() {
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
+    return process.env.CHROME_PATH;
+  }
   const pwRoot = path.join(os.homedir(), ".cache", "ms-playwright");
   if (fs.existsSync(pwRoot)) {
     const entries = fs.readdirSync(pwRoot).sort().reverse();
     for (const dir of entries) {
       const candidates = [
         path.join(pwRoot, dir, "chrome-linux", "chrome"),
+        path.join(pwRoot, dir, "chrome-linux64", "chrome"),
         path.join(pwRoot, dir, "chrome-linux", "headless_shell"),
+        path.join(pwRoot, dir, "chrome-linux64", "headless_shell"),
       ];
       for (const c of candidates) {
         if (fs.existsSync(c)) return c;
@@ -41,9 +46,11 @@ async function waitForHealth(baseUrl, timeoutMs = 15000) {
 
 async function main() {
   const repoRoot = path.resolve(import.meta.dirname, "..", "..");
-  const binPath = path.join(repoRoot, "target", "release", "digi-dx");
+  const binPath = process.env.DIGI_DX_BIN
+    ? path.resolve(process.env.DIGI_DX_BIN)
+    : path.join(repoRoot, "target", "release", "digi-dx");
   if (!fs.existsSync(binPath)) {
-    throw new Error(`Release binary not found at ${binPath}; run 'make build' first`);
+    throw new Error(`Binary not found at ${binPath}; run 'make build' (or set DIGI_DX_BIN)`);
   }
 
   const tmpData = fs.mkdtempSync(path.join(os.tmpdir(), "digi-dx-pw-"));
