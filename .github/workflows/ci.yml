@@ -2,46 +2,72 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+      - mvp-rebuild
   pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  verify:
+  test-and-lint:
+    name: Linux x86_64 Test & Lint
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libhamlib-utils shellcheck
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          # Full history: smoke independence resolves a merge base against main
-          # and fails closed when none exists (shallow checkout would red-gate).
-          fetch-depth: 0
+          components: rustfmt, clippy
 
-      - name: Fetch base branch
-        run: git fetch --no-tags origin main:refs/remotes/origin/main
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
+          cache-dependency-path: ui/package-lock.json
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install, typecheck, and build UI
+        run: make ui-deps && make ui-check && make ui-build
 
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
+      - name: Run Rust and script linters
+        run: make lint
 
-      - name: Unit and integration tests
-        run: npm test
+      - name: Verify installer dry-run
+        run: ./scripts/install.sh --dry-run --from-source --no-jt9
 
-      - name: Daemon build
-        run: npm run build
+      - name: Run Rust unit and integration tests
+        run: cargo test
 
-      - name: Client typecheck
-        run: npm run typecheck
+      - name: Build debug daemon binary for browser smoke test
+        run: cargo build
 
-      - name: Headless QSO smoke
-        run: npm run smoke
+      - name: Ensure headless Chromium is available
+        run: |
+          if [[ ! -x /usr/bin/google-chrome && ! -x /usr/bin/chromium && ! -x /usr/bin/chromium-browser ]]; then
+            cd ui && npx playwright-core install chromium --with-deps
+          fi
 
-      - name: Web UI smoke
-        run: npm run smoke:ui
+      - name: Run Playwright browser smoke test
+        run: DIGI_DX_BIN="$PWD/target/debug/digi-dx" npm --prefix ui run test:browser

@@ -1,6 +1,0 @@
-{
-  "name": "digi-dx",
-  "image": "mcr.microsoft.com/devcontainers/javascript-node:20",
-  "postCreateCommand": "npm ci && npx playwright install --with-deps chromium",
-  "forwardPorts": [8080, 8788]
-}
