@@ -1,0 +1,37 @@
+[package]
+name = "digi-dx"
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+description = "Single-process local FT8 operating daemon with embedded LAN web UI"
+default-run = "digi-dx"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+async-trait = "0.1"
+subtle = "2"
+tokio-util = "0.7"
+futures-util = "0.3"
+notify = "8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

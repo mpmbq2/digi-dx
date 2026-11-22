@@ -7,3 +7,9 @@ artifacts/
 vendor/engine/*/
 vendor/engine/manifest.json
 !vendor/engine/.gitkeep
+target/
+ui/node_modules/
+ui/dist/
+*.db
+*.db-wal
+*.db-shm
