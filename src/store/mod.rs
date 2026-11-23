@@ -75,6 +75,7 @@ pub struct UpsertChannelRosterInput {
     pub calling_me: bool,
     pub station_role: Option<String>,
     pub seen_ts_sec: i64,
+    pub increment_decode_count: bool,
 }
 
 #[derive(Debug, Error)]
@@ -1198,6 +1199,11 @@ impl StateStore {
     ) -> Result<(), StoreError> {
         let conn = self.lock()?;
         let cutoff = now_wall_ms - CHANNEL_ROSTER_WINDOW_MS;
+        let count_delta = if input.increment_decode_count {
+            1_i64
+        } else {
+            0_i64
+        };
         conn.execute(
             "INSERT INTO channel_roster (
                 is_demo, channel_key, callsign, mode, dial_freq_hz, band, grid,
@@ -1220,8 +1226,11 @@ impl StateStore {
                 calling_me = excluded.calling_me,
                 station_role = excluded.station_role,
                 last_seen_ts_sec = excluded.last_seen_ts_sec,
-                last_seen_wall_ms = excluded.last_seen_wall_ms,
-                decode_count = channel_roster.decode_count + 1",
+                last_seen_wall_ms = CASE
+                    WHEN ?20 > 0 THEN excluded.last_seen_wall_ms
+                    ELSE channel_roster.last_seen_wall_ms
+                END,
+                decode_count = channel_roster.decode_count + ?20",
             params![
                 if input.is_demo { 1_i64 } else { 0_i64 },
                 input.channel_key,
@@ -1242,6 +1251,7 @@ impl StateStore {
                 input.seen_ts_sec,
                 input.seen_ts_sec,
                 now_wall_ms,
+                count_delta,
             ],
         )?;
         conn.execute(
@@ -1527,10 +1537,45 @@ mod tests {
                     calling_me: false,
                     station_role: Some("caller".into()),
                     seen_ts_sec: 1_700_000_000,
+                    increment_decode_count: true,
                 },
                 t0,
             )
             .unwrap();
+
+        // Refined multi-pass update (increment_decode_count: false) must refresh SNR/AF without inflating count
+        store
+            .upsert_channel_roster_entry(
+                &UpsertChannelRosterInput {
+                    is_demo: false,
+                    channel_key: ch_20m.clone(),
+                    callsign: "JA1ABC".into(),
+                    mode: "FT8".into(),
+                    dial_freq_hz: Some(14_074_000),
+                    band: Some("20m".into()),
+                    grid: Some("PM95".into()),
+                    last_snr_db: -9,
+                    last_dt_sec: 0.1,
+                    last_af_hz: 1422,
+                    last_slot: "even".into(),
+                    last_message: "CQ JA1ABC PM95".into(),
+                    is_cq: true,
+                    directed_cq: None,
+                    calling_me: false,
+                    station_role: Some("caller".into()),
+                    seen_ts_sec: 1_700_000_000,
+                    increment_decode_count: false,
+                },
+                t0 + 1_700,
+            )
+            .unwrap();
+
+        let after_refine = store
+            .list_channel_roster(false, &ch_20m, t0 + 1_700)
+            .unwrap();
+        assert_eq!(after_refine[0].decode_count, 1);
+        assert_eq!(after_refine[0].last_snr_db, -9);
+        assert_eq!(after_refine[0].last_af_hz, 1422);
 
         // Follow-up message where station acts as Hunter must preserve PM95 and switch station_role
         store
@@ -1553,6 +1598,7 @@ mod tests {
                     calling_me: false,
                     station_role: Some("hunter".into()),
                     seen_ts_sec: 1_700_000_030,
+                    increment_decode_count: true,
                 },
                 t0 + 30_000,
             )
@@ -1579,6 +1625,7 @@ mod tests {
                     calling_me: false,
                     station_role: Some("caller".into()),
                     seen_ts_sec: 1_700_000_030,
+                    increment_decode_count: true,
                 },
                 t0 + 30_000,
             )

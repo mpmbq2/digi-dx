@@ -148,6 +148,32 @@ impl Ft8LibTxModulator {
         Self::synthesize_gfsk(&tones, af_hz, sample_rate)
     }
 
+    /// Generate FT8 GFSK PCM starting `offset_ms` into the slot so late TX and mid-slot
+    /// hot-swaps remain UTC-symbol-aligned and finish at t = 12.64 s with a smooth fade-in.
+    pub fn modulate_pcm_from_offset(
+        message: &str,
+        af_hz: f32,
+        sample_rate: u32,
+        offset_ms: u64,
+    ) -> Result<Vec<f32>, ModemError> {
+        let mut signal = Self::modulate_pcm(message, af_hz, sample_rate)?;
+        if offset_ms == 0 {
+            return Ok(signal);
+        }
+        let skip_samples = ((offset_ms as f64) * (sample_rate as f64) / 1000.0).round() as usize;
+        if skip_samples >= signal.len() {
+            return Ok(Vec::new());
+        }
+        let mut tail = signal.split_off(skip_samples);
+        let n_spsym = (0.5 + (sample_rate as f64) * FT8_SYMBOL_PERIOD_SEC) as usize;
+        let n_ramp = (n_spsym / 8).max(1).min(tail.len());
+        for (i, s) in tail.iter_mut().take(n_ramp).enumerate() {
+            let env = (1.0 - (2.0 * PI * (i as f64) / (2.0 * (n_ramp as f64))).cos()) * 0.5;
+            *s *= env as f32;
+        }
+        Ok(tail)
+    }
+
     /// Generate a full 15.0-second slot PCM buffer with leading and trailing silence.
     pub fn modulate_slot_pcm(
         message: &str,
@@ -242,5 +268,32 @@ impl Ft8Decoder for Ft8LibEmbeddedDecoder {
         tokio::task::spawn_blocking(move || decoder.decode_slot_sync(slot_ts, &pcm))
             .await
             .map_err(|e| ModemError::DecodeFailed(format!("ft8_lib blocking task failed: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offset_modulation_truncates_leading_samples_with_smooth_fade_in() {
+        let full = Ft8LibTxModulator::modulate_pcm("CQ N1MPM FN33", 1500.0, 48_000).unwrap();
+        assert_eq!(full.len(), 606_720);
+
+        let zero_off =
+            Ft8LibTxModulator::modulate_pcm_from_offset("CQ N1MPM FN33", 1500.0, 48_000, 0)
+                .unwrap();
+        assert_eq!(zero_off.len(), full.len());
+
+        let late_5s =
+            Ft8LibTxModulator::modulate_pcm_from_offset("CQ N1MPM FN33", 1500.0, 48_000, 5_000)
+                .unwrap();
+        assert_eq!(late_5s.len(), 606_720 - 240_000);
+        assert!(late_5s[0].abs() < 1e-6);
+
+        let past_end =
+            Ft8LibTxModulator::modulate_pcm_from_offset("CQ N1MPM FN33", 1500.0, 48_000, 15_000)
+                .unwrap();
+        assert!(past_end.is_empty());
     }
 }

@@ -228,6 +228,8 @@ pub enum WsBroadcastEvent {
         mode: String,
         message: String,
         decoder_backend: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decoder_metadata: Option<String>,
     },
     TxState {
         radio_id: String,

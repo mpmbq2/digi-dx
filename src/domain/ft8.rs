@@ -85,17 +85,34 @@ pub fn infer_station_role(parsed: &ParsedFt8Message) -> Option<StationRole> {
     }
 }
 
-/// Strip trailing WSJT-X / jt9 decoder-pass metadata starting at `?` (e.g. `? a1`).
+fn is_wsjtx_ap_token(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    (bytes.len() == 2 || bytes.len() == 3)
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(u8::is_ascii_digit)
+}
+
+/// Strip trailing WSJT-X / jt9 decoder-pass metadata while returning it separately:
+/// - Anything starting at `?` (e.g. `? a1`, `?`)
+/// - Trailing standalone lowercase AP/quality tags without `?` (e.g. `a1`, `a2`, `a31`, `q0`)
 pub fn strip_decoder_metadata(raw: &str) -> (&str, Option<&str>) {
     let trimmed = raw.trim();
     if let Some(idx) = trimmed.find('?') {
         let msg = trimmed[..idx].trim_end();
         let meta = trimmed[idx..].trim();
         let meta_opt = if meta.is_empty() { None } else { Some(meta) };
-        (msg, meta_opt)
-    } else {
-        (trimmed, None)
+        return (msg, meta_opt);
     }
+
+    if let Some(last_ws) = trimmed.rfind(char::is_whitespace) {
+        let tail = trimmed[last_ws..].trim();
+        if is_wsjtx_ap_token(tail) {
+            let msg = trimmed[..last_ws].trim_end();
+            return (msg, Some(tail));
+        }
+    }
+
+    (trimmed, None)
 }
 
 pub fn is_terminal_payload(token: &str) -> bool {
@@ -357,6 +374,22 @@ mod tests {
         let (clean2, meta2) = strip_decoder_metadata("WM8Q DL0EO -17");
         assert_eq!(clean2, "WM8Q DL0EO -17");
         assert_eq!(meta2, None);
+
+        let (clean3, meta3) = strip_decoder_metadata("CQ LZ1JZ KN22                         a1");
+        assert_eq!(clean3, "CQ LZ1JZ KN22");
+        assert_eq!(meta3, Some("a1"));
+
+        let (clean4, meta4) = strip_decoder_metadata("CQ DX K1ABC FN42   a7");
+        assert_eq!(clean4, "CQ DX K1ABC FN42");
+        assert_eq!(meta4, Some("a7"));
+
+        let (clean5, meta5) = strip_decoder_metadata("K1ABC N1MPM R-10   q0");
+        assert_eq!(clean5, "K1ABC N1MPM R-10");
+        assert_eq!(meta5, Some("q0"));
+
+        let (clean6, meta6) = strip_decoder_metadata("K1ABC N1MPM A1");
+        assert_eq!(clean6, "K1ABC N1MPM A1");
+        assert_eq!(meta6, None);
     }
 
     #[test]

@@ -25,6 +25,7 @@ import type {
   UsbInventoryEntry,
   WaterfallEvent,
 } from "../types";
+import { reconcileDecode } from "../utils/decodes";
 import { formatChannelKey } from "../utils/maidenhead";
 
 function makeActorId(): string {
@@ -414,6 +415,11 @@ export function useDaemonSocket(): DaemonState {
                 : "Session stopped"
             );
           } else if (evType === "decode") {
+            const rawMeta =
+              typeof parsed.decoder_metadata === "string" &&
+              parsed.decoder_metadata.trim().length > 0
+                ? parsed.decoder_metadata.trim()
+                : null;
             const dec: DecodeItem = {
               ts_sec: Number(parsed.ts_sec ?? 0),
               slot: (String(parsed.slot ?? "even") === "odd" ? "odd" : "even") as SlotParity,
@@ -422,8 +428,9 @@ export function useDaemonSocket(): DaemonState {
               af_hz: Number(parsed.af_hz ?? 1500),
               message: String(parsed.message ?? ""),
               decoder_backend: String(parsed.decoder_backend ?? "jt9"),
+              decoder_metadata: rawMeta,
             };
-            setRecentDecodes((prev) => [dec, ...prev].slice(0, 300));
+            setRecentDecodes((prev) => reconcileDecode(prev, dec));
           } else if (evType === "roster_update") {
             const chKey = String(parsed.channel_key ?? "");
             const isDemoEv = Boolean(parsed.is_demo);

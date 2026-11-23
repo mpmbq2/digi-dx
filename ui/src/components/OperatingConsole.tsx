@@ -625,7 +625,9 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                     const showCycleGap =
                       idx > 0 && d.ts_sec !== filteredDecodes[idx - 1].ts_sec;
                     return (
-                      <Fragment key={`${d.ts_sec}-${d.af_hz}-${idx}`}>
+                      <Fragment
+                        key={`${d.ts_sec}-${d.message}-${Math.round(d.af_hz / 30)}`}
+                      >
                         {showCycleGap && (
                           <tr
                             class="decode-cycle-gap"
@@ -661,7 +663,28 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                           </td>
                           <td>{d.snr_db >= 0 ? `+${d.snr_db}` : d.snr_db}</td>
                           <td>{d.af_hz}</td>
-                          <td class="msg-cell">{d.message}</td>
+                          <td class="msg-cell">
+                            <div class="msg-cell-inner">
+                              <span class="msg-cell-text">{d.message}</span>
+                              {d.decoder_metadata && (
+                                <span
+                                  data-testid="decode-meta-tag"
+                                  class={`decode-meta-tag ${
+                                    d.decoder_metadata.includes("?")
+                                      ? "decode-meta-uncertain"
+                                      : "decode-meta-ap"
+                                  }`}
+                                  title={
+                                    d.decoder_metadata.includes("?")
+                                      ? `Low-confidence AP decode (${d.decoder_metadata})`
+                                      : `A Priori (AP) assisted decode (${d.decoder_metadata})`
+                                  }
+                                >
+                                  {d.decoder_metadata}
+                                </span>
+                              )}
+                            </div>
+                          </td>
                           <td>
                             <button
                               type="button"

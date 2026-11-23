@@ -77,6 +77,37 @@ impl AudioCaptureHandle {
         std::mem::take(&mut *guard)
     }
 
+    /// Clone all samples currently buffered for the active slot without removing them.
+    pub fn snapshot_slot_samples(&self) -> Vec<f32> {
+        let guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
+        guard.clone()
+    }
+
+    /// Prepend `count` zero samples so a live session started mid-slot preserves FT8 DT alignment.
+    pub fn seed_leading_silence(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
+        let capped = count.min(FT8_SLOT_SAMPLES_12K);
+        let mut padded = Vec::with_capacity(capped + guard.len());
+        padded.resize(capped, 0.0);
+        padded.extend_from_slice(&guard);
+        *guard = padded;
+    }
+
+    /// Advance the capture buffer to a newly opened slot boundary, retaining only the newest
+    /// `keep_tail_samples` captured after the boundary instant.
+    pub fn reset_for_new_slot(&self, keep_tail_samples: usize) {
+        let mut guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
+        if keep_tail_samples == 0 {
+            guard.clear();
+        } else if guard.len() > keep_tail_samples {
+            let drop_count = guard.len() - keep_tail_samples;
+            guard.drain(..drop_count);
+        }
+    }
+
     pub fn discard_oldest_samples(&self, count: usize) {
         let mut guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
         let n = count.min(guard.len());
@@ -88,6 +119,15 @@ impl AudioCaptureHandle {
             .lock()
             .expect("slot buffer lock poisoned")
             .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_slot_buffer_for_test(slot_buffer: Arc<Mutex<Vec<f32>>>) -> Self {
+        Self {
+            stop_tx: None,
+            join: None,
+            slot_buffer,
+        }
     }
 
     pub fn stop(&mut self) {
@@ -106,11 +146,19 @@ impl Drop for AudioCaptureHandle {
     }
 }
 
+struct PlaybackBuffer {
+    pcm: Vec<f32>,
+    cursor: usize,
+}
+
 pub struct AudioPlaybackHandle {
     abort_flag: Arc<AtomicBool>,
     finished_flag: Arc<AtomicBool>,
-    stop_tx: Option<std_mpsc::Sender<()>>,
-    join: Option<std::thread::JoinHandle<()>>,
+    buffer: Arc<Mutex<PlaybackBuffer>>,
+    out_rate: u32,
+    tx_gain_db: f64,
+    stop_tx: Mutex<Option<std_mpsc::Sender<()>>>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl AudioPlaybackHandle {
@@ -123,10 +171,15 @@ impl AudioPlaybackHandle {
         let target = device_name.to_string();
         let abort_flag = Arc::new(AtomicBool::new(false));
         let finished_flag = Arc::new(AtomicBool::new(false));
+        let buffer = Arc::new(Mutex::new(PlaybackBuffer {
+            pcm: Vec::new(),
+            cursor: 0,
+        }));
         let abort_worker = Arc::clone(&abort_flag);
         let finished_worker = Arc::clone(&finished_flag);
+        let buffer_worker = Arc::clone(&buffer);
 
-        let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<(), AudioError>>(1);
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<u32, AudioError>>(1);
         let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
 
         let join = std::thread::Builder::new()
@@ -136,6 +189,7 @@ impl AudioPlaybackHandle {
                     target,
                     samples_48k,
                     tx_gain_db,
+                    buffer_worker,
                     abort_worker,
                     finished_worker,
                     on_fault,
@@ -146,11 +200,14 @@ impl AudioPlaybackHandle {
             .map_err(|e| AudioError::StreamError(format!("failed to spawn TX thread: {e}")))?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(out_rate)) => Ok(Self {
                 abort_flag,
                 finished_flag,
-                stop_tx: Some(stop_tx),
-                join: Some(join),
+                buffer,
+                out_rate,
+                tx_gain_db,
+                stop_tx: Mutex::new(Some(stop_tx)),
+                join: Mutex::new(Some(join)),
             }),
             Ok(Err(e)) => {
                 let _ = join.join();
@@ -165,6 +222,30 @@ impl AudioPlaybackHandle {
         }
     }
 
+    /// Hot-swap the active TX playback buffer in place without dropping PTT or reopening audio.
+    pub fn replace_samples(&self, samples_48k: Vec<f32>) -> Result<(), AudioError> {
+        let mut pcm = resample_mono(&samples_48k, DSP_SAMPLE_RATE, self.out_rate)?;
+        apply_gain_db(&mut pcm, self.tx_gain_db);
+
+        let mut guard = self.buffer.lock().expect("tx playback buffer poisoned");
+        let prev_sample = guard
+            .pcm
+            .get(guard.cursor.saturating_sub(1))
+            .copied()
+            .unwrap_or(0.0);
+        if prev_sample.abs() > 1e-4 && !pcm.is_empty() {
+            let decay_len = ((self.out_rate as usize) / 500).max(1).min(pcm.len());
+            for (i, s) in pcm.iter_mut().take(decay_len).enumerate() {
+                let t = 1.0 - (i as f32) / (decay_len as f32);
+                *s = (*s + prev_sample * t).clamp(-0.98, 0.98);
+            }
+        }
+        guard.pcm = pcm;
+        guard.cursor = 0;
+        self.finished_flag.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn abort_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.abort_flag)
     }
@@ -177,13 +258,31 @@ impl AudioPlaybackHandle {
         self.abort_flag.store(true, Ordering::SeqCst);
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         self.abort();
-        if let Some(tx) = self.stop_tx.take() {
+        if let Some(tx) = self.stop_tx.lock().expect("tx stop_tx poisoned").take() {
             let _ = tx.send(());
         }
-        if let Some(j) = self.join.take() {
+        if let Some(j) = self.join.lock().expect("tx join poisoned").take() {
             let _ = j.join();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_buffer_for_test(
+        pcm: Vec<f32>,
+        cursor: usize,
+        out_rate: u32,
+        tx_gain_db: f64,
+    ) -> Self {
+        Self {
+            abort_flag: Arc::new(AtomicBool::new(false)),
+            finished_flag: Arc::new(AtomicBool::new(cursor >= pcm.len())),
+            buffer: Arc::new(Mutex::new(PlaybackBuffer { pcm, cursor })),
+            out_rate,
+            tx_gain_db,
+            stop_tx: Mutex::new(None),
+            join: Mutex::new(None),
         }
     }
 }
@@ -417,13 +516,14 @@ fn run_playback_thread(
     device_name: String,
     samples_48k: Vec<f32>,
     tx_gain_db: f64,
+    buffer: Arc<Mutex<PlaybackBuffer>>,
     abort_flag: Arc<AtomicBool>,
     finished_flag: Arc<AtomicBool>,
     on_fault: FaultCallback,
-    ready_tx: std_mpsc::SyncSender<Result<(), AudioError>>,
+    ready_tx: std_mpsc::SyncSender<Result<u32, AudioError>>,
     stop_rx: std_mpsc::Receiver<()>,
 ) {
-    let stream = {
+    let (stream, out_rate) = {
         let _open_guard = lock_audio_open();
         let Some(dev) = resolve_cpal_output_device(&device_name) else {
             let _ = ready_tx.send(Err(AudioError::DeviceNotFound(device_name)));
@@ -449,34 +549,37 @@ fn run_playback_thread(
         };
         apply_gain_db(&mut pcm, tx_gain_db);
 
-        let cursor = Arc::new(Mutex::new(0_usize));
-        let pcm_arc = Arc::new(pcm);
+        {
+            let mut guard = buffer.lock().expect("tx playback buffer poisoned");
+            guard.pcm = pcm;
+            guard.cursor = 0;
+        }
         let err_fn = move |err: cpal::StreamError| {
             on_fault(format!("TX audio stream error: {err}"));
         };
 
         let stream_res = match fmt {
             SampleFormat::F32 => {
-                let cur = Arc::clone(&cursor);
-                let p = Arc::clone(&pcm_arc);
+                let buf = Arc::clone(&buffer);
                 let ab = Arc::clone(&abort_flag);
                 let fin = Arc::clone(&finished_flag);
                 dev.build_output_stream(
                     &config,
                     move |data: &mut [f32], _| {
-                        let mut idx = cur.lock().expect("tx cursor poisoned");
+                        let mut guard = buf.lock().expect("tx playback buffer poisoned");
                         for frame in data.chunks_mut(channels) {
-                            let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
-                                fin.store(true, Ordering::SeqCst);
-                                0.0
-                            } else {
-                                let s = p[*idx];
-                                *idx += 1;
-                                if *idx >= p.len() {
+                            let val =
+                                if ab.load(Ordering::SeqCst) || guard.cursor >= guard.pcm.len() {
                                     fin.store(true, Ordering::SeqCst);
-                                }
-                                s
-                            };
+                                    0.0
+                                } else {
+                                    let s = guard.pcm[guard.cursor];
+                                    guard.cursor += 1;
+                                    if guard.cursor >= guard.pcm.len() {
+                                        fin.store(true, Ordering::SeqCst);
+                                    }
+                                    s
+                                };
                             frame.fill(val);
                         }
                     },
@@ -485,26 +588,27 @@ fn run_playback_thread(
                 )
             }
             SampleFormat::I16 => {
-                let cur = Arc::clone(&cursor);
-                let p = Arc::clone(&pcm_arc);
+                let buf = Arc::clone(&buffer);
                 let ab = Arc::clone(&abort_flag);
                 let fin = Arc::clone(&finished_flag);
                 dev.build_output_stream(
                     &config,
                     move |data: &mut [i16], _| {
-                        let mut idx = cur.lock().expect("tx cursor poisoned");
+                        let mut guard = buf.lock().expect("tx playback buffer poisoned");
                         for frame in data.chunks_mut(channels) {
-                            let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
-                                fin.store(true, Ordering::SeqCst);
-                                0_i16
-                            } else {
-                                let s = (p[*idx].clamp(-1.0, 1.0) * 32767.0).round() as i16;
-                                *idx += 1;
-                                if *idx >= p.len() {
+                            let val =
+                                if ab.load(Ordering::SeqCst) || guard.cursor >= guard.pcm.len() {
                                     fin.store(true, Ordering::SeqCst);
-                                }
-                                s
-                            };
+                                    0_i16
+                                } else {
+                                    let s = (guard.pcm[guard.cursor].clamp(-1.0, 1.0) * 32767.0)
+                                        .round() as i16;
+                                    guard.cursor += 1;
+                                    if guard.cursor >= guard.pcm.len() {
+                                        fin.store(true, Ordering::SeqCst);
+                                    }
+                                    s
+                                };
                             frame.fill(val);
                         }
                     },
@@ -513,27 +617,28 @@ fn run_playback_thread(
                 )
             }
             SampleFormat::U16 => {
-                let cur = Arc::clone(&cursor);
-                let p = Arc::clone(&pcm_arc);
+                let buf = Arc::clone(&buffer);
                 let ab = Arc::clone(&abort_flag);
                 let fin = Arc::clone(&finished_flag);
                 dev.build_output_stream(
                     &config,
                     move |data: &mut [u16], _| {
-                        let mut idx = cur.lock().expect("tx cursor poisoned");
+                        let mut guard = buf.lock().expect("tx playback buffer poisoned");
                         for frame in data.chunks_mut(channels) {
-                            let val = if ab.load(Ordering::SeqCst) || *idx >= p.len() {
-                                fin.store(true, Ordering::SeqCst);
-                                32768_u16
-                            } else {
-                                let s =
-                                    ((p[*idx].clamp(-1.0, 1.0) * 32767.0) + 32768.0).round() as u16;
-                                *idx += 1;
-                                if *idx >= p.len() {
+                            let val =
+                                if ab.load(Ordering::SeqCst) || guard.cursor >= guard.pcm.len() {
                                     fin.store(true, Ordering::SeqCst);
-                                }
-                                s
-                            };
+                                    32768_u16
+                                } else {
+                                    let s = ((guard.pcm[guard.cursor].clamp(-1.0, 1.0) * 32767.0)
+                                        + 32768.0)
+                                        .round() as u16;
+                                    guard.cursor += 1;
+                                    if guard.cursor >= guard.pcm.len() {
+                                        fin.store(true, Ordering::SeqCst);
+                                    }
+                                    s
+                                };
                             frame.fill(val);
                         }
                     },
@@ -558,7 +663,7 @@ fn run_playback_thread(
         };
         // Drop cpal::Device so unused capture handle is released immediately.
         drop(dev);
-        stream
+        (stream, out_rate)
     };
 
     if let Err(e) = stream.play() {
@@ -566,7 +671,59 @@ fn run_playback_thread(
         return;
     }
 
-    let _ = ready_tx.send(Ok(()));
+    let _ = ready_tx.send(Ok(out_rate));
     let _ = stop_rx.recv();
     drop(stream);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_seed_and_reset_preserve_slot_alignment() {
+        let buf = Arc::new(Mutex::new(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let handle = AudioCaptureHandle::from_slot_buffer_for_test(buf);
+
+        // Non-destructive snapshot leaves samples intact across multiple passes.
+        assert_eq!(handle.snapshot_slot_samples(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(handle.snapshot_slot_samples(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(handle.buffered_len(), 4);
+
+        // Leading silence seeding prepends zeros and caps at FT8_SLOT_SAMPLES_12K.
+        handle.seed_leading_silence(3);
+        assert_eq!(
+            handle.snapshot_slot_samples(),
+            vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0]
+        );
+
+        // Boundary reset retains only the newest `keep_tail_samples`.
+        handle.reset_for_new_slot(2);
+        assert_eq!(handle.snapshot_slot_samples(), vec![3.0, 4.0]);
+
+        // Zero tail clears completely.
+        handle.reset_for_new_slot(0);
+        assert!(handle.snapshot_slot_samples().is_empty());
+
+        // Seeding over FT8_SLOT_SAMPLES_12K is capped safely.
+        handle.seed_leading_silence(FT8_SLOT_SAMPLES_12K + 500);
+        assert_eq!(handle.buffered_len(), FT8_SLOT_SAMPLES_12K);
+    }
+
+    #[test]
+    fn playback_replace_samples_resets_cursor_and_blends_transition() {
+        let handle =
+            AudioPlaybackHandle::from_buffer_for_test(vec![0.8_f32; 100], 100, 48_000, 0.0);
+        assert!(handle.is_finished());
+
+        handle.replace_samples(vec![0.0_f32; 480]).unwrap();
+        assert!(!handle.is_finished());
+
+        let guard = handle.buffer.lock().unwrap();
+        assert_eq!(guard.cursor, 0);
+        assert_eq!(guard.pcm.len(), 480);
+        // Leading sample smoothly blends down from previous 0.8 instead of jumping abruptly.
+        assert!((guard.pcm[0] - 0.8).abs() < 1e-4);
+        assert!(guard.pcm[96].abs() < 1e-4);
+    }
 }
