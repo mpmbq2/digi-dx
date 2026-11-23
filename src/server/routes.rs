@@ -10,8 +10,10 @@ use serde_json::{json, Value};
 
 use crate::command_bus::{CommandEnvelope, CommandStatus, ErrorCode, WsBroadcastEvent};
 use crate::domain::adif::export_adif_3_1_4;
+use crate::domain::bands::derive_band;
 use crate::preflight::run_preflight;
 use crate::server::AppState;
+use crate::store::channel_key_for_freq;
 use crate::telemetry::TelemetryEnvelope;
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -162,6 +164,10 @@ pub fn build_radio_summaries(state: &AppState) -> Result<Vec<Value>, String> {
             let freq_hz = snap
                 .and_then(|s| s.freq_hz)
                 .or_else(|| p.last_dial_freq_hz.and_then(|f| u64::try_from(f).ok()));
+            let capabilities = snap
+                .and_then(|s| s.capabilities.clone())
+                .or_else(|| state.supervisor.get_capabilities_for_model(p.hamlib_model));
+            let settings = snap.map(|s| s.settings.clone());
             json!({
                 "profile": p,
                 "lifecycle_state": lifecycle_state,
@@ -175,6 +181,8 @@ pub fn build_radio_summaries(state: &AppState) -> Result<Vec<Value>, String> {
                 "last_error": snap.and_then(|s| s.last_error.clone()),
                 "recovery_attempts": snap.map(|s| s.recovery_attempts).unwrap_or(0),
                 "lease_holder": lease_holder,
+                "capabilities": capabilities,
+                "settings": settings,
             })
         })
         .collect();
@@ -336,6 +344,58 @@ pub async fn qsos_export_adi(State(state): State<Arc<AppState>>) -> impl IntoRes
 pub async fn outbox_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.store.outbox_stats(&state.sink_name) {
         Ok(stats) => (StatusCode::OK, Json(json!(stats))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "INTERNAL_ERROR", "message": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RosterQuery {
+    pub freq_hz: Option<i64>,
+    pub channel_key: Option<String>,
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub demo: bool,
+}
+
+pub async fn roster(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<RosterQuery>,
+) -> impl IntoResponse {
+    let mode = q.mode.as_deref().unwrap_or("FT8");
+    let channel_key = q
+        .channel_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| channel_key_for_freq(mode, q.freq_hz));
+    let band = q
+        .freq_hz
+        .and_then(|hz| u64::try_from(hz).ok())
+        .and_then(derive_band)
+        .map(str::to_string);
+    let now_wall_ms = Utc::now().timestamp_millis();
+
+    match state
+        .store
+        .list_channel_roster(q.demo, &channel_key, now_wall_ms)
+    {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(json!({
+                "channel_key": channel_key,
+                "band": band,
+                "dial_freq_hz": q.freq_hz,
+                "demo": q.demo,
+                "window_sec": 300,
+                "items": items,
+            })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "INTERNAL_ERROR", "message": e.to_string() })),

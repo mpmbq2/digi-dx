@@ -13,3 +13,4 @@ ui/dist/
 *.db
 *.db-wal
 *.db-shm
+.worktrees/

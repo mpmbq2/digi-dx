@@ -159,6 +159,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/commands", post(routes::dispatch_command))
         .route("/api/v1/qsos", get(routes::qsos))
         .route("/api/v1/qsos/export.adi", get(routes::qsos_export_adi))
+        .route("/api/v1/roster", get(routes::roster))
         .route("/api/v1/outbox/stats", get(routes::outbox_stats))
         .route("/api/v1/ws", get(ws::ws_handler))
         .fallback(assets::serve_embedded_ui)

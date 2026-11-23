@@ -19,12 +19,16 @@ use crate::audio::dsp::{WaterfallFrame, DSP_SAMPLE_RATE, FT8_SLOT_SAMPLES_12K};
 use crate::audio::manager::{AudioCaptureHandle, AudioManager, AudioPlaybackHandle};
 use crate::command_bus::{ErrorCode, WsBroadcastEvent};
 use crate::domain::adif::QsoRecord;
+use crate::domain::bands::derive_band;
 use crate::domain::clock::{SlotClock, SlotClockSpec, SlotParity, UnixSecs};
-use crate::domain::ft8::{validate_station_callsign, validate_station_grid};
+use crate::domain::ft8::{
+    parse_ft8_message, validate_station_callsign, validate_station_grid, Ft8Payload,
+    ParsedFt8Message,
+};
 use crate::modem::ft8_lib::Ft8LibTxModulator;
 use crate::modem::simulator::SimulatedModem;
 use crate::modem::{Ft8Decode, Ft8Decoder, HybridFt8Decoder, TxIntent};
-use crate::store::{now_utc_str, StateStore};
+use crate::store::{channel_key_for_freq, now_utc_str, StateStore, UpsertChannelRosterInput};
 use crate::supervisor::radio_worker::{CmdResult, RadioLifecycleState};
 use crate::supervisor::DeviceSupervisor;
 use crate::telemetry::TelemetryEnvelope;
@@ -665,8 +669,12 @@ impl SessionManager {
 
     pub async fn qso_action(&self, radio_id: &str, qso_id: &str, action: QsoAction) -> CmdResult {
         let (_, _, rt_arc) = self.get_active_runtime(radio_id).await?;
+        let live_freq = self.live_dial_freq_hz(radio_id, None);
         let (completed, snap) = {
             let mut rt = rt_arc.lock().await;
+            if let Some(f) = live_freq {
+                rt.dial_freq_hz = Some(f);
+            }
             let freq = rt.dial_freq_hz;
             let completed = rt
                 .sequencer
@@ -798,6 +806,94 @@ impl SessionManager {
         self.broadcast_qso_update(&snap, None);
     }
 
+    fn live_dial_freq_hz(&self, radio_id: &str, fallback: Option<i64>) -> Option<i64> {
+        self.supervisor
+            .get_radio_snapshot(radio_id)
+            .and_then(|s| s.freq_hz.and_then(|f| i64::try_from(f).ok()))
+            .or(fallback)
+    }
+
+    fn record_decodes_to_roster(
+        &self,
+        radio_id: &str,
+        is_demo: bool,
+        my_call: &str,
+        dial_freq_hz: Option<i64>,
+        decodes: &[Ft8Decode],
+    ) {
+        if decodes.is_empty() {
+            return;
+        }
+        let channel_key = channel_key_for_freq("FT8", dial_freq_hz);
+        let band = dial_freq_hz
+            .and_then(|hz| u64::try_from(hz).ok())
+            .and_then(derive_band)
+            .map(str::to_string);
+        let now_wall_ms = Utc::now().timestamp_millis();
+
+        for dec in decodes {
+            let parsed = parse_ft8_message(&dec.message);
+            let (callsign, grid, is_cq, directed_cq, calling_me) = match parsed {
+                ParsedFt8Message::Cq {
+                    directed,
+                    callsign,
+                    grid,
+                    ..
+                } => (callsign, grid, true, directed, false),
+                ParsedFt8Message::Directed {
+                    to, from, payload, ..
+                } => {
+                    let g = match payload {
+                        Some(Ft8Payload::Grid(gr)) => Some(gr),
+                        _ => None,
+                    };
+                    (from, g, false, None, to == my_call)
+                }
+                ParsedFt8Message::Raw { .. } => continue,
+            };
+
+            if callsign == my_call {
+                continue;
+            }
+            let slot_str = SlotParity::from_unix_secs(dec.slot_ts).as_str().to_string();
+            let _ = self.store.upsert_channel_roster_entry(
+                &UpsertChannelRosterInput {
+                    is_demo,
+                    channel_key: channel_key.clone(),
+                    callsign,
+                    mode: "FT8".to_string(),
+                    dial_freq_hz,
+                    band: band.clone(),
+                    grid,
+                    last_snr_db: dec.snr_db,
+                    last_dt_sec: dec.dt_sec,
+                    last_af_hz: dec.af_hz,
+                    last_slot: slot_str,
+                    last_message: dec.message.clone(),
+                    is_cq,
+                    directed_cq,
+                    calling_me,
+                    seen_ts_sec: dec.slot_ts.0,
+                },
+                now_wall_ms,
+            );
+        }
+
+        if let Ok(entries) = self
+            .store
+            .list_channel_roster(is_demo, &channel_key, now_wall_ms)
+        {
+            let _ = self.ws_tx.send(WsBroadcastEvent::RosterUpdate {
+                radio_id: radio_id.to_string(),
+                is_demo,
+                channel_key,
+                band,
+                dial_freq_hz,
+                entries,
+            });
+        }
+    }
+
     fn emit_tx_error(&self, radio_id: &str, detail: String) {
         warn!(radio_id, detail = %detail, "live FT8 TX failed");
         let _ = self.ws_tx.send(WsBroadcastEvent::PreflightAlert {
@@ -895,8 +991,12 @@ impl SessionManager {
             let slot_parity = SlotParity::from_unix_secs(slot_ts);
             let rx_decodes = sim.advance_slot(slot_ts);
 
-            let (completed_rx, snap_after_rx) = {
+            let live_freq = self.live_dial_freq_hz(&radio_id, None);
+            let (completed_rx, snap_after_rx, my_call, effective_freq) = {
                 let mut rt = rt_arc.lock().await;
+                if let Some(f) = live_freq {
+                    rt.dial_freq_hz = Some(f);
+                }
                 let freq = rt.dial_freq_hz;
                 let mut done_all = Vec::new();
                 for dec in &rx_decodes {
@@ -904,8 +1004,15 @@ impl SessionManager {
                     done_all.append(&mut done);
                 }
                 let _ = rt.sequencer.maybe_finish_af_survey(next_slot_virtual_ms);
-                (done_all, rt.to_snapshot())
+                (
+                    done_all,
+                    rt.to_snapshot(),
+                    rt.sequencer.my_call.clone(),
+                    freq,
+                )
             };
+
+            self.record_decodes_to_roster(&radio_id, true, &my_call, effective_freq, &rx_decodes);
 
             for dec in &rx_decodes {
                 let _ = self.ws_tx.send(WsBroadcastEvent::Decode {
@@ -945,8 +1052,12 @@ impl SessionManager {
 
                 sim.register_local_tx(slot_ts, &intent);
 
+                let live_freq = self.live_dial_freq_hz(&radio_id, None);
                 let (completed_tx, snap_after_tx) = {
                     let mut rt = rt_arc.lock().await;
+                    if let Some(f) = live_freq {
+                        rt.dial_freq_hz = Some(f);
+                    }
                     let freq = rt.dial_freq_hz;
                     let completed = rt.sequencer.on_tx_confirmed(slot_ts, &intent, freq);
                     rt.tx_state = "idle".to_string();
@@ -1030,8 +1141,12 @@ impl SessionManager {
                 }
             }
 
+            let live_freq = self.live_dial_freq_hz(&radio_id, None);
             let tx_plan = {
                 let mut rt = rt_arc.lock().await;
+                if let Some(f) = live_freq {
+                    rt.dial_freq_hz = Some(f);
+                }
                 let _ = rt.sequencer.maybe_finish_af_survey(next_slot_ms);
                 rt.sequencer
                     .compose_tx_for_slot(active_parity, next_slot_ms)
@@ -1081,16 +1196,27 @@ impl SessionManager {
         if decodes.is_empty() {
             return;
         }
-        let (completed, snap, dial_freq) = {
+        let live_freq = self.live_dial_freq_hz(radio_id, None);
+        let (completed, snap, dial_freq, my_call) = {
             let mut rt = rt_arc.lock().await;
+            if let Some(f) = live_freq {
+                rt.dial_freq_hz = Some(f);
+            }
             let freq = rt.dial_freq_hz;
             let mut done_all = Vec::new();
             for dec in decodes {
                 let mut done = rt.sequencer.on_rx_decode(dec, freq);
                 done_all.append(&mut done);
             }
-            (done_all, rt.to_snapshot(), freq)
+            (
+                done_all,
+                rt.to_snapshot(),
+                freq,
+                rt.sequencer.my_call.clone(),
+            )
         };
+
+        self.record_decodes_to_roster(radio_id, false, &my_call, dial_freq, decodes);
 
         let station_id = self.store.get_station_config().ok().map(|s| s.station_id);
         for dec in decodes {

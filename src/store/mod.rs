@@ -12,6 +12,67 @@ use crate::domain::adif::QsoRecord;
 use crate::telemetry::TelemetryEnvelope;
 
 const INITIAL_MIGRATION_SQL: &str = include_str!("migrations/001_initial_schema.sql");
+const ROSTER_MIGRATION_SQL: &str = include_str!("migrations/002_channel_roster.sql");
+pub const CHANNEL_ROSTER_WINDOW_MS: i64 = 300_000;
+
+pub fn channel_key_for_freq(mode: &str, dial_freq_hz: Option<i64>) -> String {
+    let norm_mode = mode.trim().to_ascii_uppercase();
+    let mode_label = if norm_mode.is_empty() {
+        "FT8"
+    } else {
+        norm_mode.as_str()
+    };
+    match dial_freq_hz {
+        Some(hz) if hz > 0 => {
+            let rounded = ((hz + 500) / 1_000) * 1_000;
+            format!("{mode_label}:{rounded}")
+        }
+        _ => format!("{mode_label}:unknown"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelRosterEntry {
+    pub is_demo: bool,
+    pub channel_key: String,
+    pub callsign: String,
+    pub mode: String,
+    pub dial_freq_hz: Option<i64>,
+    pub band: Option<String>,
+    pub grid: Option<String>,
+    pub last_snr_db: i8,
+    pub last_dt_sec: f32,
+    pub last_af_hz: u16,
+    pub last_slot: String,
+    pub last_message: String,
+    pub is_cq: bool,
+    pub directed_cq: Option<String>,
+    pub calling_me: bool,
+    pub first_seen_ts_sec: i64,
+    pub last_seen_ts_sec: i64,
+    pub last_seen_wall_ms: i64,
+    pub decode_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertChannelRosterInput {
+    pub is_demo: bool,
+    pub channel_key: String,
+    pub callsign: String,
+    pub mode: String,
+    pub dial_freq_hz: Option<i64>,
+    pub band: Option<String>,
+    pub grid: Option<String>,
+    pub last_snr_db: i8,
+    pub last_dt_sec: f32,
+    pub last_af_hz: u16,
+    pub last_slot: String,
+    pub last_message: String,
+    pub is_cq: bool,
+    pub directed_cq: Option<String>,
+    pub calling_me: bool,
+    pub seen_ts_sec: i64,
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -235,6 +296,23 @@ impl StateStore {
             tx.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at_utc) VALUES (?1, ?2, ?3)",
                 params![1_i64, "001_initial_schema", now_utc_str()],
+            )?;
+            tx.commit()?;
+        }
+
+        let roster_applied: Option<i64> = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if roster_applied.is_none() {
+            let tx = conn.transaction()?;
+            tx.execute_batch(ROSTER_MIGRATION_SQL)?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at_utc) VALUES (?1, ?2, ?3)",
+                params![2_i64, "002_channel_roster", now_utc_str()],
             )?;
             tx.commit()?;
         }
@@ -516,6 +594,27 @@ impl StateStore {
             .get_radio_profile(&input.radio_id)?
             .ok_or_else(|| StoreError::NotFound(input.radio_id.clone()))?;
 
+        let next_serial_key = match input.serial_device_key.as_deref() {
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.trim().to_string()),
+            None => existing.serial_device_key.clone(),
+        };
+        let next_civ = match input.civ_address.as_deref() {
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.trim().to_string()),
+            None => existing.civ_address.clone(),
+        };
+        let next_audio_uid = match input.audio_device_uid.as_deref() {
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.trim().to_string()),
+            None => existing.audio_device_uid.clone(),
+        };
+        let next_audio_name = match input.audio_device_name.as_deref() {
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.trim().to_string()),
+            None => existing.audio_device_name.clone(),
+        };
+
         let now = now_utc_str();
         let conn = self.lock()?;
         conn.execute(
@@ -544,25 +643,16 @@ impl StateStore {
                 } else {
                     0_i64
                 },
-                input
-                    .serial_device_key
-                    .as_ref()
-                    .or(existing.serial_device_key.as_ref()),
+                next_serial_key,
                 input.serial_baud_rate.unwrap_or(existing.serial_baud_rate),
-                input.civ_address.as_ref().or(existing.civ_address.as_ref()),
+                next_civ,
                 input.ptt_method.as_deref().unwrap_or(&existing.ptt_method),
                 input
                     .rig_options_json
                     .as_deref()
                     .unwrap_or(&existing.rig_options_json),
-                input
-                    .audio_device_uid
-                    .as_ref()
-                    .or(existing.audio_device_uid.as_ref()),
-                input
-                    .audio_device_name
-                    .as_ref()
-                    .or(existing.audio_device_name.as_ref()),
+                next_audio_uid,
+                next_audio_name,
                 input
                     .audio_rx_channel
                     .as_deref()
@@ -1080,6 +1170,128 @@ impl StateStore {
         let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM command_audit", [], |r| r.get(0))?;
         Ok(cnt)
     }
+
+    pub fn upsert_channel_roster_entry(
+        &self,
+        input: &UpsertChannelRosterInput,
+        now_wall_ms: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        let cutoff = now_wall_ms - CHANNEL_ROSTER_WINDOW_MS;
+        conn.execute(
+            "INSERT INTO channel_roster (
+                is_demo, channel_key, callsign, mode, dial_freq_hz, band, grid,
+                last_snr_db, last_dt_sec, last_af_hz, last_slot, last_message,
+                is_cq, directed_cq, calling_me, first_seen_ts_sec, last_seen_ts_sec,
+                last_seen_wall_ms, decode_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 1)
+             ON CONFLICT(is_demo, channel_key, callsign) DO UPDATE SET
+                mode = excluded.mode,
+                dial_freq_hz = COALESCE(excluded.dial_freq_hz, channel_roster.dial_freq_hz),
+                band = COALESCE(excluded.band, channel_roster.band),
+                grid = COALESCE(excluded.grid, channel_roster.grid),
+                last_snr_db = excluded.last_snr_db,
+                last_dt_sec = excluded.last_dt_sec,
+                last_af_hz = excluded.last_af_hz,
+                last_slot = excluded.last_slot,
+                last_message = excluded.last_message,
+                is_cq = excluded.is_cq,
+                directed_cq = excluded.directed_cq,
+                calling_me = excluded.calling_me,
+                last_seen_ts_sec = excluded.last_seen_ts_sec,
+                last_seen_wall_ms = excluded.last_seen_wall_ms,
+                decode_count = channel_roster.decode_count + 1",
+            params![
+                if input.is_demo { 1_i64 } else { 0_i64 },
+                input.channel_key,
+                input.callsign,
+                input.mode,
+                input.dial_freq_hz,
+                input.band,
+                input.grid,
+                i64::from(input.last_snr_db),
+                f64::from(input.last_dt_sec),
+                i64::from(input.last_af_hz),
+                input.last_slot,
+                input.last_message,
+                if input.is_cq { 1_i64 } else { 0_i64 },
+                input.directed_cq,
+                if input.calling_me { 1_i64 } else { 0_i64 },
+                input.seen_ts_sec,
+                input.seen_ts_sec,
+                now_wall_ms,
+            ],
+        )?;
+        conn.execute(
+            "DELETE FROM channel_roster WHERE last_seen_wall_ms < ?1",
+            params![cutoff],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_expired_channel_roster(&self, now_wall_ms: i64) -> Result<usize, StoreError> {
+        let conn = self.lock()?;
+        let cutoff = now_wall_ms - CHANNEL_ROSTER_WINDOW_MS;
+        let deleted = conn.execute(
+            "DELETE FROM channel_roster WHERE last_seen_wall_ms < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted)
+    }
+
+    pub fn list_channel_roster(
+        &self,
+        is_demo: bool,
+        channel_key: &str,
+        now_wall_ms: i64,
+    ) -> Result<Vec<ChannelRosterEntry>, StoreError> {
+        let conn = self.lock()?;
+        let cutoff = now_wall_ms - CHANNEL_ROSTER_WINDOW_MS;
+        conn.execute(
+            "DELETE FROM channel_roster WHERE last_seen_wall_ms < ?1",
+            params![cutoff],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT is_demo, channel_key, callsign, mode, dial_freq_hz, band, grid,
+                    last_snr_db, last_dt_sec, last_af_hz, last_slot, last_message,
+                    is_cq, directed_cq, calling_me, first_seen_ts_sec, last_seen_ts_sec,
+                    last_seen_wall_ms, decode_count
+             FROM channel_roster
+             WHERE is_demo = ?1 AND channel_key = ?2 AND last_seen_wall_ms >= ?3
+             ORDER BY last_seen_wall_ms DESC, callsign ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![if is_demo { 1_i64 } else { 0_i64 }, channel_key, cutoff],
+            |row| {
+                Ok(ChannelRosterEntry {
+                    is_demo: row.get::<_, i64>(0)? != 0,
+                    channel_key: row.get(1)?,
+                    callsign: row.get(2)?,
+                    mode: row.get(3)?,
+                    dial_freq_hz: row.get(4)?,
+                    band: row.get(5)?,
+                    grid: row.get(6)?,
+                    last_snr_db: row.get::<_, i64>(7)?.clamp(-128, 127) as i8,
+                    last_dt_sec: row.get::<_, f64>(8)? as f32,
+                    last_af_hz: row.get::<_, i64>(9)?.clamp(0, u16::MAX as i64) as u16,
+                    last_slot: row.get(10)?,
+                    last_message: row.get(11)?,
+                    is_cq: row.get::<_, i64>(12)? != 0,
+                    directed_cq: row.get(13)?,
+                    calling_me: row.get::<_, i64>(14)? != 0,
+                    first_seen_ts_sec: row.get(15)?,
+                    last_seen_ts_sec: row.get(16)?,
+                    last_seen_wall_ms: row.get(17)?,
+                    decode_count: row.get(18)?,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for item in rows {
+            out.push(item?);
+        }
+        Ok(out)
+    }
 }
 
 fn map_radio_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<RadioProfile> {
@@ -1253,5 +1465,116 @@ mod tests {
         let types: Vec<&str> = remaining.iter().map(|r| r.event_type.as_str()).collect();
         assert!(types.contains(&"qso.completed"));
         assert!(types.contains(&"watchdog.abort"));
+    }
+
+    #[test]
+    fn channel_roster_preserves_grid_prunes_after_5m_and_isolates_channels_and_demo() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::open(dir.path().join("digi-dx.db")).unwrap();
+
+        let ch_20m = channel_key_for_freq("FT8", Some(14_074_000));
+        let ch_40m = channel_key_for_freq("FT8", Some(7_074_000));
+        assert_eq!(ch_20m, "FT8:14074000");
+        assert_eq!(ch_40m, "FT8:7074000");
+
+        let t0 = 1_700_000_000_000_i64;
+        store
+            .upsert_channel_roster_entry(
+                &UpsertChannelRosterInput {
+                    is_demo: false,
+                    channel_key: ch_20m.clone(),
+                    callsign: "JA1ABC".into(),
+                    mode: "FT8".into(),
+                    dial_freq_hz: Some(14_074_000),
+                    band: Some("20m".into()),
+                    grid: Some("PM95".into()),
+                    last_snr_db: -10,
+                    last_dt_sec: 0.1,
+                    last_af_hz: 1420,
+                    last_slot: "even".into(),
+                    last_message: "CQ JA1ABC PM95".into(),
+                    is_cq: true,
+                    directed_cq: None,
+                    calling_me: false,
+                    seen_ts_sec: 1_700_000_000,
+                },
+                t0,
+            )
+            .unwrap();
+
+        // Follow-up message without grid must preserve PM95 and bump decode_count
+        store
+            .upsert_channel_roster_entry(
+                &UpsertChannelRosterInput {
+                    is_demo: false,
+                    channel_key: ch_20m.clone(),
+                    callsign: "JA1ABC".into(),
+                    mode: "FT8".into(),
+                    dial_freq_hz: Some(14_074_000),
+                    band: Some("20m".into()),
+                    grid: None,
+                    last_snr_db: -8,
+                    last_dt_sec: 0.2,
+                    last_af_hz: 1420,
+                    last_slot: "even".into(),
+                    last_message: "K1XYZ JA1ABC -08".into(),
+                    is_cq: false,
+                    directed_cq: None,
+                    calling_me: false,
+                    seen_ts_sec: 1_700_000_030,
+                },
+                t0 + 30_000,
+            )
+            .unwrap();
+
+        // Demo entry on same frequency is isolated from real channel roster
+        store
+            .upsert_channel_roster_entry(
+                &UpsertChannelRosterInput {
+                    is_demo: true,
+                    channel_key: ch_20m.clone(),
+                    callsign: "QQ1AAA".into(),
+                    mode: "FT8".into(),
+                    dial_freq_hz: Some(14_074_000),
+                    band: Some("20m".into()),
+                    grid: Some("EM10".into()),
+                    last_snr_db: -5,
+                    last_dt_sec: 0.1,
+                    last_af_hz: 740,
+                    last_slot: "odd".into(),
+                    last_message: "CQ QQ1AAA EM10".into(),
+                    is_cq: true,
+                    directed_cq: None,
+                    calling_me: false,
+                    seen_ts_sec: 1_700_000_030,
+                },
+                t0 + 30_000,
+            )
+            .unwrap();
+
+        let real_20m = store
+            .list_channel_roster(false, &ch_20m, t0 + 60_000)
+            .unwrap();
+        assert_eq!(real_20m.len(), 1);
+        assert_eq!(real_20m[0].callsign, "JA1ABC");
+        assert_eq!(real_20m[0].grid.as_deref(), Some("PM95"));
+        assert_eq!(real_20m[0].decode_count, 2);
+
+        assert!(store
+            .list_channel_roster(false, &ch_40m, t0 + 60_000)
+            .unwrap()
+            .is_empty());
+
+        let demo_20m = store
+            .list_channel_roster(true, &ch_20m, t0 + 60_000)
+            .unwrap();
+        assert_eq!(demo_20m.len(), 1);
+        assert_eq!(demo_20m[0].callsign, "QQ1AAA");
+
+        // After 5m01s from t0+30_000, both entries prune out
+        let expired = store
+            .list_channel_roster(false, &ch_20m, t0 + 30_000 + CHANNEL_ROSTER_WINDOW_MS + 1)
+            .unwrap();
+        assert!(expired.is_empty());
     }
 }

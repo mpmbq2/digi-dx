@@ -25,6 +25,7 @@ use crate::supervisor::discovery::{
 use crate::supervisor::radio_worker::{
     CmdResult, RadioLifecycleState, RadioRuntimeSnapshot, RadioWorker, WorkerCmd, WorkerTiming,
 };
+use crate::supervisor::rigctld::{load_rig_capabilities, RigCapabilities};
 use crate::watchdog::{PttAbortTarget, PttWatchdog};
 
 #[derive(Debug, Clone)]
@@ -96,6 +97,7 @@ pub struct DeviceSupervisor {
     config: SupervisorConfig,
     scanner: Arc<dyn DeviceScanner>,
     snapshots: Arc<RwLock<HashMap<String, RadioRuntimeSnapshot>>>,
+    capabilities_cache: Mutex<HashMap<i64, RigCapabilities>>,
     workers: AsyncMutex<HashMap<String, WorkerHandle>>,
     reconcile_lock: AsyncMutex<()>,
     last_connected_keys: Mutex<Option<Vec<String>>>,
@@ -118,6 +120,7 @@ impl DeviceSupervisor {
             config,
             scanner,
             snapshots: Arc::new(RwLock::new(HashMap::new())),
+            capabilities_cache: Mutex::new(HashMap::new()),
             workers: AsyncMutex::new(HashMap::new()),
             reconcile_lock: AsyncMutex::new(()),
             last_connected_keys: Mutex::new(None),
@@ -311,6 +314,22 @@ impl DeviceSupervisor {
         }
     }
 
+    pub fn get_capabilities_for_model(&self, model_id: i64) -> Option<RigCapabilities> {
+        if model_id <= 0 {
+            return None;
+        }
+        if let Ok(guard) = self.capabilities_cache.lock() {
+            if let Some(cached) = guard.get(&model_id) {
+                return Some(cached.clone());
+            }
+        }
+        let loaded = load_rig_capabilities(&self.config.rigctl_bin, model_id)?;
+        if let Ok(mut guard) = self.capabilities_cache.lock() {
+            guard.insert(model_id, loaded.clone());
+        }
+        Some(loaded)
+    }
+
     fn spawn_worker(&self, profile: RadioProfile) -> WorkerHandle {
         let (tx, rx) = mpsc::channel(32);
         let root_cancel = self
@@ -320,9 +339,11 @@ impl DeviceSupervisor {
             .clone()
             .unwrap_or_default();
         let worker_cancel = root_cancel.child_token();
+        let caps = self.get_capabilities_for_model(profile.hamlib_model);
 
         let worker = RadioWorker::new(
             profile,
+            caps,
             self.config.rigctld_bin.clone(),
             self.config.timing.clone(),
             self.store.clone(),
@@ -351,12 +372,18 @@ impl DeviceSupervisor {
     }
 
     pub async fn on_profile_updated(&self, profile: RadioProfile) {
+        let caps = self.get_capabilities_for_model(profile.hamlib_model);
         let tx_opt = {
             let workers = self.workers.lock().await;
             workers.get(&profile.radio_id).map(|h| h.tx.clone())
         };
         if let Some(tx) = tx_opt {
-            let _ = tx.send(WorkerCmd::ProfileUpdated(Box::new(profile))).await;
+            let _ = tx
+                .send(WorkerCmd::ProfileUpdated {
+                    profile: Box::new(profile),
+                    capabilities: caps.map(Box::new),
+                })
+                .await;
         }
         self.reconcile_now().await;
     }
@@ -468,6 +495,125 @@ impl DeviceSupervisor {
         })
         .await
         .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
+    pub async fn set_vfo(&self, radio_id: &str, vfo: &str) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::SetVfo {
+            vfo: vfo.to_string(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
+    pub async fn set_split(&self, radio_id: &str, enabled: bool, tx_vfo: &str) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::SetSplit {
+            enabled,
+            tx_vfo: tx_vfo.to_string(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
+    pub async fn set_rit(&self, radio_id: &str, offset_hz: i32) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::SetRit {
+            offset_hz,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
+    pub async fn set_xit(&self, radio_id: &str, offset_hz: i32) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::SetXit {
+            offset_hz,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
+    pub async fn set_level(&self, radio_id: &str, name: &str, value: f64) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::SetLevel {
+            name: name.to_string(),
+            value,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
+    pub async fn set_func(&self, radio_id: &str, name: &str, enabled: bool) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::SetFunc {
+            name: name.to_string(),
+            enabled,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
+    pub async fn refresh_settings(&self, radio_id: &str) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::RefreshSettings { reply: reply_tx })
+            .await
+            .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
         reply_rx.await.map_err(|_| {
             (
                 ErrorCode::InternalError,

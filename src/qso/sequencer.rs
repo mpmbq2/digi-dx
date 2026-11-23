@@ -10,7 +10,7 @@ use crate::domain::ft8::{parse_ft8_message, Ft8Payload, ParsedFt8Message};
 use crate::modem::{Ft8Decode, TxIntent};
 use crate::store::now_utc_str;
 
-const MAX_RECENT_DECODES: usize = 150;
+const MAX_RECENT_DECODES: usize = 300;
 const MAX_CONFIRMED_RETRIES: u8 = 5;
 const OCCUPIED_AF_TOLERANCE_HZ: i32 = 50;
 const OCCUPIED_LOOKBACK_SECS: i64 = 60;
@@ -135,6 +135,7 @@ pub enum QsoAction {
     NextStep,
     MoveUp,
     MoveDown,
+    MoveToTop,
 }
 
 impl QsoAction {
@@ -149,6 +150,7 @@ impl QsoAction {
             "next_step" => Ok(Self::NextStep),
             "move_up" => Ok(Self::MoveUp),
             "move_down" => Ok(Self::MoveDown),
+            "move_to_top" => Ok(Self::MoveToTop),
             other => Err(format!("invalid qso.action '{other}'")),
         }
     }
@@ -172,6 +174,8 @@ pub struct QsoSequencer {
     pub queue: Vec<ActiveQso>,
     pub recent_decodes: VecDeque<RecentDecodeEntry>,
     pub survey: Option<AfSurveyState>,
+    pub last_cq_tx_slot_ts: Option<i64>,
+    pub last_cq_reply_slot_ts: Option<i64>,
 }
 
 impl QsoSequencer {
@@ -187,6 +191,8 @@ impl QsoSequencer {
             queue: Vec::new(),
             recent_decodes: VecDeque::with_capacity(MAX_RECENT_DECODES),
             survey: None,
+            last_cq_tx_slot_ts: None,
+            last_cq_reply_slot_ts: None,
         }
     }
 
@@ -222,6 +228,7 @@ impl QsoSequencer {
         self.queue.retain(|q| !q.is_cq);
         self.manual_tx = None;
         self.tx_enabled = true;
+        self.last_cq_reply_slot_ts = None;
 
         let cq = ActiveQso {
             qso_id: Uuid::now_v7().to_string(),
@@ -342,6 +349,13 @@ impl QsoSequencer {
                 }
                 Ok(None)
             }
+            QsoAction::MoveToTop => {
+                if idx > 0 {
+                    let item = self.queue.remove(idx);
+                    self.queue.insert(0, item);
+                }
+                Ok(None)
+            }
             QsoAction::Abandon => {
                 self.queue.remove(idx);
                 Ok(None)
@@ -394,10 +408,10 @@ impl QsoSequencer {
                 return Some(manual.clone());
             }
         }
-        let next_qso = self
-            .queue
-            .iter()
-            .find(|q| q.status == QsoStatus::Active && q.tx_slot == slot)?;
+        let next_qso = self.queue.iter().find(|q| q.status == QsoStatus::Active)?;
+        if next_qso.tx_slot != slot {
+            return None;
+        }
 
         Some(TxIntent {
             af_hz: self.tx_af_hz,
@@ -457,12 +471,19 @@ impl QsoSequencer {
                     .queue
                     .iter()
                     .any(|q| q.is_cq && q.status == QsoStatus::Active);
-                if !has_active_cq {
-                    return completed;
+                let in_same_reply_slot = self.last_cq_reply_slot_ts == Some(decode.slot_ts.0);
+                let recent_cq_tx = self
+                    .last_cq_tx_slot_ts
+                    .is_some_and(|ts| decode.slot_ts.0 > ts && decode.slot_ts.0 <= ts + 30);
+                let is_cq_reply = has_active_cq || in_same_reply_slot || recent_cq_tx;
+
+                if is_cq_reply {
+                    self.queue.retain(|q| !q.is_cq);
+                    self.last_cq_reply_slot_ts = Some(decode.slot_ts.0);
                 }
-                self.queue.retain(|q| !q.is_cq);
+
                 let now = now_utc_str();
-                let promoted = ActiveQso {
+                let incoming = ActiveQso {
                     qso_id: Uuid::now_v7().to_string(),
                     radio_id: self.radio_id.clone(),
                     is_demo: self.is_demo,
@@ -474,7 +495,11 @@ impl QsoSequencer {
                     their_grid: None,
                     tx_slot: rx_slot.opposite(),
                     step: QsoStep::SendReport,
-                    status: QsoStatus::Active,
+                    status: if is_cq_reply {
+                        QsoStatus::Active
+                    } else {
+                        QsoStatus::Paused
+                    },
                     attempts_on_step: 0,
                     last_their_snr_db: Some(decode.snr_db),
                     rst_sent: None,
@@ -483,8 +508,8 @@ impl QsoSequencer {
                     updated_at_utc: now,
                     transcript: Vec::new(),
                 };
-                self.queue.insert(0, promoted);
-                0
+                self.queue.push(incoming);
+                self.queue.len() - 1
             }
         };
 
@@ -563,11 +588,15 @@ impl QsoSequencer {
         let idx = self
             .queue
             .iter()
-            .position(|q| q.status == QsoStatus::Active && q.tx_slot == tx_parity)?;
+            .position(|q| q.status == QsoStatus::Active)?;
+        if self.queue[idx].tx_slot != tx_parity {
+            return None;
+        }
 
         let now = now_utc_str();
         let mut complete_now = false;
         let mut timed_out = false;
+        let mut confirmed_cq = false;
 
         {
             let q = &mut self.queue[idx];
@@ -592,6 +621,7 @@ impl QsoSequencer {
                 }
                 QsoStep::CallingCq => {
                     q.attempts_on_step = q.attempts_on_step.saturating_add(1);
+                    confirmed_cq = true;
                 }
                 QsoStep::SendGrid | QsoStep::SendRr73 => {
                     q.attempts_on_step = q.attempts_on_step.saturating_add(1);
@@ -601,6 +631,9 @@ impl QsoSequencer {
             if !q.is_cq && !complete_now && q.attempts_on_step >= MAX_CONFIRMED_RETRIES {
                 timed_out = true;
             }
+        }
+        if confirmed_cq {
+            self.last_cq_tx_slot_ts = Some(slot_ts.0);
         }
 
         if complete_now {
@@ -884,5 +917,104 @@ mod tests {
         // With transmitters around 500 Hz and 900 Hz, widest gap in 300..2700 is 950..2700 -> mid ~1825 -> 1830 Hz
         let best = select_widest_clear_af(&[500, 900]);
         assert!((1800..=1850).contains(&best), "got {best} Hz");
+    }
+
+    #[test]
+    fn multiple_cq_replies_in_same_slot_all_enqueue_and_work_in_order() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_cq(SlotParity::Even, None);
+        let cq_tx = seq.compose_tx_for_slot(SlotParity::Even, 0).unwrap();
+        assert!(seq
+            .on_tx_confirmed(UnixSecs(0), &cq_tx, Some(14_074_000))
+            .is_none());
+
+        for (i, (call, grid)) in [
+            ("K1AAA", "FN42"),
+            ("W2BBB", "EM10"),
+            ("N3CCC", "DN70"),
+            ("JA4DDD", "PM95"),
+            ("DL5EEE", "JO31"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let msg = format!("N1MPM {call} {grid}");
+            seq.on_rx_decode(
+                &mk_decode(15, -5 - i as i8, 900 + (i as u16) * 100, &msg),
+                Some(14_074_000),
+            );
+        }
+
+        assert_eq!(seq.queue.len(), 5);
+        assert!(seq
+            .queue
+            .iter()
+            .all(|q| !q.is_cq && q.status == QsoStatus::Active));
+        let calls: Vec<&str> = seq.queue.iter().map(|q| q.their_call.as_str()).collect();
+        assert_eq!(calls, vec!["K1AAA", "W2BBB", "N3CCC", "JA4DDD", "DL5EEE"]);
+
+        let next_tx = seq.compose_tx_for_slot(SlotParity::Even, 30_000).unwrap();
+        assert_eq!(next_tx.message, "K1AAA N1MPM -05");
+        seq.apply_action(
+            &seq.queue[0].qso_id.clone(),
+            QsoAction::Complete,
+            Some(14_074_000),
+        )
+        .unwrap();
+        let second_tx = seq.compose_tx_for_slot(SlotParity::Even, 60_000).unwrap();
+        assert_eq!(second_tx.message, "W2BBB N1MPM -06");
+    }
+
+    #[test]
+    fn unsolicited_directed_call_without_cq_auto_enqueues_paused() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        let done = seq.on_rx_decode(
+            &mk_decode(15, -11, 1300, "N1MPM K9XYZ EN52"),
+            Some(14_074_000),
+        );
+        assert!(done.is_empty());
+        assert_eq!(seq.queue.len(), 1);
+        assert_eq!(seq.queue[0].their_call, "K9XYZ");
+        assert_eq!(seq.queue[0].status, QsoStatus::Paused);
+        assert!(seq.compose_tx_for_slot(SlotParity::Even, 30_000).is_none());
+
+        // Follow-up decode updates SNR/step while staying Paused
+        seq.on_rx_decode(
+            &mk_decode(45, -7, 1300, "N1MPM K9XYZ +01"),
+            Some(14_074_000),
+        );
+        assert_eq!(seq.queue[0].status, QsoStatus::Paused);
+        assert_eq!(seq.queue[0].step, QsoStep::SendRReport);
+
+        // Resuming allows TX
+        let qid = seq.queue[0].qso_id.clone();
+        seq.apply_action(&qid, QsoAction::Resume, Some(14_074_000))
+            .unwrap();
+        let tx = seq.compose_tx_for_slot(SlotParity::Even, 60_000).unwrap();
+        assert_eq!(tx.message, "K9XYZ N1MPM R-07");
+    }
+
+    #[test]
+    fn mixed_parity_queue_only_transmits_head_active_qso() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_reply("K1EVEN", Some("FN42".into()), SlotParity::Odd, Some(-5));
+        // Second station replies in Even slot -> wants Odd TX, appended behind head
+        seq.start_reply("W2ODD", Some("EM10".into()), SlotParity::Even, Some(-8));
+        // Wait: start_reply inserts at 0, so reverse order check: head is W2ODD (tx_slot Odd) and second is K1EVEN (tx_slot Even).
+        assert!(seq.compose_tx_for_slot(SlotParity::Even, 0).is_none());
+        let tx = seq.compose_tx_for_slot(SlotParity::Odd, 15_000).unwrap();
+        assert!(tx.message.starts_with("W2ODD "));
+    }
+
+    #[test]
+    fn move_to_top_promotes_queued_caller() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_cq(SlotParity::Even, None);
+        seq.on_rx_decode(&mk_decode(15, -10, 900, "N1MPM K1AAA FN42"), None);
+        seq.on_rx_decode(&mk_decode(15, -4, 1200, "N1MPM W2BBB EM10"), None);
+        let second_id = seq.queue[1].qso_id.clone();
+        seq.apply_action(&second_id, QsoAction::MoveToTop, None)
+            .unwrap();
+        assert_eq!(seq.queue[0].their_call, "W2BBB");
     }
 }

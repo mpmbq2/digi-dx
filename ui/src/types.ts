@@ -120,6 +120,61 @@ export interface RadioProfile {
   auto_connect: boolean;
 }
 
+export interface AgcLevelOption {
+  value: number;
+  label: string;
+}
+
+export interface RigCapabilities {
+  model_id: number;
+  modes: string[];
+  vfos: string[];
+  preamp_db: number[];
+  att_db: number[];
+  agc_levels: AgcLevelOption[];
+  get_levels: string[];
+  set_levels: string[];
+  get_funcs: string[];
+  set_funcs: string[];
+  max_rit_hz: number | null;
+  max_xit_hz: number | null;
+  has_split: boolean;
+}
+
+export interface RadioLiveSettings {
+  vfo: string | null;
+  split: boolean | null;
+  tx_vfo: string | null;
+  rit_hz: number | null;
+  xit_hz: number | null;
+  strength_db: number | null;
+  rf_power_watts: number | null;
+  levels: Record<string, number>;
+  funcs: Record<string, boolean>;
+}
+
+export interface ChannelRosterEntry {
+  is_demo: boolean;
+  channel_key: string;
+  callsign: string;
+  mode: string;
+  dial_freq_hz: number | null;
+  band: string | null;
+  grid: string | null;
+  last_snr_db: number;
+  last_dt_sec: number;
+  last_af_hz: number;
+  last_slot: SlotParity;
+  last_message: string;
+  is_cq: boolean;
+  directed_cq: string | null;
+  calling_me: boolean;
+  first_seen_ts_sec: number;
+  last_seen_ts_sec: number;
+  last_seen_wall_ms: number;
+  decode_count: number;
+}
+
 export interface RadioSummary {
   profile: RadioProfile;
   lifecycle_state: string;
@@ -133,6 +188,8 @@ export interface RadioSummary {
   last_error: string | null;
   recovery_attempts: number;
   lease_holder: string | null;
+  capabilities?: RigCapabilities | null;
+  settings?: RadioLiveSettings | null;
 }
 
 export interface ControlLease {
