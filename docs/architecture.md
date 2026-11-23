@@ -187,10 +187,10 @@ flowchart LR
         Cap["cpal Capture (48 kHz Mono/Ch-Select)"] --> Resamp["rubato Resampler (48 kHz -> 12 kHz)"]
         Cap --> FFT["rustfft (200-3000 Hz Waterfall + RMS Meter)"]
         Resamp --> SlotBuf["UTC 15s Slot Ring Buffer (180,000 samples)"]
-        SlotBuf -->|"At t = 14.2s / slot end"| Trait["Ft8Decoder Trait"]
-        Trait -->|"Primary (if found)"| JT9Dec["Jt9SubprocessDecoder\n(jt9 -8 -> YYMMDD_HHMMSS.wav)"]
+        SlotBuf -->|"3-Pass: t = 11.8s / 13.5s / 14.8s"| Trait["HybridFt8Decoder (Streaming)"]
+        Trait -->|"Primary (if found)"| JT9Dec["Jt9SubprocessDecoder\n(jt9 -8 -L 200 -H 3000 + wisdom)"]
         Trait -->|"Fallback (zero deps)"| LibDec["Ft8LibEmbeddedDecoder\n(kgoba/ft8_lib C FFI, MIT)"]
-        JT9Dec --> Norm["Decode Normalizer\n(Strip '? a1', UTC Unix sec)"]
+        JT9Dec -->|"Line-by-line stdout"| Norm["SlotDecodeReconciler\n(Deduplicate + Retain AP '? a1' Tags)"]
         LibDec --> Norm
     end
 
@@ -211,10 +211,14 @@ flowchart LR
   - Strict newtype separation in Rust (`UnixSecs(i64)` vs `VirtualMs(i64)`) makes v1's seconds-vs-milliseconds parity/timestamp trap a **compile-time error**.
   - Slot parity: `(unix_secs / 15) % 2 == 0` → `even`, else `odd`.
   - Automation arms transmit `2` virtual seconds before the slot boundary with a `50 ms` minimum wall-delay floor (scale validated at `SlotClock::new` so `scale <= slot_ms / (2 * floor_ms)`).
-- **`jt9` Subprocess Adapter Specifics:**
-  - Writes each 15-second `12 kHz` 16-bit mono PCM slot buffer to a temp file in the OS temp/ramdisk directory named strictly **`YYMMDD_HHMMSS.wav`** (avoiding `jt9`'s Fortran substring crash on short filenames).
-  - Invokes `jt9 -8 -F 300 -f 1500 <path/YYMMDD_HHMMSS.wav>` with a `4 s` hard timeout and immediate temp-file cleanup.
-  - Strips trailing WSJT-X/jt9 decoder-pass metadata starting at `?` (e.g., `? a1`) before feeding the QSO parser, while preserving raw metadata in optional debug telemetry.
+- **`jt9` Subprocess Adapter & Multi-Pass Early Decoding:**
+  - Runs a WSJT-X-style 3-stage pipeline per RX slot using non-destructive buffer snapshots (`snapshot_slot_samples()`, padded to `15.0 s`) and exact boundary rollover (`reset_for_new_slot()`):
+    - **Pass 1 (`t = 11.8 s`, `-d 1`):** Fast early pass (`-w 0` if wisdom not yet cached) delivering ~80–85% of signals ~3 s before slot close.
+    - **Pass 2 (`t = 13.5 s`, `-d 2`):** Normal pre-close pass catching weaker/later signals before TX scheduling.
+    - **Pass 3 (`t = 14.8 s`, `-d 3`):** Deep final pass continuing up to `+300 ms` grace before TX (and asynchronously past TX start if still scanning deep candidates).
+  - Writes each WAV strictly as **`YYMMDD_HHMMSS.wav`** in a per-run `-t` tempdir while caching FFTW3 plans (`jt9_wisdom.dat`) in persistent `-a <data_dir>/jt9` and bounding the search passband (`-L 200 -H 3000`).
+  - Streams `jt9` stdout line-by-line as decoded rather than waiting for process exit.
+  - `SlotDecodeReconciler` reconciles lines across passes by `(slot_ts, clean_message, |ΔAF| <= 15 Hz)` without duplicates, upgrades confidence (`? a1` → `a1` → verified CRC) without downgrading earlier verified decodes, retains `decoder_metadata` for UI visibility, and flushes `ft8.decode` telemetry once per slot.
 - **Built-In `ft8_lib` Fallback & UI Visibility:**
   - If `jt9` is absent or fails preflight arch verification, `ModemManager` seamlessly uses `Ft8LibEmbeddedDecoder` (`kgoba/ft8_lib`, MIT) and surfaces `decoder_backend: "ft8_lib_fallback"` in `status` and UI banner so the operator always knows whether WSJT-X reference sensitivity or built-in fallback is active.
 - **`SimulatedModem` (Demo & CI Verification):**

@@ -97,12 +97,14 @@ impl AppState {
             ws_tx.clone(),
         );
         supervisor.attach_watchdog(Arc::downgrade(&watchdog));
+        let jt9_data_dir = config.data_dir.join("jt9");
         let sessions = SessionManager::new(
             store.clone(),
             Arc::clone(&supervisor),
             Arc::clone(&watchdog),
             ws_tx.clone(),
             config.jt9_path.as_deref(),
+            Some(jt9_data_dir.as_path()),
         );
         let bus = Arc::new(CommandBus::new(
             store.clone(),
@@ -255,12 +257,14 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
         ws_tx.clone(),
     );
     supervisor.attach_watchdog(Arc::downgrade(&watchdog));
+    let jt9_data_dir = config.data_dir.join("jt9");
     let sessions = SessionManager::new(
         store.clone(),
         Arc::clone(&supervisor),
         Arc::clone(&watchdog),
         ws_tx.clone(),
         config.jt9_path.as_deref(),
+        Some(jt9_data_dir.as_path()),
     );
 
     let bus = Arc::new(CommandBus::new(

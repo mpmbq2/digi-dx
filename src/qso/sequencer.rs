@@ -118,6 +118,8 @@ pub struct RecentDecodeEntry {
     pub af_hz: u16,
     pub message: String,
     pub decoder_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,10 +448,7 @@ impl QsoSequencer {
         dial_freq_hz: Option<i64>,
     ) -> Vec<QsoRecord> {
         let rx_slot = SlotParity::from_unix_secs(decode.slot_ts);
-        if self.recent_decodes.len() >= MAX_RECENT_DECODES {
-            self.recent_decodes.pop_back();
-        }
-        self.recent_decodes.push_front(RecentDecodeEntry {
+        let entry = RecentDecodeEntry {
             ts_sec: decode.slot_ts.0,
             slot: rx_slot,
             snr_db: decode.snr_db,
@@ -457,7 +456,17 @@ impl QsoSequencer {
             af_hz: decode.af_hz,
             message: decode.message.clone(),
             decoder_backend: decode.decoder_backend.clone(),
-        });
+            decoder_metadata: decode.raw_metadata.clone(),
+        };
+        let insert_idx = self
+            .recent_decodes
+            .iter()
+            .position(|d| d.ts_sec <= decode.slot_ts.0)
+            .unwrap_or(self.recent_decodes.len());
+        self.recent_decodes.insert(insert_idx, entry);
+        while self.recent_decodes.len() > MAX_RECENT_DECODES {
+            self.recent_decodes.pop_back();
+        }
 
         if let Some(ref mut survey) = self.survey {
             survey.collected_afs.push(decode.af_hz);
@@ -589,6 +598,50 @@ impl QsoSequencer {
         }
 
         completed
+    }
+
+    /// Update an already-ingested RX decode in place when a later decoder pass refines its
+    /// SNR/DT/AF or upgrades its AP/uncertainty metadata, without re-triggering QSO transitions
+    /// or duplicating transcript lines. Returns `true` if any `ActiveQso` was updated.
+    pub fn on_rx_decode_refined(&mut self, previous: &Ft8Decode, updated: &Ft8Decode) -> bool {
+        if let Some(entry) = self.recent_decodes.iter_mut().find(|d| {
+            d.ts_sec == updated.slot_ts.0
+                && d.message == updated.message
+                && ((i32::from(d.af_hz) - i32::from(previous.af_hz)).abs() <= 15
+                    || (i32::from(d.af_hz) - i32::from(updated.af_hz)).abs() <= 15)
+        }) {
+            entry.snr_db = updated.snr_db;
+            entry.dt_sec = updated.dt_sec;
+            entry.af_hz = updated.af_hz;
+            entry.decoder_backend = updated.decoder_backend.clone();
+            entry.decoder_metadata = updated.raw_metadata.clone();
+        }
+
+        let mut qso_changed = false;
+        let now = now_utc_str();
+        for q in &mut self.queue {
+            if q.is_cq {
+                continue;
+            }
+            let last_rx_idx = q.transcript.iter().rposition(|t| t.direction == "rx");
+            for (idx, t) in q.transcript.iter_mut().enumerate() {
+                if t.direction == "rx"
+                    && t.slot_ts == updated.slot_ts.0
+                    && t.message == updated.message
+                    && ((i32::from(t.af_hz) - i32::from(previous.af_hz)).abs() <= 15
+                        || (i32::from(t.af_hz) - i32::from(updated.af_hz)).abs() <= 15)
+                {
+                    t.snr_db = Some(updated.snr_db);
+                    t.af_hz = updated.af_hz;
+                    if Some(idx) == last_rx_idx {
+                        q.last_their_snr_db = Some(updated.snr_db);
+                    }
+                    q.updated_at_utc = now.clone();
+                    qso_changed = true;
+                }
+            }
+        }
+        qso_changed
     }
 
     pub fn on_tx_confirmed(
@@ -1163,5 +1216,55 @@ mod tests {
         assert_eq!(qso.transcript.len(), 1);
         assert_eq!(qso.transcript[0].direction, "rx");
         assert_eq!(qso.transcript[0].message, "CQ K1ABC FN42");
+    }
+
+    #[test]
+    fn refined_rx_decode_updates_metadata_and_snr_in_place_without_duplicating() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_cq(SlotParity::Even, None);
+
+        let initial = Ft8Decode {
+            slot_ts: UnixSecs(15),
+            snr_db: -14,
+            dt_sec: 0.4,
+            af_hz: 1200,
+            message: "N1MPM JA1ABC PM95".to_string(),
+            raw_metadata: Some("? a1".to_string()),
+            decoder_backend: "jt9".to_string(),
+        };
+        assert!(seq.on_rx_decode(&initial, Some(14_074_000)).is_empty());
+        assert_eq!(seq.recent_decodes.len(), 1);
+        assert_eq!(
+            seq.recent_decodes[0].decoder_metadata.as_deref(),
+            Some("? a1")
+        );
+        assert_eq!(seq.queue.len(), 1);
+        assert_eq!(seq.queue[0].step, QsoStep::SendReport);
+        assert_eq!(seq.queue[0].last_their_snr_db, Some(-14));
+        assert_eq!(seq.queue[0].transcript.len(), 1);
+
+        let refined = Ft8Decode {
+            slot_ts: UnixSecs(15),
+            snr_db: -11,
+            dt_sec: 0.4,
+            af_hz: 1202,
+            message: "N1MPM JA1ABC PM95".to_string(),
+            raw_metadata: None,
+            decoder_backend: "jt9".to_string(),
+        };
+        assert!(seq.on_rx_decode_refined(&initial, &refined));
+
+        assert_eq!(seq.recent_decodes.len(), 1);
+        assert_eq!(seq.recent_decodes[0].snr_db, -11);
+        assert_eq!(seq.recent_decodes[0].af_hz, 1202);
+        assert_eq!(seq.recent_decodes[0].decoder_metadata, None);
+
+        assert_eq!(seq.queue.len(), 1);
+        assert_eq!(seq.queue[0].step, QsoStep::SendReport);
+        assert_eq!(seq.queue[0].attempts_on_step, 0);
+        assert_eq!(seq.queue[0].last_their_snr_db, Some(-11));
+        assert_eq!(seq.queue[0].transcript.len(), 1);
+        assert_eq!(seq.queue[0].transcript[0].snr_db, Some(-11));
+        assert_eq!(seq.queue[0].transcript[0].af_hz, 1202);
     }
 }

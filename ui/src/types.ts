@@ -240,6 +240,7 @@ export interface DecodeItem {
   af_hz: number;
   message: string;
   decoder_backend: string;
+  decoder_metadata?: string | null;
 }
 
 export interface TxStateEvent {

@@ -77,6 +77,37 @@ impl AudioCaptureHandle {
         std::mem::take(&mut *guard)
     }
 
+    /// Clone all samples currently buffered for the active slot without removing them.
+    pub fn snapshot_slot_samples(&self) -> Vec<f32> {
+        let guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
+        guard.clone()
+    }
+
+    /// Prepend `count` zero samples so a live session started mid-slot preserves FT8 DT alignment.
+    pub fn seed_leading_silence(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
+        let capped = count.min(FT8_SLOT_SAMPLES_12K);
+        let mut padded = Vec::with_capacity(capped + guard.len());
+        padded.resize(capped, 0.0);
+        padded.extend_from_slice(&guard);
+        *guard = padded;
+    }
+
+    /// Advance the capture buffer to a newly opened slot boundary, retaining only the newest
+    /// `keep_tail_samples` captured after the boundary instant.
+    pub fn reset_for_new_slot(&self, keep_tail_samples: usize) {
+        let mut guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
+        if keep_tail_samples == 0 {
+            guard.clear();
+        } else if guard.len() > keep_tail_samples {
+            let drop_count = guard.len() - keep_tail_samples;
+            guard.drain(..drop_count);
+        }
+    }
+
     pub fn discard_oldest_samples(&self, count: usize) {
         let mut guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
         let n = count.min(guard.len());
@@ -88,6 +119,15 @@ impl AudioCaptureHandle {
             .lock()
             .expect("slot buffer lock poisoned")
             .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_slot_buffer_for_test(slot_buffer: Arc<Mutex<Vec<f32>>>) -> Self {
+        Self {
+            stop_tx: None,
+            join: None,
+            slot_buffer,
+        }
     }
 
     pub fn stop(&mut self) {
@@ -569,4 +609,39 @@ fn run_playback_thread(
     let _ = ready_tx.send(Ok(()));
     let _ = stop_rx.recv();
     drop(stream);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_seed_and_reset_preserve_slot_alignment() {
+        let buf = Arc::new(Mutex::new(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let handle = AudioCaptureHandle::from_slot_buffer_for_test(buf);
+
+        // Non-destructive snapshot leaves samples intact across multiple passes.
+        assert_eq!(handle.snapshot_slot_samples(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(handle.snapshot_slot_samples(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(handle.buffered_len(), 4);
+
+        // Leading silence seeding prepends zeros and caps at FT8_SLOT_SAMPLES_12K.
+        handle.seed_leading_silence(3);
+        assert_eq!(
+            handle.snapshot_slot_samples(),
+            vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0]
+        );
+
+        // Boundary reset retains only the newest `keep_tail_samples`.
+        handle.reset_for_new_slot(2);
+        assert_eq!(handle.snapshot_slot_samples(), vec![3.0, 4.0]);
+
+        // Zero tail clears completely.
+        handle.reset_for_new_slot(0);
+        assert!(handle.snapshot_slot_samples().is_empty());
+
+        // Seeding over FT8_SLOT_SAMPLES_12K is capped safely.
+        handle.seed_leading_silence(FT8_SLOT_SAMPLES_12K + 500);
+        assert_eq!(handle.buffered_len(), FT8_SLOT_SAMPLES_12K);
+    }
 }

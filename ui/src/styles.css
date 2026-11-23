@@ -995,9 +995,39 @@ body {
 }
 
 .msg-cell {
-  max-width: 185px;
+  max-width: 210px;
+}
+
+.msg-cell-inner {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.msg-cell-text {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decode-meta-tag {
+  flex-shrink: 0;
+  padding: 0.06rem 0.34rem;
+  border-radius: 4px;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.decode-meta-uncertain {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.decode-meta-ap {
+  color: var(--muted);
+  background: rgba(142, 160, 181, 0.16);
 }
 
 /* Channel Roster Sort Headers */
