@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type {
   ActiveQso,
   AudioDeviceSummary,
+  ChannelRosterEntry,
   CommandAck,
   CommandEnvelope,
   ConnectionState,
@@ -12,7 +13,9 @@ import type {
   OutboxStats,
   PreflightReport,
   QsoLogItem,
+  RadioLiveSettings,
   RadioSummary,
+  RigCapabilities,
   SessionSnapshot,
   SlotClockSpec,
   SlotParity,
@@ -22,6 +25,7 @@ import type {
   UsbInventoryEntry,
   WaterfallEvent,
 } from "../types";
+import { formatChannelKey } from "../utils/maidenhead";
 
 function makeActorId(): string {
   const stored = window.sessionStorage.getItem("digi_dx_actor");
@@ -63,11 +67,18 @@ export interface DaemonState {
   oddOccupiedHz: number[];
   realQsos: QsoLogItem[];
   demoQsos: QsoLogItem[];
+  channelRoster: ChannelRosterEntry[];
+  rosterChannelKey: string | null;
   events: EventLogItem[];
   lastAlert: { severity: string; title: string; detail: string; at: string } | null;
   clearAlert: () => void;
   refreshAll: (refreshPreflight?: boolean) => Promise<void>;
   refreshQsos: (demo: boolean, band?: string) => Promise<void>;
+  refreshRoster: (
+    freqHz: number | null,
+    isDemo: boolean,
+    mode?: string
+  ) => Promise<void>;
   sendCommand: (
     kind: string,
     payload: Record<string, unknown>,
@@ -110,6 +121,12 @@ export function useDaemonSocket(): DaemonState {
   const [oddOccupiedHz, setOddOccupiedHz] = useState<number[]>([]);
   const [realQsos, setRealQsos] = useState<QsoLogItem[]>([]);
   const [demoQsos, setDemoQsos] = useState<QsoLogItem[]>([]);
+  const [channelRoster, setChannelRoster] = useState<ChannelRosterEntry[]>([]);
+  const [rosterChannelKey, setRosterChannelKey] = useState<string | null>(null);
+  const expectedRosterRef = useRef<{ channelKey: string; isDemo: boolean }>({
+    channelKey: "FT8:unknown",
+    isDemo: false,
+  });
   const [events, setEvents] = useState<EventLogItem[]>([]);
   const [lastAlert, setLastAlert] = useState<{
     severity: string;
@@ -172,6 +189,40 @@ export function useDaemonSocket(): DaemonState {
       // Ignore transient poll errors
     }
   }, []);
+
+  const refreshRoster = useCallback(
+    async (freqHz: number | null, isDemo: boolean, mode = "FT8") => {
+      const targetKey = formatChannelKey(mode, freqHz);
+      expectedRosterRef.current = { channelKey: targetKey, isDemo };
+      setRosterChannelKey(targetKey);
+      try {
+        const qs = new URLSearchParams({
+          mode,
+          demo: isDemo ? "true" : "false",
+          channel_key: targetKey,
+        });
+        if (typeof freqHz === "number" && freqHz > 0) {
+          qs.set("freq_hz", String(Math.round(freqHz)));
+        }
+        const res = await fetch(`/api/v1/roster?${qs.toString()}`);
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          channel_key?: string;
+          items?: ChannelRosterEntry[];
+        };
+        if (
+          expectedRosterRef.current.channelKey === targetKey &&
+          expectedRosterRef.current.isDemo === isDemo
+        ) {
+          setChannelRoster(data.items ?? []);
+          if (data.channel_key) setRosterChannelKey(data.channel_key);
+        }
+      } catch {
+        // Ignore transient poll errors
+      }
+    },
+    []
+  );
 
   const refreshLiveState = useCallback(async () => {
     try {
@@ -372,7 +423,18 @@ export function useDaemonSocket(): DaemonState {
               message: String(parsed.message ?? ""),
               decoder_backend: String(parsed.decoder_backend ?? "jt9"),
             };
-            setRecentDecodes((prev) => [dec, ...prev].slice(0, 150));
+            setRecentDecodes((prev) => [dec, ...prev].slice(0, 300));
+          } else if (evType === "roster_update") {
+            const chKey = String(parsed.channel_key ?? "");
+            const isDemoEv = Boolean(parsed.is_demo);
+            const entries = (parsed.entries as ChannelRosterEntry[]) ?? [];
+            if (
+              expectedRosterRef.current.channelKey === chKey &&
+              expectedRosterRef.current.isDemo === isDemoEv
+            ) {
+              setChannelRoster(entries);
+              setRosterChannelKey(chKey);
+            }
           } else if (evType === "tx_state") {
             const tx: TxStateEvent = {
               radio_id: String(parsed.radio_id ?? ""),
@@ -525,6 +587,14 @@ export function useDaemonSocket(): DaemonState {
                     typeof parsed.recovery_attempts === "number"
                       ? parsed.recovery_attempts
                       : r.recovery_attempts,
+                  capabilities:
+                    parsed.capabilities !== undefined
+                      ? (parsed.capabilities as RigCapabilities | null)
+                      : r.capabilities,
+                  settings:
+                    parsed.settings !== undefined
+                      ? (parsed.settings as RadioLiveSettings | null)
+                      : r.settings,
                 };
               })
             );
@@ -783,11 +853,14 @@ export function useDaemonSocket(): DaemonState {
     oddOccupiedHz,
     realQsos,
     demoQsos,
+    channelRoster,
+    rosterChannelKey,
     events,
     lastAlert,
     clearAlert,
     refreshAll,
     refreshQsos,
+    refreshRoster,
     sendCommand,
     claimLease,
     releaseLease,

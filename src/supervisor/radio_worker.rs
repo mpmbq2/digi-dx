@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use crate::command_bus::{ErrorCode, WsBroadcastEvent};
 use crate::domain::bands::derive_band;
 use crate::store::{now_utc_str, RadioProfile, StateStore};
 use crate::supervisor::rigctld::{
-    is_cat_powered_off_error, RigctldClient, RigctldError, RigctldProcess,
+    is_cat_powered_off_error, RigCapabilities, RigctldClient, RigctldError, RigctldProcess,
 };
 use crate::telemetry::TelemetryEnvelope;
 
@@ -49,6 +49,19 @@ impl RadioLifecycleState {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RadioLiveSettings {
+    pub vfo: Option<String>,
+    pub split: Option<bool>,
+    pub tx_vfo: Option<String>,
+    pub rit_hz: Option<i32>,
+    pub xit_hz: Option<i32>,
+    pub strength_db: Option<i32>,
+    pub rf_power_watts: Option<f64>,
+    pub levels: BTreeMap<String, f64>,
+    pub funcs: BTreeMap<String, bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RadioRuntimeSnapshot {
     pub radio_id: String,
@@ -66,10 +79,12 @@ pub struct RadioRuntimeSnapshot {
     pub last_error: Option<String>,
     pub last_poll_utc: Option<String>,
     pub updated_at_utc: String,
+    pub capabilities: Option<RigCapabilities>,
+    pub settings: RadioLiveSettings,
 }
 
 impl RadioRuntimeSnapshot {
-    pub fn initial(profile: &RadioProfile) -> Self {
+    pub fn initial(profile: &RadioProfile, capabilities: Option<RigCapabilities>) -> Self {
         let freq_hz = profile
             .last_dial_freq_hz
             .and_then(|f| u64::try_from(f).ok());
@@ -90,6 +105,8 @@ impl RadioRuntimeSnapshot {
             last_error: None,
             last_poll_utc: None,
             updated_at_utc: now_utc_str(),
+            capabilities,
+            settings: RadioLiveSettings::default(),
         }
     }
 }
@@ -128,7 +145,10 @@ pub enum WorkerCmd {
     HardwareAmbiguous {
         reason: String,
     },
-    ProfileUpdated(Box<RadioProfile>),
+    ProfileUpdated {
+        profile: Box<RadioProfile>,
+        capabilities: Option<Box<RigCapabilities>>,
+    },
     Restart {
         reply: Option<oneshot::Sender<CmdResult>>,
     },
@@ -153,6 +173,36 @@ pub enum WorkerCmd {
     },
     SetPtt {
         active: bool,
+        reply: oneshot::Sender<CmdResult>,
+    },
+    SetVfo {
+        vfo: String,
+        reply: oneshot::Sender<CmdResult>,
+    },
+    SetSplit {
+        enabled: bool,
+        tx_vfo: String,
+        reply: oneshot::Sender<CmdResult>,
+    },
+    SetRit {
+        offset_hz: i32,
+        reply: oneshot::Sender<CmdResult>,
+    },
+    SetXit {
+        offset_hz: i32,
+        reply: oneshot::Sender<CmdResult>,
+    },
+    SetLevel {
+        name: String,
+        value: f64,
+        reply: oneshot::Sender<CmdResult>,
+    },
+    SetFunc {
+        name: String,
+        enabled: bool,
+        reply: oneshot::Sender<CmdResult>,
+    },
+    RefreshSettings {
         reply: oneshot::Sender<CmdResult>,
     },
     SetSessionActive(bool),
@@ -183,12 +233,14 @@ pub struct RadioWorker {
     halted_by_operator: bool,
     pending_recovery_at: Option<Instant>,
     pending_standby_probe_at: Option<Instant>,
+    poll_counter: u32,
 }
 
 impl RadioWorker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         profile: RadioProfile,
+        capabilities: Option<RigCapabilities>,
         rigctld_bin: String,
         timing: WorkerTiming,
         store: StateStore,
@@ -197,7 +249,7 @@ impl RadioWorker {
         rx: mpsc::Receiver<WorkerCmd>,
         shutdown: CancellationToken,
     ) -> Self {
-        let snapshot = RadioRuntimeSnapshot::initial(&profile);
+        let snapshot = RadioRuntimeSnapshot::initial(&profile, capabilities);
         {
             if let Ok(mut guard) = snapshots.write() {
                 guard.insert(profile.radio_id.clone(), snapshot.clone());
@@ -219,6 +271,7 @@ impl RadioWorker {
             halted_by_operator: false,
             pending_recovery_at: None,
             pending_standby_probe_at: None,
+            poll_counter: 0,
         }
     }
 
@@ -354,7 +407,10 @@ impl RadioWorker {
                 self.snapshot.last_error = Some(reason.clone());
                 self.set_state(RadioLifecycleState::Degraded, Some(reason));
             }
-            WorkerCmd::ProfileUpdated(updated) => {
+            WorkerCmd::ProfileUpdated {
+                profile: updated,
+                capabilities,
+            } => {
                 let updated = *updated;
                 let needs_restart = updated.hamlib_model != self.profile.hamlib_model
                     || updated.is_dummy != self.profile.is_dummy
@@ -364,6 +420,9 @@ impl RadioWorker {
                     || updated.rig_options_json != self.profile.rig_options_json
                     || updated.serial_device_key != self.profile.serial_device_key;
 
+                if let Some(caps) = capabilities {
+                    self.snapshot.capabilities = Some(*caps);
+                }
                 self.profile = updated;
                 self.halted_by_operator = false;
                 self.pending_standby_probe_at = None;
@@ -445,6 +504,42 @@ impl RadioWorker {
             }
             WorkerCmd::SetPtt { active, reply } => {
                 let res = self.exec_set_ptt(active).await;
+                let _ = reply.send(res);
+            }
+            WorkerCmd::SetVfo { vfo, reply } => {
+                let res = self.exec_set_vfo(&vfo).await;
+                let _ = reply.send(res);
+            }
+            WorkerCmd::SetSplit {
+                enabled,
+                tx_vfo,
+                reply,
+            } => {
+                let res = self.exec_set_split(enabled, &tx_vfo).await;
+                let _ = reply.send(res);
+            }
+            WorkerCmd::SetRit { offset_hz, reply } => {
+                let res = self.exec_set_rit(offset_hz).await;
+                let _ = reply.send(res);
+            }
+            WorkerCmd::SetXit { offset_hz, reply } => {
+                let res = self.exec_set_xit(offset_hz).await;
+                let _ = reply.send(res);
+            }
+            WorkerCmd::SetLevel { name, value, reply } => {
+                let res = self.exec_set_level(&name, value).await;
+                let _ = reply.send(res);
+            }
+            WorkerCmd::SetFunc {
+                name,
+                enabled,
+                reply,
+            } => {
+                let res = self.exec_set_func(&name, enabled).await;
+                let _ = reply.send(res);
+            }
+            WorkerCmd::RefreshSettings { reply } => {
+                let res = self.exec_refresh_settings().await;
                 let _ = reply.send(res);
             }
             WorkerCmd::SetSessionActive(active) => {
@@ -557,6 +652,18 @@ impl RadioWorker {
                     self.snapshot.passband_hz = Some(pb);
                 }
 
+                let mut next_settings = self.snapshot.settings.clone();
+                Self::read_all_settings(
+                    &mut client,
+                    self.snapshot.capabilities.as_ref(),
+                    self.snapshot.freq_hz,
+                    self.snapshot.mode.as_deref(),
+                    &mut next_settings,
+                )
+                .await;
+                self.snapshot.settings = next_settings;
+                self.poll_counter = 0;
+
                 self.running = Some(RunningRig { process, client });
                 info!(
                     radio_id = %self.profile.radio_id,
@@ -631,6 +738,45 @@ impl RadioWorker {
 
         let mode_pair = rig.client.get_mode().await.ok();
         let ptt_opt = rig.client.get_ptt().await.ok().flatten();
+        let strength_opt = if self
+            .snapshot
+            .capabilities
+            .as_ref()
+            .is_none_or(|c| c.get_levels.iter().any(|l| l == "STRENGTH"))
+        {
+            rig.client
+                .get_level("STRENGTH")
+                .await
+                .ok()
+                .flatten()
+                .map(|v| v.round() as i32)
+        } else {
+            None
+        };
+
+        self.poll_counter = self.poll_counter.wrapping_add(1);
+        let mut next_settings = self.snapshot.settings.clone();
+        if let Some(s_db) = strength_opt {
+            next_settings.strength_db = Some(s_db);
+        }
+        let refresh_full = self.poll_counter.is_multiple_of(5);
+        if refresh_full {
+            let caps_clone = self.snapshot.capabilities.clone();
+            let freq_snap = Some(freq);
+            let mode_snap = mode_pair
+                .as_ref()
+                .map(|(m, _)| m.as_str())
+                .or(self.snapshot.mode.as_deref())
+                .map(str::to_string);
+            Self::read_all_settings(
+                &mut rig.client,
+                caps_clone.as_ref(),
+                freq_snap,
+                mode_snap.as_deref(),
+                &mut next_settings,
+            )
+            .await;
+        }
 
         let mut changed = false;
         if self.snapshot.freq_hz != Some(freq) {
@@ -655,6 +801,10 @@ impl RadioWorker {
                 self.snapshot.ptt = ptt;
                 changed = true;
             }
+        }
+        if self.snapshot.settings != next_settings {
+            self.snapshot.settings = next_settings;
+            changed = true;
         }
 
         self.snapshot.last_poll_utc = Some(now_utc_str());
@@ -912,6 +1062,313 @@ impl RadioWorker {
         }))
     }
 
+    async fn read_all_settings(
+        client: &mut RigctldClient,
+        caps: Option<&RigCapabilities>,
+        freq_hz: Option<u64>,
+        mode: Option<&str>,
+        out: &mut RadioLiveSettings,
+    ) {
+        if let Ok(Some(v)) = client.get_vfo().await {
+            out.vfo = Some(v);
+        }
+        if caps.is_none_or(|c| c.has_split) {
+            if let Ok(Some((sp, tx_vfo))) = client.get_split().await {
+                out.split = Some(sp);
+                out.tx_vfo = tx_vfo;
+            }
+        }
+        if caps.is_none_or(|c| c.max_rit_hz.is_some()) {
+            if let Ok(Some(rit)) = client.get_rit().await {
+                out.rit_hz = Some(rit);
+            }
+        }
+        if caps.is_none_or(|c| c.max_xit_hz.is_some()) {
+            if let Ok(Some(xit)) = client.get_xit().await {
+                out.xit_hz = Some(xit);
+            }
+        }
+
+        let level_names: Vec<String> = match caps {
+            Some(c) => c.get_levels.clone(),
+            None => vec![
+                "RFPOWER".into(),
+                "AF".into(),
+                "RF".into(),
+                "SQL".into(),
+                "PREAMP".into(),
+                "ATT".into(),
+                "AGC".into(),
+                "STRENGTH".into(),
+            ],
+        };
+        for name in level_names {
+            if let Ok(Some(val)) = client.get_level(&name).await {
+                if name == "STRENGTH" {
+                    out.strength_db = Some(val.round() as i32);
+                } else {
+                    out.levels.insert(name.clone(), val);
+                }
+            }
+        }
+
+        if let (Some(&rf_pwr), Some(f_hz)) = (out.levels.get("RFPOWER"), freq_hz) {
+            if let Ok(Some(mw)) = client.power2mw(rf_pwr, f_hz, mode.unwrap_or("USB")).await {
+                out.rf_power_watts = Some(f64::from(mw) / 1000.0);
+            }
+        }
+
+        let func_names: Vec<String> = match caps {
+            Some(c) => c.get_funcs.clone(),
+            None => vec![
+                "TUNER".into(),
+                "NB".into(),
+                "NR".into(),
+                "COMP".into(),
+                "VOX".into(),
+                "LOCK".into(),
+            ],
+        };
+        for name in func_names {
+            if let Ok(Some(enabled)) = client.get_func(&name).await {
+                out.funcs.insert(name, enabled);
+            }
+        }
+    }
+
+    async fn exec_set_vfo(&mut self, vfo: &str) -> CmdResult {
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+        rig.client
+            .set_vfo(vfo)
+            .await
+            .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+        let confirmed = rig
+            .client
+            .get_vfo()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| vfo.trim().to_string());
+        self.snapshot.settings.vfo = Some(confirmed.clone());
+        self.snapshot.last_poll_utc = Some(now_utc_str());
+        self.publish_snapshot(Some(format!("VFO switched to {confirmed}")));
+        Ok(json!({ "radio_id": self.profile.radio_id, "vfo": confirmed }))
+    }
+
+    async fn exec_set_split(&mut self, enabled: bool, tx_vfo: &str) -> CmdResult {
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+        rig.client
+            .set_split(enabled, tx_vfo)
+            .await
+            .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+        let (sp, tv) = rig
+            .client
+            .get_split()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or((enabled, Some(tx_vfo.to_string())));
+        self.snapshot.settings.split = Some(sp);
+        self.snapshot.settings.tx_vfo = tv.clone();
+        self.snapshot.last_poll_utc = Some(now_utc_str());
+        self.publish_snapshot(Some(format!("Split {}", if sp { "ON" } else { "OFF" })));
+        Ok(json!({ "radio_id": self.profile.radio_id, "split": sp, "tx_vfo": tv }))
+    }
+
+    async fn exec_set_rit(&mut self, offset_hz: i32) -> CmdResult {
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+        rig.client
+            .set_rit(offset_hz)
+            .await
+            .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+        let confirmed = rig
+            .client
+            .get_rit()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(offset_hz);
+        self.snapshot.settings.rit_hz = Some(confirmed);
+        self.snapshot.last_poll_utc = Some(now_utc_str());
+        self.publish_snapshot(Some(format!("RIT set to {confirmed} Hz")));
+        Ok(json!({ "radio_id": self.profile.radio_id, "rit_hz": confirmed }))
+    }
+
+    async fn exec_set_xit(&mut self, offset_hz: i32) -> CmdResult {
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+        rig.client
+            .set_xit(offset_hz)
+            .await
+            .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+        let confirmed = rig
+            .client
+            .get_xit()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(offset_hz);
+        self.snapshot.settings.xit_hz = Some(confirmed);
+        self.snapshot.last_poll_utc = Some(now_utc_str());
+        self.publish_snapshot(Some(format!("XIT set to {confirmed} Hz")));
+        Ok(json!({ "radio_id": self.profile.radio_id, "xit_hz": confirmed }))
+    }
+
+    async fn exec_set_level(&mut self, name: &str, value: f64) -> CmdResult {
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+        let upper = name.trim().to_ascii_uppercase();
+        rig.client
+            .set_level(&upper, value)
+            .await
+            .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+        let confirmed = rig
+            .client
+            .get_level(&upper)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(value);
+        self.snapshot
+            .settings
+            .levels
+            .insert(upper.clone(), confirmed);
+        if upper == "RFPOWER" {
+            if let Some(f_hz) = self.snapshot.freq_hz {
+                if let Ok(Some(mw)) = rig
+                    .client
+                    .power2mw(
+                        confirmed,
+                        f_hz,
+                        self.snapshot.mode.as_deref().unwrap_or("USB"),
+                    )
+                    .await
+                {
+                    self.snapshot.settings.rf_power_watts = Some(f64::from(mw) / 1000.0);
+                }
+            }
+        }
+        self.snapshot.last_poll_utc = Some(now_utc_str());
+        self.publish_snapshot(Some(format!("Level {upper} set to {confirmed}")));
+        Ok(json!({
+            "radio_id": self.profile.radio_id,
+            "name": upper,
+            "value": confirmed,
+            "rf_power_watts": self.snapshot.settings.rf_power_watts,
+        }))
+    }
+
+    async fn exec_set_func(&mut self, name: &str, enabled: bool) -> CmdResult {
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+        let upper = name.trim().to_ascii_uppercase();
+        rig.client
+            .set_func(&upper, enabled)
+            .await
+            .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+        let confirmed = rig
+            .client
+            .get_func(&upper)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(enabled);
+        self.snapshot
+            .settings
+            .funcs
+            .insert(upper.clone(), confirmed);
+        self.snapshot.last_poll_utc = Some(now_utc_str());
+        self.publish_snapshot(Some(format!(
+            "Function {upper} {}",
+            if confirmed { "ON" } else { "OFF" }
+        )));
+        Ok(json!({
+            "radio_id": self.profile.radio_id,
+            "name": upper,
+            "enabled": confirmed,
+        }))
+    }
+
+    async fn exec_refresh_settings(&mut self) -> CmdResult {
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+        let mut next = self.snapshot.settings.clone();
+        Self::read_all_settings(
+            &mut rig.client,
+            self.snapshot.capabilities.as_ref(),
+            self.snapshot.freq_hz,
+            self.snapshot.mode.as_deref(),
+            &mut next,
+        )
+        .await;
+        self.snapshot.settings = next;
+        self.snapshot.last_poll_utc = Some(now_utc_str());
+        self.publish_snapshot(Some("Refreshed CAT radio settings".into()));
+        Ok(json!({
+            "radio_id": self.profile.radio_id,
+            "settings": self.snapshot.settings,
+        }))
+    }
+
     async fn fail_closed_drop_ptt(
         &mut self,
         teardown_reason: &str,
@@ -1008,6 +1465,8 @@ impl RadioWorker {
             rigctld_pid: self.snapshot.rigctld_pid,
             last_error: self.snapshot.last_error.clone(),
             recovery_attempts: Some(self.snapshot.recovery_attempts),
+            capabilities: self.snapshot.capabilities.clone().map(Box::new),
+            settings: Some(Box::new(self.snapshot.settings.clone())),
             detail,
         });
     }

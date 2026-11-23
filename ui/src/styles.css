@@ -59,6 +59,7 @@ body {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+  cursor: pointer;
 }
 
 .brand h1 {
@@ -139,8 +140,8 @@ body {
 }
 
 .slot-odd {
-  background: rgba(168, 85, 247, 0.22);
-  color: #d8b4fe;
+  background: rgba(245, 158, 11, 0.2);
+  color: #fcd34d;
 }
 
 .utc-readout {
@@ -170,7 +171,7 @@ body {
 }
 
 .fill-odd {
-  background: #a855f7;
+  background: #f59e0b;
 }
 
 .main-content {
@@ -777,7 +778,7 @@ body {
 }
 
 .swatch-even {
-  background: #22c55e;
+  background: #38bdf8;
 }
 
 .swatch-odd {
@@ -874,4 +875,364 @@ body {
 
 .row-mine {
   background: rgba(239, 68, 68, 0.14);
+}
+
+/* Radio Fleet & Setup Splash */
+.radio-fleet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 0.85rem;
+}
+
+.fleet-card {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 0.7rem;
+  transition: border-color 140ms ease;
+}
+
+.fleet-card:hover {
+  border-color: var(--accent);
+}
+
+.fleet-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  cursor: pointer;
+}
+
+.fleet-card-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--border);
+}
+
+.empty-fleet-box {
+  padding: 1rem;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--surface-alt);
+}
+
+/* FT8 Operation Layout (2/3 Waterfall + 1/3 Decodes; Roster + Sequencer) */
+.operating-header-grid {
+  display: grid;
+  grid-template-columns: 1.3fr auto auto;
+  gap: 1rem;
+  align-items: start;
+}
+
+@media (max-width: 1040px) {
+  .operating-header-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.op-zone {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  position: relative;
+}
+
+.op-zone-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.op-zone-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.demo-popover {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.45rem 0.6rem;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  margin-top: 0.25rem;
+}
+
+.ft8-top-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 1rem;
+  align-items: stretch;
+}
+
+.ft8-bottom-grid {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+@media (max-width: 1080px) {
+  .ft8-top-grid,
+  .ft8-bottom-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.table-scroll-compact {
+  max-height: 230px;
+}
+
+.msg-cell {
+  max-width: 185px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Channel Roster Sort Headers */
+.sort-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.sort-btn:hover {
+  color: var(--accent);
+}
+
+/* QSO Sequencer Priority Cards */
+.qso-card-head {
+  border-color: var(--ok);
+  border-left: 3px solid var(--ok);
+}
+
+.qso-card-paused {
+  border-color: rgba(245, 158, 11, 0.5);
+  border-left: 3px solid var(--warn);
+}
+
+.qso-overrides summary,
+.manual-tx-details summary {
+  cursor: pointer;
+  font-size: 0.76rem;
+  user-select: none;
+}
+
+.manual-tx-details {
+  margin-top: 0.75rem;
+  padding-top: 0.55rem;
+  border-top: 1px dashed var(--border);
+}
+
+/* Radio Info Dynamic Controls */
+.s-meter {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 170px;
+}
+
+.s-meter-track {
+  width: 90px;
+  height: 7px;
+  background: var(--surface-alt);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.s-meter-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e 0%, #38bdf8 65%, #f59e0b 85%, #ef4444 100%);
+  transition: width 150ms ease;
+}
+
+.discrete-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.seg-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.sliders-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 0.75rem;
+}
+
+.setting-slider {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0.5rem 0.65rem;
+}
+
+.setting-slider-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.func-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.event-drawer {
+  border-top: 2px solid var(--accent);
+}
+
+.badge-role-caller {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.16);
+}
+
+.badge-role-hunter {
+  color: #c084fc;
+  background: rgba(192, 132, 252, 0.18);
+}
+
+/* Live Decodes Cycle Separator */
+.decode-cycle-gap td {
+  padding: 0.28rem 0.45rem;
+  border-bottom: none;
+  background: transparent;
+}
+
+.decode-cycle-gap-inner {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.decode-cycle-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+  opacity: 0.85;
+}
+
+.decode-cycle-label {
+  font-size: 0.67rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* QSO Sequencer Distinct RX / TX Message Boxes */
+.qso-msg-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.qso-msg-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.qso-msg-rx {
+  border-left: 3px solid #38bdf8;
+  background: rgba(56, 189, 248, 0.06);
+}
+
+.qso-msg-tx {
+  border-left: 3px solid var(--ok);
+  background: rgba(34, 197, 94, 0.06);
+}
+
+.qso-msg-tx-live {
+  border-left: 3px solid #ef4444;
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.qso-msg-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.qso-dir-tag {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+}
+
+.qso-dir-rx {
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.16);
+}
+
+.qso-dir-tx {
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.16);
+}
+
+.qso-dir-tx-live {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.22);
+}
+
+.qso-msg-text {
+  font-size: 0.84rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+.qso-af-pill {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  color: var(--muted);
 }

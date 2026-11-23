@@ -40,9 +40,60 @@ pub enum RigctldError {
     RadioPoweredOff(String),
 }
 
+pub const CURATED_LEVELS: &[&str] = &[
+    "RFPOWER",
+    "AF",
+    "RF",
+    "SQL",
+    "MICGAIN",
+    "PREAMP",
+    "ATT",
+    "AGC",
+    "NR",
+    "NB",
+    "COMP",
+    "KEYSPD",
+    "STRENGTH",
+    "SWR",
+    "ALC",
+    "RFPOWER_METER_WATTS",
+];
+
+pub const WRITABLE_LEVELS: &[&str] = &[
+    "RFPOWER", "AF", "RF", "SQL", "MICGAIN", "PREAMP", "ATT", "AGC", "NR", "NB", "COMP", "KEYSPD",
+];
+
+pub const CURATED_FUNCS: &[&str] = &[
+    "TUNER", "NB", "NR", "COMP", "VOX", "LOCK", "ANF", "MON", "RIT", "XIT",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgcLevelOption {
+    pub value: i32,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RigCapabilities {
+    pub model_id: i64,
+    pub modes: Vec<String>,
+    pub vfos: Vec<String>,
+    pub preamp_db: Vec<i32>,
+    pub att_db: Vec<i32>,
+    pub agc_levels: Vec<AgcLevelOption>,
+    pub get_levels: Vec<String>,
+    pub set_levels: Vec<String>,
+    pub get_funcs: Vec<String>,
+    pub set_funcs: Vec<String>,
+    pub max_rit_hz: Option<i32>,
+    pub max_xit_hz: Option<i32>,
+    pub has_split: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtendedResponse {
     pub values: HashMap<String, String>,
+    pub raw_lines: Vec<String>,
     pub code: i32,
 }
 
@@ -84,6 +135,7 @@ impl RigctldClient {
             self.writer.flush().await?;
 
             let mut values = HashMap::new();
+            let mut raw_lines = Vec::new();
             let mut line = String::new();
             loop {
                 line.clear();
@@ -98,7 +150,11 @@ impl RigctldClient {
                     let code = code_str.trim().parse::<i32>().map_err(|_| {
                         RigctldError::ProtocolError(format!("invalid RPRT code '{s}'"))
                     })?;
-                    return Ok(ExtendedResponse { values, code });
+                    return Ok(ExtendedResponse {
+                        values,
+                        raw_lines,
+                        code,
+                    });
                 }
                 if let Some((k, v)) = s.split_once(':') {
                     let key = k.trim().to_string();
@@ -106,6 +162,8 @@ impl RigctldClient {
                     if !val.is_empty() {
                         values.insert(key, val);
                     }
+                } else if !s.is_empty() {
+                    raw_lines.push(s.to_string());
                 }
             }
         };
@@ -214,6 +272,170 @@ impl RigctldClient {
             }
             Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
             Err(RigctldError::HamlibError { code: -20, .. }) => Ok(Some(false)),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn get_vfo(&mut self) -> Result<Option<String>, RigctldError> {
+        match self.send_extended("+v", DEFAULT_CAT_TIMEOUT).await {
+            Ok(resp) => Ok(resp
+                .values
+                .get("VFO")
+                .cloned()
+                .or_else(|| resp.raw_lines.first().cloned())),
+            Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn set_vfo(&mut self, vfo: &str) -> Result<(), RigctldError> {
+        let trimmed = vfo.trim();
+        self.send_extended(&format!("+V {trimmed}"), DEFAULT_CAT_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_split(&mut self) -> Result<Option<(bool, Option<String>)>, RigctldError> {
+        match self.send_extended("+s", DEFAULT_CAT_TIMEOUT).await {
+            Ok(resp) => {
+                let split_on = resp
+                    .values
+                    .get("Split")
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .is_some_and(|v| v != 0);
+                let tx_vfo = resp.values.get("TX VFO").cloned();
+                Ok(Some((split_on, tx_vfo)))
+            }
+            Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn set_split(&mut self, enabled: bool, tx_vfo: &str) -> Result<(), RigctldError> {
+        let flag = if enabled { 1 } else { 0 };
+        let vfo = if tx_vfo.trim().is_empty() {
+            "VFOB"
+        } else {
+            tx_vfo.trim()
+        };
+        self.send_extended(&format!("+S {flag} {vfo}"), DEFAULT_CAT_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_rit(&mut self) -> Result<Option<i32>, RigctldError> {
+        match self.send_extended("+j", DEFAULT_CAT_TIMEOUT).await {
+            Ok(resp) => Ok(resp.values.get("RIT").and_then(|s| s.parse::<i32>().ok())),
+            Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn set_rit(&mut self, hz: i32) -> Result<(), RigctldError> {
+        self.send_extended(&format!("+J {hz}"), DEFAULT_CAT_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_xit(&mut self) -> Result<Option<i32>, RigctldError> {
+        match self.send_extended("+z", DEFAULT_CAT_TIMEOUT).await {
+            Ok(resp) => Ok(resp.values.get("XIT").and_then(|s| s.parse::<i32>().ok())),
+            Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn set_xit(&mut self, hz: i32) -> Result<(), RigctldError> {
+        self.send_extended(&format!("+Z {hz}"), DEFAULT_CAT_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_level(&mut self, name: &str) -> Result<Option<f64>, RigctldError> {
+        let upper = name.trim().to_ascii_uppercase();
+        match self
+            .send_extended(&format!("+l {upper}"), DEFAULT_CAT_TIMEOUT)
+            .await
+        {
+            Ok(resp) => {
+                let val = resp
+                    .raw_lines
+                    .first()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| {
+                        resp.values
+                            .get("Level Value")
+                            .and_then(|s| s.parse::<f64>().ok())
+                    });
+                Ok(val)
+            }
+            Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn set_level(&mut self, name: &str, value: f64) -> Result<(), RigctldError> {
+        let upper = name.trim().to_ascii_uppercase();
+        let val_str = if matches!(upper.as_str(), "PREAMP" | "ATT" | "AGC" | "KEYSPD") {
+            format!("{}", value.round() as i64)
+        } else {
+            format!("{value:.4}")
+        };
+        self.send_extended(&format!("+L {upper} {val_str}"), DEFAULT_CAT_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_func(&mut self, name: &str) -> Result<Option<bool>, RigctldError> {
+        let upper = name.trim().to_ascii_uppercase();
+        match self
+            .send_extended(&format!("+u {upper}"), DEFAULT_CAT_TIMEOUT)
+            .await
+        {
+            Ok(resp) => {
+                let raw = resp
+                    .raw_lines
+                    .first()
+                    .map(String::as_str)
+                    .or_else(|| resp.values.get("Func Status").map(String::as_str));
+                Ok(raw.and_then(|s| s.parse::<i32>().ok()).map(|v| v != 0))
+            }
+            Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn set_func(&mut self, name: &str, enabled: bool) -> Result<(), RigctldError> {
+        let upper = name.trim().to_ascii_uppercase();
+        let flag = if enabled { 1 } else { 0 };
+        self.send_extended(&format!("+U {upper} {flag}"), DEFAULT_CAT_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn power2mw(
+        &mut self,
+        level: f64,
+        freq_hz: u64,
+        mode: &str,
+    ) -> Result<Option<u32>, RigctldError> {
+        let norm_mode = if mode.trim().is_empty() {
+            "USB"
+        } else {
+            mode.trim()
+        };
+        match self
+            .send_extended(
+                &format!("+\\power2mW {level:.4} {freq_hz} {norm_mode}"),
+                DEFAULT_CAT_TIMEOUT,
+            )
+            .await
+        {
+            Ok(resp) => Ok(resp
+                .values
+                .get("Power mW")
+                .and_then(|s| s.parse::<u32>().ok())),
+            Err(RigctldError::HamlibError { code: -4 | -11, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -590,6 +812,156 @@ pub struct HamlibModelEntry {
     pub status: String,
 }
 
+pub fn load_rig_capabilities(rigctl_bin: &str, model_id: i64) -> Option<RigCapabilities> {
+    if model_id <= 0 {
+        return None;
+    }
+    let out = std::process::Command::new(rigctl_bin)
+        .args(["-m", &model_id.to_string(), "-u"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_rigctl_caps(
+        model_id,
+        &String::from_utf8_lossy(&out.stdout),
+    ))
+}
+
+fn parse_curated_token_list(raw: &str, allowlist: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    for tok in raw.split_whitespace() {
+        let name = tok.split('(').next().unwrap_or(tok).trim();
+        let upper = name.to_ascii_uppercase();
+        if allowlist.contains(&upper.as_str()) && !found.contains(&upper) {
+            found.push(upper);
+        }
+    }
+    found
+}
+
+fn parse_db_steps(raw: &str) -> Vec<i32> {
+    let mut steps = Vec::new();
+    for tok in raw.split_whitespace() {
+        let cleaned = tok.trim_end_matches("dB").trim_end_matches("db");
+        if let Ok(val) = cleaned.parse::<i32>() {
+            if val > 0 && !steps.contains(&val) {
+                steps.push(val);
+            }
+        }
+    }
+    if !steps.is_empty() {
+        steps.insert(0, 0);
+    }
+    steps
+}
+
+fn parse_max_rit_xit_hz(raw: &str) -> Option<i32> {
+    // Examples: "-9.990kHz/+9.990kHz", "-9999Hz/+9999Hz"
+    let plus_part = raw.split('/').nth(1).unwrap_or(raw).trim();
+    let lower = plus_part.to_ascii_lowercase();
+    if let Some(num) = lower.strip_suffix("khz") {
+        num.trim()
+            .trim_start_matches('+')
+            .parse::<f64>()
+            .ok()
+            .map(|k| (k * 1000.0).round() as i32)
+            .filter(|&hz| hz > 0)
+    } else if let Some(num) = lower.strip_suffix("hz") {
+        num.trim()
+            .trim_start_matches('+')
+            .parse::<f64>()
+            .ok()
+            .map(|h| h.round() as i32)
+            .filter(|&hz| hz > 0)
+    } else {
+        None
+    }
+}
+
+pub fn parse_rigctl_caps(model_id: i64, stdout: &str) -> RigCapabilities {
+    let mut modes = Vec::new();
+    let mut vfos = Vec::new();
+    let mut preamp_db = Vec::new();
+    let mut att_db = Vec::new();
+    let mut agc_levels = Vec::new();
+    let mut get_levels = Vec::new();
+    let mut set_levels = Vec::new();
+    let mut get_funcs = Vec::new();
+    let mut set_funcs = Vec::new();
+    let mut max_rit_hz = None;
+    let mut max_xit_hz = None;
+    let mut targetable_vfo = false;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Mode list:") {
+            for tok in rest.split_whitespace() {
+                let m = tok.trim().to_ascii_uppercase();
+                if !m.is_empty() && !modes.contains(&m) {
+                    modes.push(m);
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("VFO list:") {
+            if vfos.is_empty() {
+                for tok in rest.split_whitespace() {
+                    let v = tok.trim().to_string();
+                    if !v.is_empty() && v != "currVFO" && !vfos.contains(&v) {
+                        vfos.push(v);
+                    }
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Preamp:") {
+            preamp_db = parse_db_steps(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("Attenuator:") {
+            att_db = parse_db_steps(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("AGC levels:") {
+            for tok in rest.split_whitespace() {
+                if let Some((num_s, lbl)) = tok.split_once('=') {
+                    if let Ok(value) = num_s.trim().parse::<i32>() {
+                        agc_levels.push(AgcLevelOption {
+                            value,
+                            label: lbl.trim().to_string(),
+                        });
+                    }
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Get level:") {
+            get_levels = parse_curated_token_list(rest, CURATED_LEVELS);
+        } else if let Some(rest) = trimmed.strip_prefix("Set level:") {
+            set_levels = parse_curated_token_list(rest, WRITABLE_LEVELS);
+        } else if let Some(rest) = trimmed.strip_prefix("Get functions:") {
+            get_funcs = parse_curated_token_list(rest, CURATED_FUNCS);
+        } else if let Some(rest) = trimmed.strip_prefix("Set functions:") {
+            set_funcs = parse_curated_token_list(rest, CURATED_FUNCS);
+        } else if let Some(rest) = trimmed.strip_prefix("Max RIT:") {
+            max_rit_hz = parse_max_rit_xit_hz(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("Max XIT:") {
+            max_xit_hz = parse_max_rit_xit_hz(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("Has targetable VFO:") {
+            targetable_vfo = rest.trim().eq_ignore_ascii_case("Y");
+        }
+    }
+
+    let has_split = vfos.len() > 1 || targetable_vfo || stdout.contains("Can set Split");
+    RigCapabilities {
+        model_id,
+        modes,
+        vfos,
+        preamp_db,
+        att_db,
+        agc_levels,
+        get_levels,
+        set_levels,
+        get_funcs,
+        set_funcs,
+        max_rit_hz,
+        max_xit_hz,
+        has_split,
+    }
+}
+
 pub fn load_hamlib_models(rigctl_bin: &str) -> Vec<HamlibModelEntry> {
     if let Ok(out) = std::process::Command::new(rigctl_bin).arg("-l").output() {
         if out.status.success() {
@@ -896,5 +1268,84 @@ mod tests {
             std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert!(matches!(res, Err(RigctldError::PermissionDenied(_))));
         }
+    }
+
+    #[test]
+    fn parses_ts570_and_ic7300_rigctl_caps() {
+        let ts570 = "\
+Model name:\tTS-570S
+Max RIT: -9.990kHz/+9.990kHz
+Max XIT: -9.990kHz/+9.990kHz
+Preamp: 12dB
+Attenuator: 18dB
+AGC levels: 2=FAST 3=SLOW
+Get functions: FAGC NB COMP VOX TONE TSQL NR LOCK BC TUNER 
+Set functions: FAGC NB COMP VOX TONE TSQL NR LOCK BC TUNER 
+Get level: PREAMP(10..20/10) ATT(12..12/0) AF(0..1/0.0039) RF(0..1/0.0039) RFPOWER(0.05..1/0.01) STRENGTH(0..60/0) 
+Set level: PREAMP(10..20/10) ATT(12..12/0) AF(0..1/0.0039) RF(0..1/0.0039) RFPOWER(0.05..1/0.01) 
+Mode list: AM CW USB LSB RTTY FM 
+VFO list: VFOA VFOB 
+";
+        let caps = parse_rigctl_caps(2016, ts570);
+        assert_eq!(caps.modes, vec!["AM", "CW", "USB", "LSB", "RTTY", "FM"]);
+        assert_eq!(caps.vfos, vec!["VFOA", "VFOB"]);
+        assert_eq!(caps.preamp_db, vec![0, 12]);
+        assert_eq!(caps.att_db, vec![0, 18]);
+        assert_eq!(caps.agc_levels.len(), 2);
+        assert_eq!(caps.max_rit_hz, Some(9990));
+        assert!(caps.set_funcs.contains(&"TUNER".to_string()));
+        assert!(caps.set_levels.contains(&"RFPOWER".to_string()));
+        assert!(caps.get_levels.contains(&"STRENGTH".to_string()));
+        assert!(!caps.set_levels.contains(&"STRENGTH".to_string()));
+
+        let ic7300 = "\
+Model name:\tIC-7300
+Preamp: 1dB 2dB
+Attenuator: 20dB
+Mode list: AM CW USB LSB RTTY FM CWR RTTYR PKTLSB PKTUSB FM-D AM-D 
+VFO list: VFOA VFOB MEM 
+";
+        let ic_caps = parse_rigctl_caps(3073, ic7300);
+        assert!(ic_caps.modes.contains(&"PKTUSB".to_string()));
+        assert_eq!(ic_caps.preamp_db, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn dummy_rigctld_settings_round_trip() {
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut prof = sample_profile(true);
+        prof.rigctld_port = port;
+        let cancel = CancellationToken::new();
+        let Ok((proc_handle, mut client)) =
+            RigctldProcess::spawn_and_connect("rigctld", &prof, None, &cancel).await
+        else {
+            return;
+        };
+
+        assert!(client.get_vfo().await.unwrap().is_some());
+        client.set_vfo("VFOB").await.unwrap();
+        assert_eq!(client.get_vfo().await.unwrap().as_deref(), Some("VFOB"));
+
+        client.set_split(true, "VFOA").await.unwrap();
+        assert_eq!(
+            client.get_split().await.unwrap(),
+            Some((true, Some("VFOA".to_string())))
+        );
+
+        client.set_level("RFPOWER", 0.5).await.unwrap();
+        let pwr = client.get_level("RFPOWER").await.unwrap().unwrap();
+        assert!((pwr - 0.5).abs() < 0.01);
+        let mw = client.power2mw(0.5, 14_074_000, "USB").await.unwrap();
+        assert_eq!(mw, Some(50_000));
+
+        client.set_func("TUNER", true).await.unwrap();
+        assert_eq!(client.get_func("TUNER").await.unwrap(), Some(true));
+
+        proc_handle.shutdown_gracefully(Some(&mut client)).await;
     }
 }

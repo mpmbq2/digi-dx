@@ -83,14 +83,14 @@ export function WaterfallCanvas({
       ctx.fillText(`${hz}`, x + 4, 14);
     }
 
-    // Occupancy strip (Even = green, Odd = amber)
+    // Occupancy strip (Even = blue #38bdf8, Odd = amber #f59e0b)
     const occTop = plotTop + plotH;
     ctx.fillStyle = "#0d1522";
     ctx.fillRect(0, occTop, w, occH);
     for (const hz of evenOccupiedHz) {
       const x1 = ((hz - 25 - MIN_HZ) / (MAX_HZ - MIN_HZ)) * w;
       const x2 = ((hz + 25 - MIN_HZ) / (MAX_HZ - MIN_HZ)) * w;
-      ctx.fillStyle = "rgba(34, 197, 94, 0.75)";
+      ctx.fillStyle = "rgba(56, 189, 248, 0.8)";
       ctx.fillRect(x1, occTop + 2, Math.max(4, x2 - x1), 5);
     }
     for (const hz of oddOccupiedHz) {

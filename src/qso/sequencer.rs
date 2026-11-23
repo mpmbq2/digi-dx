@@ -10,13 +10,17 @@ use crate::domain::ft8::{parse_ft8_message, Ft8Payload, ParsedFt8Message};
 use crate::modem::{Ft8Decode, TxIntent};
 use crate::store::now_utc_str;
 
-const MAX_RECENT_DECODES: usize = 150;
+const MAX_RECENT_DECODES: usize = 300;
 const MAX_CONFIRMED_RETRIES: u8 = 5;
 const OCCUPIED_AF_TOLERANCE_HZ: i32 = 50;
 const OCCUPIED_LOOKBACK_SECS: i64 = 60;
 const SURVEY_MIN_AF_HZ: u16 = 300;
 const SURVEY_MAX_AF_HZ: u16 = 2700;
 const SURVEY_HALF_WIDTH_HZ: u16 = 50;
+
+fn strip_call_brackets(s: &str) -> &str {
+    s.trim().trim_matches(|c| c == '<' || c == '>')
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +139,7 @@ pub enum QsoAction {
     NextStep,
     MoveUp,
     MoveDown,
+    MoveToTop,
 }
 
 impl QsoAction {
@@ -149,6 +154,7 @@ impl QsoAction {
             "next_step" => Ok(Self::NextStep),
             "move_up" => Ok(Self::MoveUp),
             "move_down" => Ok(Self::MoveDown),
+            "move_to_top" => Ok(Self::MoveToTop),
             other => Err(format!("invalid qso.action '{other}'")),
         }
     }
@@ -172,6 +178,8 @@ pub struct QsoSequencer {
     pub queue: Vec<ActiveQso>,
     pub recent_decodes: VecDeque<RecentDecodeEntry>,
     pub survey: Option<AfSurveyState>,
+    pub last_cq_tx_slot_ts: Option<i64>,
+    pub last_cq_reply_slot_ts: Option<i64>,
 }
 
 impl QsoSequencer {
@@ -187,6 +195,8 @@ impl QsoSequencer {
             queue: Vec::new(),
             recent_decodes: VecDeque::with_capacity(MAX_RECENT_DECODES),
             survey: None,
+            last_cq_tx_slot_ts: None,
+            last_cq_reply_slot_ts: None,
         }
     }
 
@@ -222,6 +232,7 @@ impl QsoSequencer {
         self.queue.retain(|q| !q.is_cq);
         self.manual_tx = None;
         self.tx_enabled = true;
+        self.last_cq_reply_slot_ts = None;
 
         let cq = ActiveQso {
             qso_id: Uuid::now_v7().to_string(),
@@ -255,6 +266,17 @@ impl QsoSequencer {
         rx_slot: SlotParity,
         snr_db: Option<i8>,
     ) -> ActiveQso {
+        self.start_reply_with_rx(their_call, their_grid, rx_slot, snr_db, None)
+    }
+
+    pub fn start_reply_with_rx(
+        &mut self,
+        their_call: &str,
+        their_grid: Option<String>,
+        rx_slot: SlotParity,
+        snr_db: Option<i8>,
+        initial_rx: Option<TranscriptEntry>,
+    ) -> ActiveQso {
         let now = now_utc_str();
         let call = their_call.trim().to_ascii_uppercase();
         let grid = their_grid
@@ -264,6 +286,11 @@ impl QsoSequencer {
         self.queue.retain(|q| q.is_cq || q.their_call != call);
         self.manual_tx = None;
         self.tx_enabled = true;
+
+        let transcript = match initial_rx {
+            Some(entry) if !entry.message.trim().is_empty() => vec![entry],
+            _ => Vec::new(),
+        };
 
         let qso = ActiveQso {
             qso_id: Uuid::now_v7().to_string(),
@@ -284,7 +311,7 @@ impl QsoSequencer {
             rst_rcvd: None,
             started_at_utc: now.clone(),
             updated_at_utc: now,
-            transcript: Vec::new(),
+            transcript,
         };
         self.queue.insert(0, qso.clone());
         qso
@@ -342,6 +369,13 @@ impl QsoSequencer {
                 }
                 Ok(None)
             }
+            QsoAction::MoveToTop => {
+                if idx > 0 {
+                    let item = self.queue.remove(idx);
+                    self.queue.insert(0, item);
+                }
+                Ok(None)
+            }
             QsoAction::Abandon => {
                 self.queue.remove(idx);
                 Ok(None)
@@ -394,10 +428,10 @@ impl QsoSequencer {
                 return Some(manual.clone());
             }
         }
-        let next_qso = self
-            .queue
-            .iter()
-            .find(|q| q.status == QsoStatus::Active && q.tx_slot == slot)?;
+        let next_qso = self.queue.iter().find(|q| q.status == QsoStatus::Active)?;
+        if next_qso.tx_slot != slot {
+            return None;
+        }
 
         Some(TxIntent {
             af_hz: self.tx_af_hz,
@@ -457,12 +491,19 @@ impl QsoSequencer {
                     .queue
                     .iter()
                     .any(|q| q.is_cq && q.status == QsoStatus::Active);
-                if !has_active_cq {
-                    return completed;
+                let in_same_reply_slot = self.last_cq_reply_slot_ts == Some(decode.slot_ts.0);
+                let recent_cq_tx = self
+                    .last_cq_tx_slot_ts
+                    .is_some_and(|ts| decode.slot_ts.0 > ts && decode.slot_ts.0 <= ts + 30);
+                let is_cq_reply = has_active_cq || in_same_reply_slot || recent_cq_tx;
+
+                if is_cq_reply {
+                    self.queue.retain(|q| !q.is_cq);
+                    self.last_cq_reply_slot_ts = Some(decode.slot_ts.0);
                 }
-                self.queue.retain(|q| !q.is_cq);
+
                 let now = now_utc_str();
-                let promoted = ActiveQso {
+                let incoming = ActiveQso {
                     qso_id: Uuid::now_v7().to_string(),
                     radio_id: self.radio_id.clone(),
                     is_demo: self.is_demo,
@@ -474,7 +515,11 @@ impl QsoSequencer {
                     their_grid: None,
                     tx_slot: rx_slot.opposite(),
                     step: QsoStep::SendReport,
-                    status: QsoStatus::Active,
+                    status: if is_cq_reply {
+                        QsoStatus::Active
+                    } else {
+                        QsoStatus::Paused
+                    },
                     attempts_on_step: 0,
                     last_their_snr_db: Some(decode.snr_db),
                     rst_sent: None,
@@ -483,8 +528,8 @@ impl QsoSequencer {
                     updated_at_utc: now,
                     transcript: Vec::new(),
                 };
-                self.queue.insert(0, promoted);
-                0
+                self.queue.push(incoming);
+                self.queue.len() - 1
             }
         };
 
@@ -559,60 +604,106 @@ impl QsoSequencer {
             }
         }
 
-        let tx_parity = SlotParity::from_unix_secs(slot_ts);
-        let idx = self
-            .queue
-            .iter()
-            .position(|q| q.status == QsoStatus::Active && q.tx_slot == tx_parity)?;
-
         let now = now_utc_str();
-        let mut complete_now = false;
-        let mut timed_out = false;
+        let parsed = parse_ft8_message(&intent.message);
 
-        {
-            let q = &mut self.queue[idx];
-            q.updated_at_utc = now.clone();
-            q.transcript.push(TranscriptEntry {
-                at_utc: now,
-                direction: "tx".to_string(),
-                slot_ts: slot_ts.0,
-                af_hz: intent.af_hz,
-                snr_db: None,
-                message: intent.message.clone(),
-            });
-
-            match q.step {
-                QsoStep::SendReport | QsoStep::SendRReport => {
-                    let sent = q.last_their_snr_db.unwrap_or(-10).clamp(-50, 49);
-                    q.rst_sent = Some(format!("{sent:+03}"));
-                    q.attempts_on_step = q.attempts_on_step.saturating_add(1);
+        match parsed {
+            ParsedFt8Message::Cq { .. } => {
+                self.last_cq_tx_slot_ts = Some(slot_ts.0);
+                if let Some(idx) = self.queue.iter().position(|q| q.is_cq) {
+                    let q = &mut self.queue[idx];
+                    q.updated_at_utc = now.clone();
+                    q.transcript.push(TranscriptEntry {
+                        at_utc: now,
+                        direction: "tx".to_string(),
+                        slot_ts: slot_ts.0,
+                        af_hz: intent.af_hz,
+                        snr_db: None,
+                        message: intent.message.clone(),
+                    });
+                    if q.step == QsoStep::CallingCq {
+                        q.attempts_on_step = q.attempts_on_step.saturating_add(1);
+                    }
                 }
-                QsoStep::Send73 => {
-                    complete_now = true;
-                }
-                QsoStep::CallingCq => {
-                    q.attempts_on_step = q.attempts_on_step.saturating_add(1);
-                }
-                QsoStep::SendGrid | QsoStep::SendRr73 => {
-                    q.attempts_on_step = q.attempts_on_step.saturating_add(1);
-                }
+                None
             }
+            ParsedFt8Message::Directed { to, payload, .. } => {
+                let to_clean = strip_call_brackets(&to);
+                let idx = self.queue.iter().position(|q| {
+                    !q.is_cq && strip_call_brackets(&q.their_call).eq_ignore_ascii_case(to_clean)
+                })?;
 
-            if !q.is_cq && !complete_now && q.attempts_on_step >= MAX_CONFIRMED_RETRIES {
-                timed_out = true;
+                let (tx_step, sent_snr) = match payload {
+                    Some(Ft8Payload::Grid(_)) => (Some(QsoStep::SendGrid), None),
+                    Some(Ft8Payload::Report {
+                        is_roger: false,
+                        snr_db,
+                    }) => (Some(QsoStep::SendReport), Some(snr_db)),
+                    Some(Ft8Payload::Report {
+                        is_roger: true,
+                        snr_db,
+                    }) => (Some(QsoStep::SendRReport), Some(snr_db)),
+                    Some(Ft8Payload::Terminal(ref term)) if term == "RR73" || term == "RRR" => {
+                        (Some(QsoStep::SendRr73), None)
+                    }
+                    Some(Ft8Payload::Terminal(ref term)) if term == "73" => {
+                        (Some(QsoStep::Send73), None)
+                    }
+                    None if self.grid4().is_empty() => (Some(QsoStep::SendGrid), None),
+                    _ => (None, None),
+                };
+
+                let mut complete_now = false;
+                let mut timed_out = false;
+
+                {
+                    let q = &mut self.queue[idx];
+                    q.updated_at_utc = now.clone();
+                    q.transcript.push(TranscriptEntry {
+                        at_utc: now,
+                        direction: "tx".to_string(),
+                        slot_ts: slot_ts.0,
+                        af_hz: intent.af_hz,
+                        snr_db: None,
+                        message: intent.message.clone(),
+                    });
+
+                    match tx_step {
+                        Some(QsoStep::Send73) => {
+                            complete_now = true;
+                        }
+                        Some(step @ (QsoStep::SendReport | QsoStep::SendRReport)) => {
+                            if let Some(snr) = sent_snr {
+                                q.rst_sent = Some(format!("{snr:+03}"));
+                            }
+                            if q.step == step {
+                                q.attempts_on_step = q.attempts_on_step.saturating_add(1);
+                            }
+                        }
+                        Some(step) if q.step == step => {
+                            q.attempts_on_step = q.attempts_on_step.saturating_add(1);
+                        }
+                        Some(_) | None => {}
+                    }
+
+                    if !q.is_cq && !complete_now && q.attempts_on_step >= MAX_CONFIRMED_RETRIES {
+                        timed_out = true;
+                    }
+                }
+
+                if complete_now {
+                    let done = self.queue.remove(idx);
+                    return Some(self.build_qso_record(done, "73_sent", dial_freq_hz));
+                }
+
+                if timed_out {
+                    self.queue.remove(idx);
+                }
+
+                None
             }
+            ParsedFt8Message::Raw { .. } => None,
         }
-
-        if complete_now {
-            let done = self.queue.remove(idx);
-            return Some(self.build_qso_record(done, "73_sent", dial_freq_hz));
-        }
-
-        if timed_out {
-            self.queue.remove(idx);
-        }
-
-        None
     }
 
     pub fn is_af_occupied(
@@ -884,5 +975,193 @@ mod tests {
         // With transmitters around 500 Hz and 900 Hz, widest gap in 300..2700 is 950..2700 -> mid ~1825 -> 1830 Hz
         let best = select_widest_clear_af(&[500, 900]);
         assert!((1800..=1850).contains(&best), "got {best} Hz");
+    }
+
+    #[test]
+    fn multiple_cq_replies_in_same_slot_all_enqueue_and_work_in_order() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_cq(SlotParity::Even, None);
+        let cq_tx = seq.compose_tx_for_slot(SlotParity::Even, 0).unwrap();
+        assert!(seq
+            .on_tx_confirmed(UnixSecs(0), &cq_tx, Some(14_074_000))
+            .is_none());
+
+        for (i, (call, grid)) in [
+            ("K1AAA", "FN42"),
+            ("W2BBB", "EM10"),
+            ("N3CCC", "DN70"),
+            ("JA4DDD", "PM95"),
+            ("DL5EEE", "JO31"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let msg = format!("N1MPM {call} {grid}");
+            seq.on_rx_decode(
+                &mk_decode(15, -5 - i as i8, 900 + (i as u16) * 100, &msg),
+                Some(14_074_000),
+            );
+        }
+
+        assert_eq!(seq.queue.len(), 5);
+        assert!(seq
+            .queue
+            .iter()
+            .all(|q| !q.is_cq && q.status == QsoStatus::Active));
+        let calls: Vec<&str> = seq.queue.iter().map(|q| q.their_call.as_str()).collect();
+        assert_eq!(calls, vec!["K1AAA", "W2BBB", "N3CCC", "JA4DDD", "DL5EEE"]);
+
+        let next_tx = seq.compose_tx_for_slot(SlotParity::Even, 30_000).unwrap();
+        assert_eq!(next_tx.message, "K1AAA N1MPM -05");
+        seq.apply_action(
+            &seq.queue[0].qso_id.clone(),
+            QsoAction::Complete,
+            Some(14_074_000),
+        )
+        .unwrap();
+        let second_tx = seq.compose_tx_for_slot(SlotParity::Even, 60_000).unwrap();
+        assert_eq!(second_tx.message, "W2BBB N1MPM -06");
+    }
+
+    #[test]
+    fn unsolicited_directed_call_without_cq_auto_enqueues_paused() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        let done = seq.on_rx_decode(
+            &mk_decode(15, -11, 1300, "N1MPM K9XYZ EN52"),
+            Some(14_074_000),
+        );
+        assert!(done.is_empty());
+        assert_eq!(seq.queue.len(), 1);
+        assert_eq!(seq.queue[0].their_call, "K9XYZ");
+        assert_eq!(seq.queue[0].status, QsoStatus::Paused);
+        assert!(seq.compose_tx_for_slot(SlotParity::Even, 30_000).is_none());
+
+        // Follow-up decode updates SNR/step while staying Paused
+        seq.on_rx_decode(
+            &mk_decode(45, -7, 1300, "N1MPM K9XYZ +01"),
+            Some(14_074_000),
+        );
+        assert_eq!(seq.queue[0].status, QsoStatus::Paused);
+        assert_eq!(seq.queue[0].step, QsoStep::SendRReport);
+
+        // Resuming allows TX
+        let qid = seq.queue[0].qso_id.clone();
+        seq.apply_action(&qid, QsoAction::Resume, Some(14_074_000))
+            .unwrap();
+        let tx = seq.compose_tx_for_slot(SlotParity::Even, 60_000).unwrap();
+        assert_eq!(tx.message, "K9XYZ N1MPM R-07");
+    }
+
+    #[test]
+    fn mixed_parity_queue_only_transmits_head_active_qso() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_reply("K1EVEN", Some("FN42".into()), SlotParity::Odd, Some(-5));
+        // Second station replies in Even slot -> wants Odd TX, appended behind head
+        seq.start_reply("W2ODD", Some("EM10".into()), SlotParity::Even, Some(-8));
+        // Wait: start_reply inserts at 0, so reverse order check: head is W2ODD (tx_slot Odd) and second is K1EVEN (tx_slot Even).
+        assert!(seq.compose_tx_for_slot(SlotParity::Even, 0).is_none());
+        let tx = seq.compose_tx_for_slot(SlotParity::Odd, 15_000).unwrap();
+        assert!(tx.message.starts_with("W2ODD "));
+    }
+
+    #[test]
+    fn move_to_top_promotes_queued_caller() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_cq(SlotParity::Even, None);
+        seq.on_rx_decode(&mk_decode(15, -10, 900, "N1MPM K1AAA FN42"), None);
+        seq.on_rx_decode(&mk_decode(15, -4, 1200, "N1MPM W2BBB EM10"), None);
+        let second_id = seq.queue[1].qso_id.clone();
+        seq.apply_action(&second_id, QsoAction::MoveToTop, None)
+            .unwrap();
+        assert_eq!(seq.queue[0].their_call, "W2BBB");
+    }
+
+    #[test]
+    fn late_rr73_decode_during_r_report_tx_does_not_skip_sending_73() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_reply("K1ABC", Some("FN42".into()), SlotParity::Odd, Some(-10));
+
+        // Peer replies with SNR report -> advances us to SendRReport
+        let done = seq.on_rx_decode(
+            &mk_decode(45, -8, 1200, "N1MPM K1ABC +02"),
+            Some(14_074_000),
+        );
+        assert!(done.is_empty());
+
+        let tx_r = seq.compose_tx_for_slot(SlotParity::Even, 60_000).unwrap();
+        assert_eq!(tx_r.message, "K1ABC N1MPM R-08");
+
+        // Race: late RR73 decode arrives BEFORE tx_r confirmation runs, bumping q.step to Send73
+        let done_late = seq.on_rx_decode(
+            &mk_decode(75, -9, 1200, "N1MPM K1ABC RR73"),
+            Some(14_074_000),
+        );
+        assert!(done_late.is_empty());
+        assert_eq!(seq.queue[0].step, QsoStep::Send73);
+
+        // Confirming tx_r (R-08) must NOT complete the QSO as 73_sent!
+        assert!(seq
+            .on_tx_confirmed(UnixSecs(60), &tx_r, Some(14_074_000))
+            .is_none());
+        assert_eq!(seq.queue.len(), 1);
+        assert_eq!(seq.queue[0].step, QsoStep::Send73);
+        assert_eq!(seq.queue[0].attempts_on_step, 0);
+        assert_eq!(seq.queue[0].rst_sent.as_deref(), Some("-08"));
+
+        // Next slot actually composes and transmits "73"
+        let tx_73 = seq.compose_tx_for_slot(SlotParity::Even, 90_000).unwrap();
+        assert_eq!(tx_73.message, "K1ABC N1MPM 73");
+
+        let rec = seq
+            .on_tx_confirmed(UnixSecs(90), &tx_73, Some(14_074_000))
+            .expect("confirmed 73 TX must complete QSO");
+        assert_eq!(rec.completion_reason, "73_sent");
+        assert!(seq.queue.is_empty());
+        assert!(rec.transcript_json.contains("K1ABC N1MPM R-08"));
+        assert!(rec.transcript_json.contains("K1ABC N1MPM 73"));
+    }
+
+    #[test]
+    fn tx_confirmation_matches_target_call_even_if_queue_reordered() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_reply("K1AAA", Some("FN42".into()), SlotParity::Odd, Some(-5));
+        let in_flight = seq.compose_tx_for_slot(SlotParity::Even, 30_000).unwrap();
+        assert_eq!(in_flight.message, "K1AAA N1MPM FN33");
+
+        // Operator replies to W2BBB while K1AAA's TX is in flight -> W2BBB becomes head
+        seq.start_reply("W2BBB", Some("EM10".into()), SlotParity::Odd, Some(-9));
+        assert_eq!(seq.queue[0].their_call, "W2BBB");
+        assert_eq!(seq.queue[1].their_call, "K1AAA");
+
+        assert!(seq
+            .on_tx_confirmed(UnixSecs(30), &in_flight, Some(14_074_000))
+            .is_none());
+        assert_eq!(seq.queue[0].attempts_on_step, 0);
+        assert!(seq.queue[0].transcript.is_empty());
+        assert_eq!(seq.queue[1].attempts_on_step, 1);
+        assert_eq!(seq.queue[1].transcript.len(), 1);
+        assert_eq!(seq.queue[1].transcript[0].message, "K1AAA N1MPM FN33");
+    }
+
+    #[test]
+    fn start_reply_with_rx_seeds_initial_rx_transcript() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        let qso = seq.start_reply_with_rx(
+            "K1ABC",
+            Some("FN42".into()),
+            SlotParity::Odd,
+            Some(-6),
+            Some(TranscriptEntry {
+                at_utc: "2026-11-23T14:00:00.000Z".to_string(),
+                direction: "rx".to_string(),
+                slot_ts: 1_795_212_915,
+                af_hz: 1420,
+                snr_db: Some(-6),
+                message: "CQ K1ABC FN42".to_string(),
+            }),
+        );
+        assert_eq!(qso.transcript.len(), 1);
+        assert_eq!(qso.transcript[0].direction, "rx");
+        assert_eq!(qso.transcript[0].message, "CQ K1ABC FN42");
     }
 }

@@ -17,8 +17,11 @@ use crate::modem::TxIntent;
 use crate::qso::sequencer::{ActiveQso, QsoAction};
 use crate::qso::SessionManager;
 use crate::store::{
-    now_utc_str, CreateRadioProfileInput, StateStore, StoreError, UpdateRadioProfileInput,
+    now_utc_str, ChannelRosterEntry, CreateRadioProfileInput, StateStore, StoreError,
+    UpdateRadioProfileInput,
 };
+use crate::supervisor::radio_worker::RadioLiveSettings;
+use crate::supervisor::rigctld::{RigCapabilities, CURATED_FUNCS, WRITABLE_LEVELS};
 use crate::supervisor::DeviceSupervisor;
 use crate::telemetry::TelemetryEnvelope;
 use crate::watchdog::{PttWatchdog, WatchdogAbortReason};
@@ -185,7 +188,19 @@ pub enum WsBroadcastEvent {
         rigctld_pid: Option<u32>,
         last_error: Option<String>,
         recovery_attempts: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Box<RigCapabilities>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        settings: Option<Box<RadioLiveSettings>>,
         detail: Option<String>,
+    },
+    RosterUpdate {
+        radio_id: String,
+        is_demo: bool,
+        channel_key: String,
+        band: Option<String>,
+        dial_freq_hz: Option<i64>,
+        entries: Vec<ChannelRosterEntry>,
     },
     UsbDevicesChanged {
         devices: Value,
@@ -433,6 +448,13 @@ impl CommandBus {
             "radio.test_ptt" => self.exec_radio_test_ptt(envelope).await,
             "radio.set_freq" => self.exec_radio_set_freq(envelope).await,
             "radio.set_mode" => self.exec_radio_set_mode(envelope).await,
+            "radio.set_vfo" => self.exec_radio_set_vfo(envelope).await,
+            "radio.set_split" => self.exec_radio_set_split(envelope).await,
+            "radio.set_rit" => self.exec_radio_set_rit(envelope).await,
+            "radio.set_xit" => self.exec_radio_set_xit(envelope).await,
+            "radio.set_level" => self.exec_radio_set_level(envelope).await,
+            "radio.set_func" => self.exec_radio_set_func(envelope).await,
+            "radio.refresh_settings" => self.exec_radio_refresh_settings(envelope).await,
             "control.claim_lease" => self.exec_claim_lease(envelope),
             "control.release_lease" => self.exec_release_lease(envelope).await,
             "control.heartbeat" => self.exec_heartbeat(envelope).await,
@@ -770,6 +792,192 @@ impl CommandBus {
             .set_mode(&radio_id, &mode, passband_hz)
             .await
         {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_set_vfo(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let vfo = envelope
+            .payload
+            .get("vfo")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        match self.supervisor.set_vfo(&radio_id, vfo).await {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_set_split(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let enabled = envelope
+            .payload
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let tx_vfo = envelope
+            .payload
+            .get("tx_vfo")
+            .and_then(Value::as_str)
+            .unwrap_or("VFOB");
+        match self.supervisor.set_split(&radio_id, enabled, tx_vfo).await {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_set_rit(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let offset_hz = envelope
+            .payload
+            .get("offset_hz")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as i32;
+        match self.supervisor.set_rit(&radio_id, offset_hz).await {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_set_xit(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let offset_hz = envelope
+            .payload
+            .get("offset_hz")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as i32;
+        match self.supervisor.set_xit(&radio_id, offset_hz).await {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_set_level(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let name = envelope
+            .payload
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let value = envelope
+            .payload
+            .get("value")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        match self.supervisor.set_level(&radio_id, name, value).await {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_set_func(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let name = envelope
+            .payload
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let enabled = envelope
+            .payload
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match self.supervisor.set_func(&radio_id, name, enabled).await {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_refresh_settings(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        match self.supervisor.refresh_settings(&radio_id).await {
             Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
             Err((code, msg)) => CommandAck::err(
                 envelope.command_id.clone(),
@@ -1156,9 +1364,22 @@ impl CommandBus {
             .get("snr_db")
             .and_then(Value::as_i64)
             .map(|n| n.clamp(-50, 49) as i8);
+        let rx_message = envelope
+            .payload
+            .get("rx_message")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let rx_af_hz = envelope
+            .payload
+            .get("rx_af_hz")
+            .and_then(Value::as_u64)
+            .map(|n| n.clamp(200, 3000) as u16);
+        let rx_ts_sec = envelope.payload.get("rx_ts_sec").and_then(Value::as_i64);
         match self
             .sessions
-            .reply_qso(&radio_id, callsign, their_grid, rx_slot, snr_db)
+            .reply_qso(
+                &radio_id, callsign, their_grid, rx_slot, snr_db, rx_message, rx_af_hz, rx_ts_sec,
+            )
             .await
         {
             Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
@@ -1348,6 +1569,12 @@ fn requires_lease(kind: &str) -> bool {
         "radio.test_ptt"
             | "radio.set_freq"
             | "radio.set_mode"
+            | "radio.set_vfo"
+            | "radio.set_split"
+            | "radio.set_rit"
+            | "radio.set_xit"
+            | "radio.set_level"
+            | "radio.set_func"
             | "control.release_lease"
             | "control.heartbeat"
             | "session.start"
@@ -1474,7 +1701,8 @@ fn validate_command(envelope: &CommandEnvelope) -> Result<(), (ErrorCode, String
                 .trim()
                 .to_ascii_uppercase();
             let valid_modes = [
-                "USB", "LSB", "PKTUSB", "PKTLSB", "CW", "CWR", "FM", "AM", "RTTY", "RTTYR", "DATA",
+                "USB", "LSB", "PKTUSB", "PKTLSB", "PKTFM", "PKTAM", "CW", "CWR", "FM", "FM-D",
+                "AM", "AM-D", "WFM", "RTTY", "RTTYR", "DATA",
             ];
             if !valid_modes.contains(&mode.as_str()) {
                 return Err((
@@ -1489,6 +1717,109 @@ fn validate_command(envelope: &CommandEnvelope) -> Result<(), (ErrorCode, String
                         "passband_hz must be between 0 and 50000".to_string(),
                     ));
                 }
+            }
+            Ok(())
+        }
+        "radio.set_vfo" => {
+            let vfo = envelope
+                .payload
+                .get("vfo")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if vfo.is_empty() || vfo.len() > 16 {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "vfo string is required".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "radio.set_split" => {
+            if envelope
+                .payload
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .is_none()
+            {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "enabled boolean is required for radio.set_split".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "radio.set_rit" | "radio.set_xit" => {
+            let off = envelope
+                .payload
+                .get("offset_hz")
+                .and_then(Value::as_i64)
+                .ok_or((
+                    ErrorCode::ValidationFailed,
+                    "offset_hz integer is required".to_string(),
+                ))?;
+            if !(-20_000..=20_000).contains(&off) {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "offset_hz must be between -20000 and 20000".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "radio.set_level" => {
+            let name = envelope
+                .payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
+            if !WRITABLE_LEVELS.contains(&name.as_str()) {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    format!("unsupported or read-only level '{name}'"),
+                ));
+            }
+            let val = envelope
+                .payload
+                .get("value")
+                .and_then(Value::as_f64)
+                .ok_or((
+                    ErrorCode::ValidationFailed,
+                    "numeric level value is required".to_string(),
+                ))?;
+            if !val.is_finite() {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "level value must be finite".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "radio.set_func" => {
+            let name = envelope
+                .payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
+            if !CURATED_FUNCS.contains(&name.as_str()) {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    format!("unsupported function '{name}'"),
+                ));
+            }
+            if envelope
+                .payload
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .is_none()
+            {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "enabled boolean is required for radio.set_func".to_string(),
+                ));
             }
             Ok(())
         }
