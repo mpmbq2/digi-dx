@@ -77,6 +77,12 @@ impl AudioCaptureHandle {
         std::mem::take(&mut *guard)
     }
 
+    pub fn discard_oldest_samples(&self, count: usize) {
+        let mut guard = self.slot_buffer.lock().expect("slot buffer lock poisoned");
+        let n = count.min(guard.len());
+        guard.drain(..n);
+    }
+
     pub fn buffered_len(&self) -> usize {
         self.slot_buffer
             .lock()

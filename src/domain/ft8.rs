@@ -36,6 +36,55 @@ pub enum ParsedFt8Message {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StationRole {
+    Caller,
+    Hunter,
+}
+
+impl StationRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Caller => "caller",
+            Self::Hunter => "hunter",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "caller" => Some(Self::Caller),
+            "hunter" => Some(Self::Hunter),
+            _ => None,
+        }
+    }
+}
+
+/// Infer whether the transmitting station (`from`) is acting as a Caller (running CQ)
+/// or a Hunter (replying to CQ) based on the standard 6-step FT8 QSO sequence:
+///   1. CQ A GRID      -> Caller
+///   2. A B GRID       -> Hunter
+///   3. B A -10        -> Caller (non-roger report)
+///   4. A B R-08       -> Hunter (roger report)
+///   5. B A RR73 / RRR -> Caller
+///   6. A B 73         -> Hunter
+pub fn infer_station_role(parsed: &ParsedFt8Message) -> Option<StationRole> {
+    match parsed {
+        ParsedFt8Message::Cq { .. } => Some(StationRole::Caller),
+        ParsedFt8Message::Directed { payload, .. } => match payload {
+            Some(Ft8Payload::Grid(_)) => Some(StationRole::Hunter),
+            Some(Ft8Payload::Report {
+                is_roger: false, ..
+            }) => Some(StationRole::Caller),
+            Some(Ft8Payload::Report { is_roger: true, .. }) => Some(StationRole::Hunter),
+            Some(Ft8Payload::Terminal(t)) if t == "RR73" || t == "RRR" => Some(StationRole::Caller),
+            Some(Ft8Payload::Terminal(t)) if t == "73" => Some(StationRole::Hunter),
+            _ => None,
+        },
+        ParsedFt8Message::Raw { .. } => None,
+    }
+}
+
 /// Strip trailing WSJT-X / jt9 decoder-pass metadata starting at `?` (e.g. `? a1`).
 pub fn strip_decoder_metadata(raw: &str) -> (&str, Option<&str>) {
     let trimmed = raw.trim();
@@ -365,6 +414,42 @@ mod tests {
         assert_eq!(
             validate_tx_message("  cq n1mpm fn33  ").unwrap(),
             "CQ N1MPM FN33"
+        );
+    }
+
+    #[test]
+    fn infers_caller_and_hunter_roles_across_ft8_sequence() {
+        assert_eq!(
+            infer_station_role(&parse_ft8_message("CQ N1MPM FN33")),
+            Some(StationRole::Caller)
+        );
+        assert_eq!(
+            infer_station_role(&parse_ft8_message("N1MPM JA1ABC PM95")),
+            Some(StationRole::Hunter)
+        );
+        assert_eq!(
+            infer_station_role(&parse_ft8_message("JA1ABC N1MPM -08")),
+            Some(StationRole::Caller)
+        );
+        assert_eq!(
+            infer_station_role(&parse_ft8_message("N1MPM JA1ABC R+03")),
+            Some(StationRole::Hunter)
+        );
+        assert_eq!(
+            infer_station_role(&parse_ft8_message("JA1ABC N1MPM RR73")),
+            Some(StationRole::Caller)
+        );
+        assert_eq!(
+            infer_station_role(&parse_ft8_message("JA1ABC N1MPM RRR")),
+            Some(StationRole::Caller)
+        );
+        assert_eq!(
+            infer_station_role(&parse_ft8_message("N1MPM JA1ABC 73")),
+            Some(StationRole::Hunter)
+        );
+        assert_eq!(
+            infer_station_role(&parse_ft8_message("SOME FREE TEXT")),
+            None
         );
     }
 }

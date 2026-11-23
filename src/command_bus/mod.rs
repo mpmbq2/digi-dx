@@ -1364,9 +1364,22 @@ impl CommandBus {
             .get("snr_db")
             .and_then(Value::as_i64)
             .map(|n| n.clamp(-50, 49) as i8);
+        let rx_message = envelope
+            .payload
+            .get("rx_message")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let rx_af_hz = envelope
+            .payload
+            .get("rx_af_hz")
+            .and_then(Value::as_u64)
+            .map(|n| n.clamp(200, 3000) as u16);
+        let rx_ts_sec = envelope.payload.get("rx_ts_sec").and_then(Value::as_i64);
         match self
             .sessions
-            .reply_qso(&radio_id, callsign, their_grid, rx_slot, snr_db)
+            .reply_qso(
+                &radio_id, callsign, their_grid, rx_slot, snr_db, rx_message, rx_af_hz, rx_ts_sec,
+            )
             .await
         {
             Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),

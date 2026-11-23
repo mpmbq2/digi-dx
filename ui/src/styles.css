@@ -1116,3 +1116,123 @@ body {
 .event-drawer {
   border-top: 2px solid var(--accent);
 }
+
+.badge-role-caller {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.16);
+}
+
+.badge-role-hunter {
+  color: #c084fc;
+  background: rgba(192, 132, 252, 0.18);
+}
+
+/* Live Decodes Cycle Separator */
+.decode-cycle-gap td {
+  padding: 0.28rem 0.45rem;
+  border-bottom: none;
+  background: transparent;
+}
+
+.decode-cycle-gap-inner {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.decode-cycle-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+  opacity: 0.85;
+}
+
+.decode-cycle-label {
+  font-size: 0.67rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* QSO Sequencer Distinct RX / TX Message Boxes */
+.qso-msg-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.qso-msg-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.qso-msg-rx {
+  border-left: 3px solid #38bdf8;
+  background: rgba(56, 189, 248, 0.06);
+}
+
+.qso-msg-tx {
+  border-left: 3px solid var(--ok);
+  background: rgba(34, 197, 94, 0.06);
+}
+
+.qso-msg-tx-live {
+  border-left: 3px solid #ef4444;
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.qso-msg-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.qso-dir-tag {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+}
+
+.qso-dir-rx {
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.16);
+}
+
+.qso-dir-tx {
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.16);
+}
+
+.qso-dir-tx-live {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.22);
+}
+
+.qso-msg-text {
+  font-size: 0.84rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+.qso-af-pill {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}

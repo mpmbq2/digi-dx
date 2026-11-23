@@ -154,13 +154,25 @@ async function main() {
       return el && el.textContent && !el.textContent.includes("1620 Hz");
     });
 
-    // 6. Verify Channel Roster populates with QQ* stations from SQLite, mi default + km toggle + sort
+    // 6. Verify Channel Roster populates with QQ* stations from SQLite, role badges, QRZ link, mi/km toggle & sorting
+    //    and confirm Live Decodes inserts cycle dividers across multiple 15s cycles
     await page.waitForSelector('[data-testid="roster-row"]', { timeout: 10000 });
+    await page.waitForSelector('[data-testid="decode-cycle-divider"]', { timeout: 10000 });
+    const roleText = await page.textContent('[data-testid="roster-role-badge"]');
+    assert.match(roleText ?? "", /^(CALLER|HUNTER)$/);
+    const qrzHref = await page.getAttribute('[data-testid="roster-qrz-link"]', "href");
+    const qrzTarget = await page.getAttribute('[data-testid="roster-qrz-link"]', "target");
+    assert.match(qrzHref ?? "", /^https:\/\/www\.qrz\.com\/db\/QQ/);
+    assert.equal(qrzTarget, "_blank");
+
     const unitBefore = await page.textContent('[data-testid="roster-unit-toggle"]');
     assert.match(unitBefore ?? "", /mi/);
     await page.click('[data-testid="roster-unit-toggle"]');
     const unitAfter = await page.textContent('[data-testid="roster-unit-toggle"]');
     assert.match(unitAfter ?? "", /km/);
+    await page.click('[data-testid="roster-sort-role"]');
+    await page.click('[data-testid="roster-sort-grid"]');
+    await page.click('[data-testid="roster-sort-distance"]');
     await page.click('[data-testid="roster-sort-snr"]');
 
     // 7. Verify SQLite channel switching: QSY to 40m -> empty roster -> QSY back to 20m -> 20m rows return
@@ -178,7 +190,38 @@ async function main() {
       return lbl && lbl.textContent && lbl.textContent.includes("14074000") && rows.length > 0;
     }, { timeout: 5000 });
 
-    // 8. Trigger Call CQ and wait for simulated QSO completion in Demo Log
+    // 8. Pause TX temporarily while inspecting QSO Sequencer card fields, then Reply, verify RX/TX boxes & QRZ link,
+    //    resume TX and wait for full Hunter QSO completion in Demo Log
+    await page.click('[data-testid="tx-enable-toggle"]');
+    await page.waitForFunction(() => {
+      const btn = document.querySelector('[data-testid="tx-enable-toggle"]');
+      return btn && btn.textContent && btn.textContent.includes("MUTED");
+    }, { timeout: 5000 });
+
+    await page.click('[data-testid="roster-row"] button');
+    await page.waitForSelector('[data-testid="qso-card"]', { timeout: 5000 });
+
+    const qsoLastRx = await page.textContent('[data-testid="qso-last-rx-msg"]');
+    assert.match(qsoLastRx ?? "", /CQ QQ/);
+
+    const qsoTxMsg = await page.textContent('[data-testid="qso-tx-msg"]');
+    assert.match(qsoTxMsg ?? "", /^QQ\d[A-Z]+ QQ0DEMO /);
+    assert(!qsoTxMsg?.includes("Hz"), `TX message mixed AF into message string: ${qsoTxMsg}`);
+
+    const qsoTxAf = await page.textContent('[data-testid="qso-tx-af"]');
+    assert.match(qsoTxAf ?? "", /^AF \d+ Hz$/);
+
+    const qsoQrzHref = await page.getAttribute('[data-testid="qso-qrz-link"]', "href");
+    const qsoQrzTarget = await page.getAttribute('[data-testid="qso-qrz-link"]', "target");
+    assert.match(qsoQrzHref ?? "", /^https:\/\/www\.qrz\.com\/db\/QQ/);
+    assert.equal(qsoQrzTarget, "_blank");
+
+    await page.click('[data-testid="tx-enable-toggle"]');
+    await page.waitForFunction(() => {
+      const btn = document.querySelector('[data-testid="tx-enable-toggle"]');
+      return btn && btn.textContent && btn.textContent.includes("ENABLED");
+    }, { timeout: 5000 });
+
     await page.click('[data-testid="call-cq-btn"]');
     await page.click('[data-testid="nav-logbook"]');
     await page.click('[data-testid="tab-demo-log"]');

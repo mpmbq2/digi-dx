@@ -169,6 +169,7 @@ export interface ChannelRosterEntry {
   is_cq: boolean;
   directed_cq: string | null;
   calling_me: boolean;
+  station_role: "caller" | "hunter" | null;
   first_seen_ts_sec: number;
   last_seen_ts_sec: number;
   last_seen_wall_ms: number;
@@ -200,6 +201,15 @@ export interface ControlLease {
   expires_at_utc: string;
 }
 
+export interface TranscriptEntry {
+  at_utc: string;
+  direction: "rx" | "tx" | string;
+  slot_ts: number;
+  af_hz: number;
+  snr_db: number | null;
+  message: string;
+}
+
 export interface ActiveQso {
   qso_id: string;
   radio_id: string;
@@ -219,6 +229,7 @@ export interface ActiveQso {
   rst_rcvd: string | null;
   started_at_utc: string;
   updated_at_utc: string;
+  transcript?: TranscriptEntry[];
 }
 
 export interface DecodeItem {

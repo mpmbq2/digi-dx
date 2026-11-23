@@ -1,6 +1,13 @@
+import { Fragment } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import type { DaemonState } from "../hooks/useDaemonSocket";
-import type { ActiveQso, ChannelRosterEntry, DecodeItem, RadioSummary } from "../types";
+import type {
+  ActiveQso,
+  ChannelRosterEntry,
+  DecodeItem,
+  RadioSummary,
+  TranscriptEntry,
+} from "../types";
 import { gridDistance, parseFt8Decode } from "../utils/maidenhead";
 import { FT8_BAND_PRESETS, formatFreqMhz, formatLifecycleLabel } from "../utils/radioHelpers";
 import { ChannelRosterPanel } from "./ChannelRosterPanel";
@@ -205,6 +212,9 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
         their_grid: parsed.grid,
         rx_slot: dec.slot,
         snr_db: dec.snr_db,
+        rx_message: dec.message,
+        rx_af_hz: dec.af_hz,
+        rx_ts_sec: dec.ts_sec,
       },
       `Queued reply to ${parsed.from}${parsed.grid ? ` (${parsed.grid})` : ""}`
     );
@@ -218,6 +228,9 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
         their_grid: entry.grid,
         rx_slot: entry.last_slot,
         snr_db: entry.last_snr_db,
+        rx_message: entry.last_message,
+        rx_af_hz: entry.last_af_hz,
+        rx_ts_sec: entry.last_seen_ts_sec,
       },
       `Queued reply to ${entry.callsign}${entry.grid ? ` (${entry.grid})` : ""}`
     );
@@ -421,6 +434,7 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                 class={`btn btn-sm ${
                   activeSession?.tx_enabled ? "btn-primary" : "btn-secondary"
                 }`}
+                data-testid="tx-enable-toggle"
                 disabled={!activeSession}
                 onClick={() =>
                   void runSessionCmd("qso.set_tx_enabled", {
@@ -608,37 +622,58 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                     const isMine = Boolean(
                       effectiveCall && d.message.includes(effectiveCall)
                     );
+                    const showCycleGap =
+                      idx > 0 && d.ts_sec !== filteredDecodes[idx - 1].ts_sec;
                     return (
-                      <tr
-                        key={`${d.ts_sec}-${d.af_hz}-${idx}`}
-                        class={isMine ? "row-mine" : isCq ? "row-cq" : ""}
-                      >
-                        <td>
-                          {new Date(d.ts_sec * 1000).toISOString().slice(11, 19)}
-                        </td>
-                        <td>
-                          <span
-                            class={`slot-pill ${
-                              d.slot === "even" ? "slot-even" : "slot-odd"
-                            }`}
+                      <Fragment key={`${d.ts_sec}-${d.af_hz}-${idx}`}>
+                        {showCycleGap && (
+                          <tr
+                            class="decode-cycle-gap"
+                            data-testid="decode-cycle-divider"
+                            aria-hidden="true"
                           >
-                            {d.slot === "even" ? "E" : "O"}
-                          </span>
-                        </td>
-                        <td>{d.snr_db >= 0 ? `+${d.snr_db}` : d.snr_db}</td>
-                        <td>{d.af_hz}</td>
-                        <td class="msg-cell">{d.message}</td>
-                        <td>
-                          <button
-                            type="button"
-                            class="btn btn-secondary btn-xs"
-                            disabled={!activeSession}
-                            onClick={() => void handleReplyDecode(d)}
-                          >
-                            Reply
-                          </button>
-                        </td>
-                      </tr>
+                            <td colspan={6}>
+                              <div class="decode-cycle-gap-inner">
+                                <span class="decode-cycle-line" />
+                                <span class="decode-cycle-label mono">
+                                  {new Date(d.ts_sec * 1000)
+                                    .toISOString()
+                                    .slice(11, 19)}{" "}
+                                  UTC · {d.slot === "even" ? "EVEN" : "ODD"}
+                                </span>
+                                <span class="decode-cycle-line" />
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        <tr class={isMine ? "row-mine" : isCq ? "row-cq" : ""}>
+                          <td>
+                            {new Date(d.ts_sec * 1000).toISOString().slice(11, 19)}
+                          </td>
+                          <td>
+                            <span
+                              class={`slot-pill ${
+                                d.slot === "even" ? "slot-even" : "slot-odd"
+                              }`}
+                            >
+                              {d.slot === "even" ? "E" : "O"}
+                            </span>
+                          </td>
+                          <td>{d.snr_db >= 0 ? `+${d.snr_db}` : d.snr_db}</td>
+                          <td>{d.af_hz}</td>
+                          <td class="msg-cell">{d.message}</td>
+                          <td>
+                            <button
+                              type="button"
+                              class="btn btn-secondary btn-xs"
+                              disabled={!activeSession}
+                              onClick={() => void handleReplyDecode(d)}
+                            >
+                              Reply
+                            </button>
+                          </td>
+                        </tr>
+                      </Fragment>
                     );
                   })
                 )}
@@ -746,9 +781,40 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
               (activeSession?.active_qsos ?? []).map((q, idx) => {
                 const isHeadActive = q.qso_id === firstActiveId;
                 const dist = gridDistance(effectiveGrid, q.their_grid);
+                const transcript = q.transcript ?? [];
+                let lastRx: TranscriptEntry | null = null;
+                for (let i = transcript.length - 1; i >= 0; i--) {
+                  if (transcript[i].direction === "rx") {
+                    lastRx = transcript[i];
+                    break;
+                  }
+                }
+                const liveTxMsg =
+                  daemon.txState?.state === "transmitting"
+                    ? daemon.txState.message
+                    : activeSession?.tx_state === "transmitting"
+                    ? activeSession.armed_message
+                    : null;
+                const liveTxAf =
+                  daemon.txState?.state === "transmitting"
+                    ? daemon.txState.af_hz ?? currentAf
+                    : currentAf;
+                const cleanCall = q.their_call.replace(/^<|>$/g, "");
+                const isSendingThis = Boolean(
+                  isHeadActive &&
+                    txStateStr === "transmitting" &&
+                    liveTxMsg &&
+                    (q.is_cq
+                      ? liveTxMsg.startsWith("CQ ")
+                      : liveTxMsg.replace(/[<>]/g, "").includes(cleanCall))
+                );
+                const displayTxMsg =
+                  isSendingThis && liveTxMsg ? liveTxMsg : formatQsoStepMessage(q);
+                const displayTxAf = isSendingThis ? liveTxAf : currentAf;
                 return (
                   <div
                     key={q.qso_id}
+                    data-testid="qso-card"
                     class={`qso-card ${
                       isHeadActive
                         ? "qso-card-head"
@@ -770,14 +836,18 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                       <div class="hw-badges">
                         <span
                           class={`badge ${
-                            isHeadActive
+                            isSendingThis
+                              ? "badge-fail"
+                              : isHeadActive
                               ? "badge-ok"
                               : q.status === "paused"
                               ? "badge-warn"
                               : "badge-info"
                           }`}
                         >
-                          {isHeadActive
+                          {isSendingThis
+                            ? "SENDING"
+                            : isHeadActive
                             ? "NEXT TX"
                             : q.status === "paused"
                             ? "PAUSED"
@@ -794,11 +864,62 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                       </div>
                     </div>
 
-                    <div
-                      class="mono"
-                      style={{ fontSize: "0.78rem", color: "var(--accent)" }}
-                    >
-                      Next TX: {formatQsoStepMessage(q)} @ {currentAf} Hz
+                    <div class="qso-msg-stack">
+                      {!q.is_cq && (
+                        <div class="qso-msg-box qso-msg-rx">
+                          <div class="qso-msg-head">
+                            <span class="qso-dir-tag qso-dir-rx">LAST RX</span>
+                            {lastRx && (
+                              <span class="muted mono" style={{ fontSize: "0.7rem" }}>
+                                {lastRx.snr_db !== null
+                                  ? `${
+                                      lastRx.snr_db >= 0
+                                        ? `+${lastRx.snr_db}`
+                                        : lastRx.snr_db
+                                    } dB · `
+                                  : ""}
+                                {lastRx.af_hz} Hz ·{" "}
+                                {new Date(lastRx.slot_ts * 1000)
+                                  .toISOString()
+                                  .slice(11, 19)}
+                                Z
+                              </span>
+                            )}
+                          </div>
+                          <div
+                            class={`qso-msg-text mono${lastRx ? "" : " muted"}`}
+                            data-testid="qso-last-rx-msg"
+                          >
+                            {lastRx ? lastRx.message : "Waiting for reply..."}
+                          </div>
+                        </div>
+                      )}
+
+                      <div
+                        class={`qso-msg-box ${
+                          isSendingThis ? "qso-msg-tx-live" : "qso-msg-tx"
+                        }`}
+                      >
+                        <div class="qso-msg-head">
+                          <span
+                            class={`qso-dir-tag ${
+                              isSendingThis ? "qso-dir-tx-live" : "qso-dir-tx"
+                            }`}
+                          >
+                            {isSendingThis
+                              ? "SENDING TX"
+                              : isHeadActive
+                              ? "NEXT TX"
+                              : "QUEUED TX"}
+                          </span>
+                          <span class="qso-af-pill mono" data-testid="qso-tx-af">
+                            AF {displayTxAf} Hz
+                          </span>
+                        </div>
+                        <div class="qso-msg-text mono" data-testid="qso-tx-msg">
+                          {displayTxMsg}
+                        </div>
+                      </div>
                     </div>
                     <div class="muted mono" style={{ fontSize: "0.75rem" }}>
                       Attempts: {q.attempts_on_step}/5 · Sent: {q.rst_sent ?? "—"} · Rcvd:{" "}
@@ -877,19 +998,33 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                         </button>
                       )}
                       {!q.is_cq && (
-                        <button
-                          type="button"
-                          class="btn btn-primary btn-xs"
-                          onClick={() =>
-                            void runSessionCmd(
-                              "qso.action",
-                              { qso_id: q.qso_id, action: "complete" },
-                              `Logged QSO with ${q.their_call}`
-                            )
-                          }
-                        >
-                          Log Now
-                        </button>
+                        <>
+                          <a
+                            class="btn btn-secondary btn-xs"
+                            data-testid="qso-qrz-link"
+                            href={`https://www.qrz.com/db/${encodeURIComponent(
+                              cleanCall
+                            )}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title={`Look up ${cleanCall} on QRZ.com`}
+                          >
+                            QRZ ↗
+                          </a>
+                          <button
+                            type="button"
+                            class="btn btn-primary btn-xs"
+                            onClick={() =>
+                              void runSessionCmd(
+                                "qso.action",
+                                { qso_id: q.qso_id, action: "complete" },
+                                `Logged QSO with ${q.their_call}`
+                              )
+                            }
+                          >
+                            Log Now
+                          </button>
+                        </>
                       )}
                       <button
                         type="button"

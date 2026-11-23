@@ -4,6 +4,7 @@ import { gridDistance } from "../utils/maidenhead";
 
 type SortColumn =
   | "callsign"
+  | "role"
   | "grid"
   | "distance"
   | "snr"
@@ -45,6 +46,25 @@ function formatAge(ageSec: number): string {
   return `${m}m ${rem}s`;
 }
 
+/**
+ * Compare two nullable column values while always pinning null/undefined values
+ * to the bottom regardless of ascending or descending sort direction.
+ */
+function compareNullable<T>(
+  aVal: T | null | undefined,
+  bVal: T | null | undefined,
+  cmp: (a: T, b: T) => number,
+  asc: boolean
+): number {
+  const aMissing = aVal === null || aVal === undefined || aVal === "";
+  const bMissing = bVal === null || bVal === undefined || bVal === "";
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+  const res = cmp(aVal, bVal);
+  return asc ? res : -res;
+}
+
 export function ChannelRosterPanel({
   entries,
   channelKey,
@@ -84,7 +104,6 @@ export function ChannelRosterPanel({
       setSortAsc(!sortAsc);
     } else {
       setSortCol(col);
-      // Default SNR descending, others ascending
       setSortAsc(col !== "snr");
     }
   };
@@ -100,6 +119,7 @@ export function ChannelRosterPanel({
           return (
             e.callsign.includes(q) ||
             (e.grid ?? "").includes(q) ||
+            (e.station_role ?? "").toUpperCase().includes(q) ||
             e.last_message.includes(q)
           );
         }
@@ -120,34 +140,67 @@ export function ChannelRosterPanel({
         let cmp = 0;
         switch (sortCol) {
           case "callsign":
-            cmp = a.entry.callsign.localeCompare(b.entry.callsign);
+            cmp = compareNullable(
+              a.entry.callsign,
+              b.entry.callsign,
+              (x, y) => x.localeCompare(y),
+              sortAsc
+            );
+            break;
+          case "role":
+            cmp = compareNullable(
+              a.entry.station_role,
+              b.entry.station_role,
+              (x, y) => x.localeCompare(y),
+              sortAsc
+            );
             break;
           case "grid":
-            cmp = (a.entry.grid ?? "ZZZZ").localeCompare(b.entry.grid ?? "ZZZZ");
+            cmp = compareNullable(
+              a.entry.grid,
+              b.entry.grid,
+              (x, y) => x.localeCompare(y),
+              sortAsc
+            );
             break;
           case "distance": {
-            const da = a.dist ? (unit === "km" ? a.dist.km : a.dist.miles) : Number.MAX_SAFE_INTEGER;
-            const db = b.dist ? (unit === "km" ? b.dist.km : b.dist.miles) : Number.MAX_SAFE_INTEGER;
-            cmp = da - db;
+            const da = a.dist ? (unit === "km" ? a.dist.km : a.dist.miles) : null;
+            const db = b.dist ? (unit === "km" ? b.dist.km : b.dist.miles) : null;
+            cmp = compareNullable(da, db, (x, y) => x - y, sortAsc);
             break;
           }
           case "snr":
-            cmp = a.entry.last_snr_db - b.entry.last_snr_db;
+            cmp = compareNullable(
+              a.entry.last_snr_db,
+              b.entry.last_snr_db,
+              (x, y) => x - y,
+              sortAsc
+            );
             break;
           case "af":
-            cmp = a.entry.last_af_hz - b.entry.last_af_hz;
+            cmp = compareNullable(
+              a.entry.last_af_hz,
+              b.entry.last_af_hz,
+              (x, y) => x - y,
+              sortAsc
+            );
             break;
           case "slot":
-            cmp = a.entry.last_slot.localeCompare(b.entry.last_slot);
+            cmp = compareNullable(
+              a.entry.last_slot,
+              b.entry.last_slot,
+              (x, y) => x.localeCompare(y),
+              sortAsc
+            );
             break;
           case "age":
-            cmp = a.ageSec - b.ageSec;
+            cmp = compareNullable(a.ageSec, b.ageSec, (x, y) => x - y, sortAsc);
             break;
         }
         if (cmp === 0) {
-          cmp = a.entry.callsign.localeCompare(b.entry.callsign);
+          return a.entry.callsign.localeCompare(b.entry.callsign);
         }
-        return sortAsc ? cmp : -cmp;
+        return cmp;
       });
   }, [entries, nowMs, cqOnly, hideWorked, workedCalls, queuedCalls, query, myGrid, sortCol, sortAsc, unit]);
 
@@ -224,6 +277,16 @@ export function ChannelRosterPanel({
                 <button
                   type="button"
                   class="sort-btn"
+                  data-testid="roster-sort-role"
+                  onClick={() => handleSort("role")}
+                >
+                  Role{sortArrow("role")}
+                </button>
+              </th>
+              <th>
+                <button
+                  type="button"
+                  class="sort-btn"
                   data-testid="roster-sort-grid"
                   onClick={() => handleSort("grid")}
                 >
@@ -287,7 +350,7 @@ export function ChannelRosterPanel({
           <tbody>
             {enriched.length === 0 ? (
               <tr>
-                <td colspan={9} class="muted">
+                <td colspan={10} class="muted">
                   No stations seen on this channel in the last 5 minutes.
                 </td>
               </tr>
@@ -296,6 +359,7 @@ export function ChannelRosterPanel({
                 const distLabel = dist
                   ? `${unit === "km" ? dist.km : dist.miles} ${unit} (${dist.bearingDeg}°)`
                   : "—";
+                const qrzCall = entry.callsign.replace(/[<>]/g, "").trim();
                 return (
                   <tr
                     key={entry.callsign}
@@ -309,6 +373,25 @@ export function ChannelRosterPanel({
                     }
                   >
                     <td style={{ fontWeight: 700 }}>{entry.callsign}</td>
+                    <td>
+                      {entry.station_role === "caller" ? (
+                        <span
+                          class="badge badge-role-caller"
+                          data-testid="roster-role-badge"
+                        >
+                          CALLER
+                        </span>
+                      ) : entry.station_role === "hunter" ? (
+                        <span
+                          class="badge badge-role-hunter"
+                          data-testid="roster-role-badge"
+                        >
+                          HUNTER
+                        </span>
+                      ) : (
+                        <span class="muted">—</span>
+                      )}
+                    </td>
                     <td>{entry.grid ?? "—"}</td>
                     <td>{distLabel}</td>
                     <td>
@@ -342,14 +425,26 @@ export function ChannelRosterPanel({
                       </div>
                     </td>
                     <td>
-                      <button
-                        type="button"
-                        class="btn btn-secondary btn-xs"
-                        disabled={!sessionActive}
-                        onClick={() => onReply(entry)}
-                      >
-                        Reply
-                      </button>
+                      <div class="hw-badges">
+                        <button
+                          type="button"
+                          class="btn btn-secondary btn-xs"
+                          disabled={!sessionActive}
+                          onClick={() => onReply(entry)}
+                        >
+                          Reply
+                        </button>
+                        <a
+                          class="btn btn-secondary btn-xs"
+                          data-testid="roster-qrz-link"
+                          href={`https://www.qrz.com/db/${encodeURIComponent(qrzCall)}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title={`Open ${qrzCall} on QRZ.com`}
+                        >
+                          QRZ ↗
+                        </a>
+                      </div>
                     </td>
                   </tr>
                 );

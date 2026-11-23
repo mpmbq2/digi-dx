@@ -13,6 +13,7 @@ use crate::telemetry::TelemetryEnvelope;
 
 const INITIAL_MIGRATION_SQL: &str = include_str!("migrations/001_initial_schema.sql");
 const ROSTER_MIGRATION_SQL: &str = include_str!("migrations/002_channel_roster.sql");
+const ROSTER_ROLE_MIGRATION_SQL: &str = include_str!("migrations/003_channel_roster_role.sql");
 pub const CHANNEL_ROSTER_WINDOW_MS: i64 = 300_000;
 
 pub fn channel_key_for_freq(mode: &str, dial_freq_hz: Option<i64>) -> String {
@@ -48,6 +49,7 @@ pub struct ChannelRosterEntry {
     pub is_cq: bool,
     pub directed_cq: Option<String>,
     pub calling_me: bool,
+    pub station_role: Option<String>,
     pub first_seen_ts_sec: i64,
     pub last_seen_ts_sec: i64,
     pub last_seen_wall_ms: i64,
@@ -71,6 +73,7 @@ pub struct UpsertChannelRosterInput {
     pub is_cq: bool,
     pub directed_cq: Option<String>,
     pub calling_me: bool,
+    pub station_role: Option<String>,
     pub seen_ts_sec: i64,
 }
 
@@ -313,6 +316,23 @@ impl StateStore {
             tx.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at_utc) VALUES (?1, ?2, ?3)",
                 params![2_i64, "002_channel_roster", now_utc_str()],
+            )?;
+            tx.commit()?;
+        }
+
+        let role_applied: Option<i64> = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if role_applied.is_none() {
+            let tx = conn.transaction()?;
+            tx.execute_batch(ROSTER_ROLE_MIGRATION_SQL)?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at_utc) VALUES (?1, ?2, ?3)",
+                params![3_i64, "003_channel_roster_role", now_utc_str()],
             )?;
             tx.commit()?;
         }
@@ -1182,9 +1202,9 @@ impl StateStore {
             "INSERT INTO channel_roster (
                 is_demo, channel_key, callsign, mode, dial_freq_hz, band, grid,
                 last_snr_db, last_dt_sec, last_af_hz, last_slot, last_message,
-                is_cq, directed_cq, calling_me, first_seen_ts_sec, last_seen_ts_sec,
+                is_cq, directed_cq, calling_me, station_role, first_seen_ts_sec, last_seen_ts_sec,
                 last_seen_wall_ms, decode_count
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 1)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1)
              ON CONFLICT(is_demo, channel_key, callsign) DO UPDATE SET
                 mode = excluded.mode,
                 dial_freq_hz = COALESCE(excluded.dial_freq_hz, channel_roster.dial_freq_hz),
@@ -1198,6 +1218,7 @@ impl StateStore {
                 is_cq = excluded.is_cq,
                 directed_cq = excluded.directed_cq,
                 calling_me = excluded.calling_me,
+                station_role = excluded.station_role,
                 last_seen_ts_sec = excluded.last_seen_ts_sec,
                 last_seen_wall_ms = excluded.last_seen_wall_ms,
                 decode_count = channel_roster.decode_count + 1",
@@ -1217,6 +1238,7 @@ impl StateStore {
                 if input.is_cq { 1_i64 } else { 0_i64 },
                 input.directed_cq,
                 if input.calling_me { 1_i64 } else { 0_i64 },
+                input.station_role,
                 input.seen_ts_sec,
                 input.seen_ts_sec,
                 now_wall_ms,
@@ -1254,8 +1276,8 @@ impl StateStore {
         let mut stmt = conn.prepare(
             "SELECT is_demo, channel_key, callsign, mode, dial_freq_hz, band, grid,
                     last_snr_db, last_dt_sec, last_af_hz, last_slot, last_message,
-                    is_cq, directed_cq, calling_me, first_seen_ts_sec, last_seen_ts_sec,
-                    last_seen_wall_ms, decode_count
+                    is_cq, directed_cq, calling_me, station_role, first_seen_ts_sec,
+                    last_seen_ts_sec, last_seen_wall_ms, decode_count
              FROM channel_roster
              WHERE is_demo = ?1 AND channel_key = ?2 AND last_seen_wall_ms >= ?3
              ORDER BY last_seen_wall_ms DESC, callsign ASC",
@@ -1263,6 +1285,12 @@ impl StateStore {
         let rows = stmt.query_map(
             params![if is_demo { 1_i64 } else { 0_i64 }, channel_key, cutoff],
             |row| {
+                let last_message: String = row.get(11)?;
+                let stored_role: Option<String> = row.get(15)?;
+                let station_role = stored_role.or_else(|| {
+                    let parsed = crate::domain::ft8::parse_ft8_message(&last_message);
+                    crate::domain::ft8::infer_station_role(&parsed).map(|r| r.as_str().to_string())
+                });
                 Ok(ChannelRosterEntry {
                     is_demo: row.get::<_, i64>(0)? != 0,
                     channel_key: row.get(1)?,
@@ -1275,14 +1303,15 @@ impl StateStore {
                     last_dt_sec: row.get::<_, f64>(8)? as f32,
                     last_af_hz: row.get::<_, i64>(9)?.clamp(0, u16::MAX as i64) as u16,
                     last_slot: row.get(10)?,
-                    last_message: row.get(11)?,
+                    last_message,
                     is_cq: row.get::<_, i64>(12)? != 0,
                     directed_cq: row.get(13)?,
                     calling_me: row.get::<_, i64>(14)? != 0,
-                    first_seen_ts_sec: row.get(15)?,
-                    last_seen_ts_sec: row.get(16)?,
-                    last_seen_wall_ms: row.get(17)?,
-                    decode_count: row.get(18)?,
+                    station_role,
+                    first_seen_ts_sec: row.get(16)?,
+                    last_seen_ts_sec: row.get(17)?,
+                    last_seen_wall_ms: row.get(18)?,
+                    decode_count: row.get(19)?,
                 })
             },
         )?;
@@ -1496,13 +1525,14 @@ mod tests {
                     is_cq: true,
                     directed_cq: None,
                     calling_me: false,
+                    station_role: Some("caller".into()),
                     seen_ts_sec: 1_700_000_000,
                 },
                 t0,
             )
             .unwrap();
 
-        // Follow-up message without grid must preserve PM95 and bump decode_count
+        // Follow-up message where station acts as Hunter must preserve PM95 and switch station_role
         store
             .upsert_channel_roster_entry(
                 &UpsertChannelRosterInput {
@@ -1517,10 +1547,11 @@ mod tests {
                     last_dt_sec: 0.2,
                     last_af_hz: 1420,
                     last_slot: "even".into(),
-                    last_message: "K1XYZ JA1ABC -08".into(),
+                    last_message: "K1XYZ JA1ABC R-08".into(),
                     is_cq: false,
                     directed_cq: None,
                     calling_me: false,
+                    station_role: Some("hunter".into()),
                     seen_ts_sec: 1_700_000_030,
                 },
                 t0 + 30_000,
@@ -1546,6 +1577,7 @@ mod tests {
                     is_cq: true,
                     directed_cq: None,
                     calling_me: false,
+                    station_role: Some("caller".into()),
                     seen_ts_sec: 1_700_000_030,
                 },
                 t0 + 30_000,
@@ -1558,6 +1590,7 @@ mod tests {
         assert_eq!(real_20m.len(), 1);
         assert_eq!(real_20m[0].callsign, "JA1ABC");
         assert_eq!(real_20m[0].grid.as_deref(), Some("PM95"));
+        assert_eq!(real_20m[0].station_role.as_deref(), Some("hunter"));
         assert_eq!(real_20m[0].decode_count, 2);
 
         assert!(store

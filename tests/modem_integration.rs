@@ -126,3 +126,78 @@ async fn hybrid_decoder_falls_back_to_ft8_lib_when_jt9_missing() {
         .unwrap();
     assert!(decodes.iter().any(|d| d.message == "CQ DX R6WA LN32"));
 }
+
+#[tokio::test]
+async fn loopback_73_and_14s_padded_slot_decode_with_ft8_lib_and_jt9() {
+    let slot_ts = UnixSecs(1_795_212_930);
+    let slot_48k =
+        Ft8LibTxModulator::modulate_slot_pcm("K1ABC N1MPM 73", 1500.0, DSP_SAMPLE_RATE, 0.4)
+            .unwrap();
+    let mut slot_12k = resample_48k_to_12k(&slot_48k).unwrap();
+    let samples_14s = 14 * FT8_SAMPLE_RATE as usize;
+    slot_12k.truncate(samples_14s);
+    slot_12k.resize(FT8_SLOT_SAMPLES_12K, 0.0);
+
+    let embedded = Ft8LibEmbeddedDecoder;
+    let emb_decodes = embedded.decode_slot(slot_ts, &slot_12k).await.unwrap();
+    let emb_hit = emb_decodes
+        .iter()
+        .find(|d| d.message == "K1ABC N1MPM 73")
+        .unwrap_or_else(|| panic!("ft8_lib failed loopback decode for 73: {emb_decodes:?}"));
+    assert!(
+        (1495..=1505).contains(&emb_hit.af_hz),
+        "ft8_lib loopback 73 AF {} not within ±5 Hz of 1500",
+        emb_hit.af_hz
+    );
+
+    let wav_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("191111_110200.wav");
+    let (_, mut wav_12k) = read_wav_mono_f32(&wav_path).unwrap();
+    wav_12k.truncate(samples_14s);
+    wav_12k.resize(FT8_SLOT_SAMPLES_12K, 0.0);
+    let fixture_slot_ts = UnixSecs(1_573_470_120);
+    let wav_emb = embedded
+        .decode_slot(fixture_slot_ts, &wav_12k)
+        .await
+        .unwrap();
+    for expected_msg in [
+        "CQ TA6CQ KN70",
+        "CQ LZ1JZ KN22",
+        "CQ R7IW LN35",
+        "CQ DX R6WA LN32",
+    ] {
+        assert!(
+            wav_emb.iter().any(|d| d.message == expected_msg),
+            "ft8_lib missed 14s-padded fixture message '{expected_msg}': {wav_emb:?}"
+        );
+    }
+
+    if let Some(jt9_bin) = HybridFt8Decoder::resolve_jt9_path(None) {
+        let jt9 = Jt9SubprocessDecoder::new(jt9_bin);
+        let jt9_decodes = jt9.decode_slot(slot_ts, &slot_12k).await.unwrap();
+        let jt9_hit = jt9_decodes
+            .iter()
+            .find(|d| d.message == "K1ABC N1MPM 73")
+            .unwrap_or_else(|| panic!("jt9 failed loopback decode for 73: {jt9_decodes:?}"));
+        assert!(
+            (1495..=1505).contains(&jt9_hit.af_hz),
+            "jt9 loopback 73 AF {} not within ±5 Hz of 1500",
+            jt9_hit.af_hz
+        );
+
+        let wav_jt9 = jt9.decode_slot(fixture_slot_ts, &wav_12k).await.unwrap();
+        for expected_msg in [
+            "CQ TA6CQ KN70",
+            "CQ LZ1JZ KN22",
+            "CQ R7IW LN35",
+            "CQ DX R6WA LN32",
+        ] {
+            assert!(
+                wav_jt9.iter().any(|d| d.message == expected_msg),
+                "jt9 missed 14s-padded fixture message '{expected_msg}': {wav_jt9:?}"
+            );
+        }
+    }
+}
