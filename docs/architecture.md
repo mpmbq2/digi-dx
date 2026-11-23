@@ -194,12 +194,12 @@ flowchart LR
         LibDec --> Norm
     end
 
-    subgraph TX["Transmit Path (Slot-Aligned)"]
+    subgraph TX["Transmit Path (Slot-Aligned + Late TX / Hot-Swap)"]
         Intent["TxIntent (af: 200..3000, slot: even|odd, msg)"] --> Pack["ft8_lib 77-bit Pack + LDPC + Costas"]
-        Pack --> Synth["GFSK Tone Synthesizer (12.64 s, 48 kHz)"]
-        Synth --> Gate["Slot Boundary Gate (Arm at T-2s, Key at T+0.0s)"]
+        Pack --> Synth["Offset-Aligned GFSK Synthesizer (0..6s cut, ends 12.64 s)"]
+        Synth --> Gate["TX Reconciler (Boundary + Mid-Slot Late Start / Hot-Swap / Abort)"]
         Gate --> Key["RigctldClient (+T 1 / +T 3) + Arm PttWatchdog"]
-        Key --> Play["cpal Playback Stream (TX Gain Scaled)"]
+        Key --> Play["cpal Playback Stream (Hot-Swappable PCM + TX Gain)"]
         Play --> Unkey["RigctldClient (+T 0) + Disarm PttWatchdog"]
     end
 ```
@@ -211,6 +211,7 @@ flowchart LR
   - Strict newtype separation in Rust (`UnixSecs(i64)` vs `VirtualMs(i64)`) makes v1's seconds-vs-milliseconds parity/timestamp trap a **compile-time error**.
   - Slot parity: `(unix_secs / 15) % 2 == 0` → `even`, else `odd`.
   - Automation arms transmit `2` virtual seconds before the slot boundary with a `50 ms` minimum wall-delay floor (scale validated at `SlotClock::new` so `scale <= slot_ms / (2 * floor_ms)`).
+  - **Delayed TX Initiation & Mid-Slot Hot-Swap:** Live TX reconciliation triggers at slot boundaries, on every `ReconcileOutcome::New` decode, and on operator QSO/TX commands. Up to `6.0 s` into a matching slot, newly queued/answered TXs start immediately using `modulate_pcm_from_offset` (truncating elapsed leading samples with a `20 ms` fade-in ramp so remaining symbols stay UTC-aligned and finish at `12.64 s`), and active TXs whose desired message changes seamlessly hot-swap the `cpal` playback buffer without dropping PTT (`confirmed_intent` logs only the final message). Past `6.0 s`, invalidated TXs abort immediately (dropping PTT without confirmation) while new TXs queue for the next matching slot.
 - **`jt9` Subprocess Adapter & Multi-Pass Early Decoding:**
   - Runs a WSJT-X-style 3-stage pipeline per RX slot using non-destructive buffer snapshots (`snapshot_slot_samples()`, padded to `15.0 s`) and exact boundary rollover (`reset_for_new_slot()`):
     - **Pass 1 (`t = 11.8 s`, `-d 1`):** Fast early pass (`-w 0` if wisdom not yet cached) delivering ~80–85% of signals ~3 s before slot close.

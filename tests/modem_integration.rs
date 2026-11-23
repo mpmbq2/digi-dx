@@ -328,9 +328,8 @@ async fn streaming_jt9_emits_decodes_before_exit_and_reconciles_three_passes() {
     );
 
     let final_decodes = reconciler.take_final_for_telemetry();
-    assert_eq!(
-        final_decodes.len(),
-        5,
+    assert!(
+        final_decodes.len() == 5,
         "expected 5 deduplicated decodes across 3 passes: {final_decodes:?}"
     );
     for expected_msg in [
@@ -343,6 +342,100 @@ async fn streaming_jt9_emits_decodes_before_exit_and_reconciles_three_passes() {
         assert!(
             final_decodes.iter().any(|d| d.message == expected_msg),
             "missing reconciled message '{expected_msg}': {final_decodes:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_start_5s_offset_tx_waveform_decodes_with_jt9_and_ft8_lib() {
+    let slot_ts = UnixSecs(1_795_212_960);
+    let total_48k = 15 * (DSP_SAMPLE_RATE as usize);
+
+    // Embedded ft8_lib fallback requires more Costas symbols than jt9; verify offset-sliced grid alignment at 1.0 s.
+    let tail_1s_48k = Ft8LibTxModulator::modulate_pcm_from_offset(
+        "K1ABC N1MPM RR73",
+        1500.0,
+        DSP_SAMPLE_RATE,
+        1_000,
+    )
+    .unwrap();
+    let start_1s_48k = DSP_SAMPLE_RATE as usize;
+    let mut slot_1s_48k = vec![0.0_f32; total_48k];
+    let copy_1s = tail_1s_48k.len().min(total_48k - start_1s_48k);
+    slot_1s_48k[start_1s_48k..start_1s_48k + copy_1s].copy_from_slice(&tail_1s_48k[..copy_1s]);
+    let slot_1s_12k = resample_48k_to_12k(&slot_1s_48k).unwrap();
+    let embedded = Ft8LibEmbeddedDecoder;
+    let emb = embedded.decode_slot(slot_ts, &slot_1s_12k).await.unwrap();
+    let emb_hit = emb
+        .iter()
+        .find(|d| d.message == "K1ABC N1MPM RR73")
+        .unwrap_or_else(|| panic!("ft8_lib missed 1s late-start TX: {emb:?}"));
+    assert!((1495..=1505).contains(&emb_hit.af_hz));
+
+    // Primary jt9 decoder decodes all the way out to 5.0 s+ late start.
+    let tail_48k = Ft8LibTxModulator::modulate_pcm_from_offset(
+        "K1ABC N1MPM RR73",
+        1500.0,
+        DSP_SAMPLE_RATE,
+        5_000,
+    )
+    .unwrap();
+    let start_48k = 5 * (DSP_SAMPLE_RATE as usize);
+    let mut slot_48k = vec![0.0_f32; total_48k];
+    let copy_len = tail_48k.len().min(total_48k - start_48k);
+    slot_48k[start_48k..start_48k + copy_len].copy_from_slice(&tail_48k[..copy_len]);
+    let slot_12k = resample_48k_to_12k(&slot_48k).unwrap();
+    assert_eq!(slot_12k.len(), FT8_SLOT_SAMPLES_12K);
+
+    if let Some(jt9_bin) = HybridFt8Decoder::resolve_jt9_path(None) {
+        let jt9 = Jt9SubprocessDecoder::new(jt9_bin);
+        let jt9_decodes = jt9.decode_slot(slot_ts, &slot_12k).await.unwrap();
+        let hit = jt9_decodes
+            .iter()
+            .find(|d| d.message == "K1ABC N1MPM RR73")
+            .unwrap_or_else(|| panic!("jt9 missed 5s late-start TX: {jt9_decodes:?}"));
+        assert!((1495..=1505).contains(&hit.af_hz));
+        assert!(
+            (hit.dt_sec + 0.5).abs() <= 0.25,
+            "expected UTC-aligned dt_sec near -0.5 (got {})",
+            hit.dt_sec
+        );
+    }
+}
+
+#[tokio::test]
+async fn mid_slot_hotswap_tx_waveform_decodes_replacement_message_in_jt9() {
+    let slot_ts = UnixSecs(1_795_212_990);
+    let stale_48k =
+        Ft8LibTxModulator::modulate_pcm("K1ABC N1MPM -08", 1500.0, DSP_SAMPLE_RATE).unwrap();
+    let replacement_48k = Ft8LibTxModulator::modulate_pcm_from_offset(
+        "K1ABC N1MPM RR73",
+        1500.0,
+        DSP_SAMPLE_RATE,
+        1_000,
+    )
+    .unwrap();
+
+    let total_48k = 15 * (DSP_SAMPLE_RATE as usize);
+    let swap_at_48k = DSP_SAMPLE_RATE as usize;
+    let mut slot_48k = vec![0.0_f32; total_48k];
+    slot_48k[..swap_at_48k].copy_from_slice(&stale_48k[..swap_at_48k]);
+    let copy_len = replacement_48k.len().min(total_48k - swap_at_48k);
+    slot_48k[swap_at_48k..swap_at_48k + copy_len].copy_from_slice(&replacement_48k[..copy_len]);
+    let slot_12k = resample_48k_to_12k(&slot_48k).unwrap();
+
+    if let Some(jt9_bin) = HybridFt8Decoder::resolve_jt9_path(None) {
+        let jt9 = Jt9SubprocessDecoder::new(jt9_bin);
+        let jt9_decodes = jt9.decode_slot(slot_ts, &slot_12k).await.unwrap();
+        assert!(
+            jt9_decodes
+                .iter()
+                .any(|d| d.message == "K1ABC N1MPM RR73" && (1495..=1505).contains(&d.af_hz)),
+            "jt9 missed hot-swapped replacement message: {jt9_decodes:?}"
+        );
+        assert!(
+            !jt9_decodes.iter().any(|d| d.message == "K1ABC N1MPM -08"),
+            "jt9 unexpectedly decoded cancelled stale prefix: {jt9_decodes:?}"
         );
     }
 }

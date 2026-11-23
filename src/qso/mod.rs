@@ -2,7 +2,7 @@ pub mod reconciler;
 pub mod sequencer;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -45,6 +45,52 @@ const PASS_2_LEAD_MS: i64 = 1_500; // t = 13.5s (1.5s left): normal pre-close pa
 const PASS_3_LEAD_MS: i64 = 200; // t = 14.8s (0.2s left): deep final pass (-d 3)
 const LIVE_DECODE_GRACE_MS: i64 = 300; // Wait up to +300ms past slot boundary for Pass 3 before TX
 const ROSTER_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(150);
+pub const MAX_LATE_TX_START_MS: i64 = 6_000; // Late TX initiation / mid-slot hot-swap cutoff
+const FT8_TX_END_OFFSET_MS: i64 = 12_700; // End TX at slot_start + 12.70 s (60 ms drain past 12.64 s)
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxReconcileDecision {
+    Noop,
+    Start { intent: TxIntent, offset_ms: u64 },
+    HotSwap { intent: TxIntent, offset_ms: u64 },
+    Abort,
+    TooLateWaitNextSlot,
+}
+
+/// Pure reconciliation decision for initiating, hot-swapping, or aborting a live TX slot.
+pub fn decide_tx_action(
+    active: Option<&TxIntent>,
+    desired: Option<&TxIntent>,
+    into_slot_ms: i64,
+    max_late_tx_start_ms: i64,
+) -> TxReconcileDecision {
+    match (active, desired) {
+        (None, None) => TxReconcileDecision::Noop,
+        (None, Some(want)) => {
+            if into_slot_ms <= max_late_tx_start_ms {
+                TxReconcileDecision::Start {
+                    intent: want.clone(),
+                    offset_ms: into_slot_ms.max(0) as u64,
+                }
+            } else {
+                TxReconcileDecision::TooLateWaitNextSlot
+            }
+        }
+        (Some(_), None) => TxReconcileDecision::Abort,
+        (Some(cur), Some(want)) => {
+            if cur.message == want.message && cur.slot == want.slot {
+                TxReconcileDecision::Noop
+            } else if into_slot_ms <= max_late_tx_start_ms {
+                TxReconcileDecision::HotSwap {
+                    intent: want.clone(),
+                    offset_ms: into_slot_ms.max(0) as u64,
+                }
+            } else {
+                TxReconcileDecision::Abort
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -87,6 +133,16 @@ impl SessionSnapshot {
     }
 }
 
+struct ActiveTxHandle {
+    tx_gen: u64,
+    slot_ts: UnixSecs,
+    intent: TxIntent,
+    confirmed_intent: Arc<AsyncMutex<TxIntent>>,
+    tx_cancel: CancellationToken,
+    aborted_by_control: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
 struct SessionRuntime {
     sequencer: QsoSequencer,
     clock: SlotClock,
@@ -97,11 +153,22 @@ struct SessionRuntime {
     tx_state: String,
     armed_message: Option<String>,
     capture: Option<AudioCaptureHandle>,
-    playback: Option<AudioPlaybackHandle>,
+    playback: Option<Arc<AudioPlaybackHandle>>,
+    active_tx: Option<ActiveTxHandle>,
+    next_tx_gen: u64,
+    tx_occurred_in_slot_ts: Option<UnixSecs>,
     wf_task: Option<JoinHandle<()>>,
 }
 
 impl SessionRuntime {
+    fn did_tx_in_slot(&self, slot_ts: UnixSecs) -> bool {
+        self.tx_occurred_in_slot_ts == Some(slot_ts)
+            || self
+                .active_tx
+                .as_ref()
+                .is_some_and(|t| t.slot_ts == slot_ts)
+    }
+
     fn to_snapshot(&self) -> SessionSnapshot {
         let now_ms = Utc::now().timestamp_millis();
         let cur_ts = self.clock.unix_secs_at(now_ms);
@@ -129,13 +196,37 @@ impl SessionRuntime {
     }
 }
 
+#[derive(Clone)]
+struct ActiveSessionHandle {
+    radio_id: String,
+    is_demo: bool,
+    actor: String,
+    cancel: CancellationToken,
+    runtime: Arc<AsyncMutex<SessionRuntime>>,
+    tx_reconcile_lock: Arc<AsyncMutex<()>>,
+}
+
 struct RunningSession {
     radio_id: String,
     is_demo: bool,
     actor: String,
     cancel: CancellationToken,
     runtime: Arc<AsyncMutex<SessionRuntime>>,
+    tx_reconcile_lock: Arc<AsyncMutex<()>>,
     task: JoinHandle<()>,
+}
+
+impl RunningSession {
+    fn handle(&self) -> ActiveSessionHandle {
+        ActiveSessionHandle {
+            radio_id: self.radio_id.clone(),
+            is_demo: self.is_demo,
+            actor: self.actor.clone(),
+            cancel: self.cancel.clone(),
+            runtime: Arc::clone(&self.runtime),
+            tx_reconcile_lock: Arc::clone(&self.tx_reconcile_lock),
+        }
+    }
 }
 
 pub struct SessionManager {
@@ -380,6 +471,9 @@ impl SessionManager {
             armed_message: None,
             capture: capture_handle,
             playback: None,
+            active_tx: None,
+            next_tx_gen: 1,
+            tx_occurred_in_slot_ts: None,
             wf_task,
         }));
 
@@ -407,17 +501,25 @@ impl SessionManager {
         });
 
         let cancel = CancellationToken::new();
+        let tx_reconcile_lock = Arc::new(AsyncMutex::new(()));
+        let session_handle = ActiveSessionHandle {
+            radio_id: radio_id.to_string(),
+            is_demo: demo,
+            actor: actor.to_string(),
+            cancel: cancel.clone(),
+            runtime: Arc::clone(&runtime),
+            tx_reconcile_lock: Arc::clone(&tx_reconcile_lock),
+        };
         let mgr = Arc::clone(self);
-        let rt_clone = Arc::clone(&runtime);
-        let cancel_clone = cancel.clone();
-        let actor_str = actor.to_string();
         let task = if demo {
+            let rt_clone = Arc::clone(&runtime);
+            let cancel_clone = cancel.clone();
             tokio::spawn(async move {
                 mgr.run_demo_loop(rt_clone, cancel_clone).await;
             })
         } else {
             tokio::spawn(async move {
-                mgr.run_live_loop(rt_clone, actor_str, cancel_clone).await;
+                mgr.run_live_loop(session_handle).await;
             })
         };
 
@@ -427,6 +529,7 @@ impl SessionManager {
             actor: actor.to_string(),
             cancel,
             runtime,
+            tx_reconcile_lock,
             task,
         });
 
@@ -460,10 +563,16 @@ impl SessionManager {
         stopped.cancel.cancel();
         let _ = stopped.task.await;
 
-        {
+        let (active_tx, pb_opt) = {
             let mut rt = stopped.runtime.lock().await;
-            if let Some(mut pb) = rt.playback.take() {
-                pb.stop();
+            let active_tx = rt.active_tx.take();
+            if let Some(ref active) = active_tx {
+                active.aborted_by_control.store(true, Ordering::SeqCst);
+                active.tx_cancel.cancel();
+            }
+            let pb = rt.playback.take();
+            if let Some(ref pb) = pb {
+                pb.abort();
             }
             if let Some(mut cap) = rt.capture.take() {
                 cap.stop();
@@ -475,6 +584,13 @@ impl SessionManager {
             rt.sequencer.cancel_manual_tx();
             rt.tx_state = "idle".to_string();
             rt.armed_message = None;
+            (active_tx, pb)
+        };
+        if let Some(pb) = pb_opt {
+            pb.stop();
+        }
+        if let Some(active) = active_tx {
+            let _ = active.task.await;
         }
 
         self.watchdog.disarm_tx(&stopped.radio_id).await;
@@ -516,78 +632,48 @@ impl SessionManager {
     }
 
     pub async fn emergency_halt(&self, radio_id: Option<&str>) {
-        let rt_opt = {
+        let session_opt = {
             let guard = self.inner.lock().await;
             match (&*guard, radio_id) {
-                (Some(s), Some(rid)) if s.radio_id == rid => {
-                    Some((s.radio_id.clone(), Arc::clone(&s.runtime)))
-                }
-                (Some(s), None) => Some((s.radio_id.clone(), Arc::clone(&s.runtime))),
+                (Some(s), Some(rid)) if s.radio_id == rid => Some(s.handle()),
+                (Some(s), None) => Some(s.handle()),
                 _ => None,
             }
         };
 
-        if let Some((rid, rt_arc)) = rt_opt {
-            let snap = {
-                let mut rt = rt_arc.lock().await;
+        if let Some(session) = session_opt {
+            let _reconcile_guard = session.tx_reconcile_lock.lock().await;
+            {
+                let mut rt = session.runtime.lock().await;
                 rt.sequencer.set_tx_enabled(false);
                 rt.sequencer.cancel_manual_tx();
-                if let Some(mut pb) = rt.playback.take() {
-                    pb.stop();
-                }
-                rt.tx_state = "idle".to_string();
-                rt.armed_message = None;
-                rt.to_snapshot()
-            };
-            self.update_snapshot_cache(snap.clone());
-            self.broadcast_qso_update(&snap, None);
-            let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
-                radio_id: rid,
-                state: "idle".to_string(),
-                af_hz: Some(snap.tx_af_hz),
-                slot: None,
-                message: None,
-                ptt_elapsed_ms: 0,
-            });
+            }
+            self.abort_current_tx_locked(&session).await;
         }
     }
 
     pub async fn abort_active_tx(&self, radio_id: &str) {
-        let rt_opt = {
+        let session_opt = {
             let guard = self.inner.lock().await;
             guard
                 .as_ref()
                 .filter(|s| s.radio_id == radio_id)
-                .map(|s| Arc::clone(&s.runtime))
+                .map(RunningSession::handle)
         };
-        if let Some(rt_arc) = rt_opt {
-            let snap = {
-                let mut rt = rt_arc.lock().await;
+        if let Some(session) = session_opt {
+            let _reconcile_guard = session.tx_reconcile_lock.lock().await;
+            {
+                let mut rt = session.runtime.lock().await;
                 rt.sequencer.cancel_manual_tx();
-                if let Some(mut pb) = rt.playback.take() {
-                    pb.stop();
-                }
-                rt.tx_state = "idle".to_string();
-                rt.armed_message = None;
-                rt.to_snapshot()
-            };
-            self.update_snapshot_cache(snap.clone());
-            let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
-                radio_id: radio_id.to_string(),
-                state: "idle".to_string(),
-                af_hz: Some(snap.tx_af_hz),
-                slot: None,
-                message: None,
-                ptt_elapsed_ms: 0,
-            });
-            self.broadcast_qso_update(&snap, None);
+            }
+            self.abort_current_tx_locked(&session).await;
         }
     }
 
     async fn get_active_runtime(
         &self,
         radio_id: &str,
-    ) -> Result<(bool, String, Arc<AsyncMutex<SessionRuntime>>), (ErrorCode, String)> {
+    ) -> Result<ActiveSessionHandle, (ErrorCode, String)> {
         let guard = self.inner.lock().await;
         let Some(ref s) = *guard else {
             return Err((
@@ -604,30 +690,36 @@ impl SessionManager {
                 ),
             ));
         }
-        Ok((s.is_demo, s.actor.clone(), Arc::clone(&s.runtime)))
+        Ok(s.handle())
     }
 
-    pub async fn arm_tx(&self, radio_id: &str, intent: TxIntent) -> CmdResult {
-        let (_, _, rt_arc) = self.get_active_runtime(radio_id).await?;
+    pub async fn arm_tx(self: &Arc<Self>, radio_id: &str, intent: TxIntent) -> CmdResult {
+        let session = self.get_active_runtime(radio_id).await?;
         let snap = {
-            let mut rt = rt_arc.lock().await;
+            let mut rt = session.runtime.lock().await;
             rt.sequencer.arm_manual_tx(intent.clone());
-            rt.tx_state = "armed".to_string();
-            rt.armed_message = Some(intent.message.clone());
+            if rt.active_tx.is_none() {
+                rt.tx_state = "armed".to_string();
+                rt.armed_message = Some(intent.message.clone());
+            }
             rt.to_snapshot()
         };
         self.update_snapshot_cache(snap.clone());
-        let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
-            radio_id: radio_id.to_string(),
-            state: "armed".to_string(),
-            af_hz: Some(intent.af_hz),
-            slot: Some(intent.slot.as_str().to_string()),
-            message: Some(intent.message.clone()),
-            ptt_elapsed_ms: 0,
-        });
+        if snap.tx_state != "transmitting" {
+            let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
+                radio_id: radio_id.to_string(),
+                state: "armed".to_string(),
+                af_hz: Some(intent.af_hz),
+                slot: Some(intent.slot.as_str().to_string()),
+                message: Some(intent.message.clone()),
+                ptt_elapsed_ms: 0,
+            });
+        }
         self.broadcast_qso_update(&snap, None);
+        self.reconcile_live_tx(&session).await;
+        let current = self.snapshot();
         Ok(json!({
-            "tx_state": "armed",
+            "tx_state": current.tx_state,
             "af_hz": intent.af_hz,
             "slot": intent.slot.as_str(),
             "message": intent.message,
@@ -640,27 +732,37 @@ impl SessionManager {
     }
 
     pub async fn call_cq(
-        &self,
+        self: &Arc<Self>,
         radio_id: &str,
         slot_opt: Option<SlotParity>,
         directed: Option<String>,
     ) -> CmdResult {
-        let (_, _, rt_arc) = self.get_active_runtime(radio_id).await?;
+        let session = self.get_active_runtime(radio_id).await?;
         let (cq, snap) = {
-            let mut rt = rt_arc.lock().await;
+            let mut rt = session.runtime.lock().await;
             let now_ms = Utc::now().timestamp_millis();
-            let slot = slot_opt.unwrap_or_else(|| rt.clock.parity_at(now_ms).opposite());
+            let slot = slot_opt.unwrap_or_else(|| {
+                let current_parity = rt.clock.parity_at(now_ms);
+                if !rt.sequencer.is_demo
+                    && rt.clock.ms_into_slot_virtual(now_ms) <= MAX_LATE_TX_START_MS
+                {
+                    current_parity
+                } else {
+                    current_parity.opposite()
+                }
+            });
             let cq = rt.sequencer.start_cq(slot, directed);
             (cq, rt.to_snapshot())
         };
         self.update_snapshot_cache(snap.clone());
         self.broadcast_qso_update(&snap, None);
+        self.reconcile_live_tx(&session).await;
         Ok(serde_json::to_value(cq).unwrap_or(Value::Null))
     }
 
     #[allow(clippy::too_many_arguments)]
     pub async fn reply_qso(
-        &self,
+        self: &Arc<Self>,
         radio_id: &str,
         callsign: &str,
         their_grid: Option<String>,
@@ -670,7 +772,7 @@ impl SessionManager {
         rx_af_hz: Option<u16>,
         rx_ts_sec: Option<i64>,
     ) -> CmdResult {
-        let (_, _, rt_arc) = self.get_active_runtime(radio_id).await?;
+        let session = self.get_active_runtime(radio_id).await?;
         let initial_rx = rx_message
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
@@ -683,7 +785,7 @@ impl SessionManager {
                 message,
             });
         let (qso, snap) = {
-            let mut rt = rt_arc.lock().await;
+            let mut rt = session.runtime.lock().await;
             let qso = rt
                 .sequencer
                 .start_reply_with_rx(callsign, their_grid, rx_slot, snr_db, initial_rx);
@@ -691,14 +793,20 @@ impl SessionManager {
         };
         self.update_snapshot_cache(snap.clone());
         self.broadcast_qso_update(&snap, None);
+        self.reconcile_live_tx(&session).await;
         Ok(serde_json::to_value(qso).unwrap_or(Value::Null))
     }
 
-    pub async fn qso_action(&self, radio_id: &str, qso_id: &str, action: QsoAction) -> CmdResult {
-        let (_, _, rt_arc) = self.get_active_runtime(radio_id).await?;
+    pub async fn qso_action(
+        self: &Arc<Self>,
+        radio_id: &str,
+        qso_id: &str,
+        action: QsoAction,
+    ) -> CmdResult {
+        let session = self.get_active_runtime(radio_id).await?;
         let live_freq = self.live_dial_freq_hz(radio_id, None);
         let (completed, snap) = {
-            let mut rt = rt_arc.lock().await;
+            let mut rt = session.runtime.lock().await;
             if let Some(f) = live_freq {
                 rt.dial_freq_hz = Some(f);
             }
@@ -715,6 +823,7 @@ impl SessionManager {
         }
         self.update_snapshot_cache(snap.clone());
         self.broadcast_qso_update(&snap, completed.clone());
+        self.reconcile_live_tx(&session).await;
         Ok(json!({
             "active_qsos": snap.active_qsos,
             "completed_qso": completed,
@@ -722,9 +831,9 @@ impl SessionManager {
     }
 
     pub async fn survey_af(&self, radio_id: &str) -> CmdResult {
-        let (_, _, rt_arc) = self.get_active_runtime(radio_id).await?;
+        let session = self.get_active_runtime(radio_id).await?;
         let snap = {
-            let mut rt = rt_arc.lock().await;
+            let mut rt = session.runtime.lock().await;
             let vnow = rt.clock.virtual_ms_at(Utc::now().timestamp_millis()).0;
             let slot_ms = rt.clock.spec().slot_ms;
             rt.sequencer.begin_af_survey(vnow, slot_ms);
@@ -736,9 +845,9 @@ impl SessionManager {
     }
 
     pub async fn set_af(&self, radio_id: &str, af_hz: u16) -> CmdResult {
-        let (_, _, rt_arc) = self.get_active_runtime(radio_id).await?;
+        let session = self.get_active_runtime(radio_id).await?;
         let snap = {
-            let mut rt = rt_arc.lock().await;
+            let mut rt = session.runtime.lock().await;
             rt.sequencer.set_af(af_hz);
             rt.to_snapshot()
         };
@@ -750,26 +859,28 @@ impl SessionManager {
         }))
     }
 
-    pub async fn set_tx_enabled(&self, radio_id: &str, enabled: bool) -> CmdResult {
-        let (_, _, rt_arc) = self.get_active_runtime(radio_id).await?;
-        let snap = {
-            let mut rt = rt_arc.lock().await;
-            rt.sequencer.set_tx_enabled(enabled);
-            if !enabled {
-                if let Some(mut pb) = rt.playback.take() {
-                    pb.stop();
-                }
-                rt.tx_state = "idle".to_string();
+    pub async fn set_tx_enabled(self: &Arc<Self>, radio_id: &str, enabled: bool) -> CmdResult {
+        let session = self.get_active_runtime(radio_id).await?;
+        if !enabled {
+            let _reconcile_guard = session.tx_reconcile_lock.lock().await;
+            {
+                let mut rt = session.runtime.lock().await;
+                rt.sequencer.set_tx_enabled(false);
             }
+            self.abort_current_tx_locked(&session).await;
+            let snap = self.snapshot();
+            return Ok(json!({ "tx_enabled": snap.tx_enabled }));
+        }
+
+        let snap = {
+            let mut rt = session.runtime.lock().await;
+            rt.sequencer.set_tx_enabled(true);
             rt.to_snapshot()
         };
-        if !enabled {
-            self.watchdog.disarm_tx(radio_id).await;
-            let _ = self.supervisor.set_ptt(radio_id, false).await;
-        }
         self.update_snapshot_cache(snap.clone());
         self.broadcast_qso_update(&snap, None);
-        Ok(json!({ "tx_enabled": snap.tx_enabled }))
+        self.reconcile_live_tx(&session).await;
+        Ok(json!({ "tx_enabled": true }))
     }
 
     fn persist_completed_qso(&self, radio_id: &str, rec: &QsoRecord) {
@@ -1161,16 +1272,14 @@ impl SessionManager {
         }
     }
 
-    async fn run_live_loop(
-        self: Arc<Self>,
-        rt_arc: Arc<AsyncMutex<SessionRuntime>>,
-        actor: String,
-        cancel: CancellationToken,
-    ) {
-        let (slot_ms, epoch_ms, radio_id) = {
+    async fn run_live_loop(self: Arc<Self>, session: ActiveSessionHandle) {
+        let rt_arc = Arc::clone(&session.runtime);
+        let cancel = session.cancel.clone();
+        let radio_id = session.radio_id.clone();
+        let (slot_ms, epoch_ms) = {
             let rt = rt_arc.lock().await;
             let spec = rt.clock.spec();
-            (spec.slot_ms, spec.epoch_ms, rt.sequencer.radio_id.clone())
+            (spec.slot_ms, spec.epoch_ms)
         };
 
         let session_start_ms = epoch_ms;
@@ -1185,7 +1294,6 @@ impl SessionManager {
             }
         }
 
-        let mut last_slot_was_tx = false;
         let mut active_pass3: Option<JoinHandle<()>> = None;
 
         loop {
@@ -1193,7 +1301,12 @@ impl SessionManager {
             let finished_slot_ts = UnixSecs(slot_start_ms.div_euclid(1000));
             let real_audio_start_ms = slot_start_ms.max(session_start_ms);
 
-            if !last_slot_was_tx {
+            let slot_had_tx = {
+                let rt = rt_arc.lock().await;
+                rt.did_tx_in_slot(finished_slot_ts)
+            };
+
+            if !slot_had_tx {
                 let reconciler =
                     Arc::new(AsyncMutex::new(SlotDecodeReconciler::new(finished_slot_ts)));
 
@@ -1205,7 +1318,10 @@ impl SessionManager {
                 if let Some(bg) = active_pass3.take() {
                     let _ = bg.await;
                 }
-                if self.should_decode_slot(&rt_arc, real_audio_start_ms).await {
+                if self
+                    .should_decode_slot(&rt_arc, finished_slot_ts, real_audio_start_ms)
+                    .await
+                {
                     if let Some(pcm_12k) = self.snapshot_prepared_slot_pcm(&rt_arc).await {
                         self.run_streaming_pass(
                             1,
@@ -1217,10 +1333,8 @@ impl SessionManager {
                                 generate_wisdom_if_missing: false,
                                 fallback_on_empty_timeout: false,
                             },
-                            &radio_id,
-                            &rt_arc,
+                            &session,
                             &reconciler,
-                            &cancel,
                         )
                         .await;
                     }
@@ -1233,7 +1347,10 @@ impl SessionManager {
                         .await;
                     break;
                 }
-                if self.should_decode_slot(&rt_arc, real_audio_start_ms).await {
+                if self
+                    .should_decode_slot(&rt_arc, finished_slot_ts, real_audio_start_ms)
+                    .await
+                {
                     if let Some(pcm_12k) = self.snapshot_prepared_slot_pcm(&rt_arc).await {
                         self.run_streaming_pass(
                             2,
@@ -1245,10 +1362,8 @@ impl SessionManager {
                                 generate_wisdom_if_missing: false,
                                 fallback_on_empty_timeout: false,
                             },
-                            &radio_id,
-                            &rt_arc,
+                            &session,
                             &reconciler,
-                            &cancel,
                         )
                         .await;
                     }
@@ -1261,43 +1376,42 @@ impl SessionManager {
                         .await;
                     break;
                 }
-                let mut pass3_handle =
-                    if self.should_decode_slot(&rt_arc, real_audio_start_ms).await {
-                        self.snapshot_prepared_slot_pcm(&rt_arc)
-                            .await
-                            .map(|pcm_12k| {
-                                let mgr_p3 = Arc::clone(&self);
-                                let rt_p3 = Arc::clone(&rt_arc);
-                                let rec_p3 = Arc::clone(&reconciler);
-                                let rid_p3 = radio_id.clone();
-                                let cancel_p3 = cancel.clone();
-                                tokio::spawn(async move {
-                                    mgr_p3
-                                        .run_streaming_pass(
-                                            3,
-                                            finished_slot_ts,
-                                            pcm_12k,
-                                            DecodePassOptions {
-                                                depth: 3,
-                                                timeout: Duration::from_millis(3_500),
-                                                generate_wisdom_if_missing: true,
-                                                fallback_on_empty_timeout: true,
-                                            },
-                                            &rid_p3,
-                                            &rt_p3,
-                                            &rec_p3,
-                                            &cancel_p3,
-                                        )
-                                        .await;
-                                    let dial_freq = mgr_p3.live_dial_freq_hz(&rid_p3, None);
-                                    mgr_p3
-                                        .flush_slot_telemetry(&rid_p3, dial_freq, &rec_p3)
-                                        .await;
-                                })
+                let mut pass3_handle = if self
+                    .should_decode_slot(&rt_arc, finished_slot_ts, real_audio_start_ms)
+                    .await
+                {
+                    self.snapshot_prepared_slot_pcm(&rt_arc)
+                        .await
+                        .map(|pcm_12k| {
+                            let mgr_p3 = Arc::clone(&self);
+                            let sess_p3 = session.clone();
+                            let rec_p3 = Arc::clone(&reconciler);
+                            let rid_p3 = radio_id.clone();
+                            tokio::spawn(async move {
+                                mgr_p3
+                                    .run_streaming_pass(
+                                        3,
+                                        finished_slot_ts,
+                                        pcm_12k,
+                                        DecodePassOptions {
+                                            depth: 3,
+                                            timeout: Duration::from_millis(3_500),
+                                            generate_wisdom_if_missing: true,
+                                            fallback_on_empty_timeout: true,
+                                        },
+                                        &sess_p3,
+                                        &rec_p3,
+                                    )
+                                    .await;
+                                let dial_freq = mgr_p3.live_dial_freq_hz(&rid_p3, None);
+                                mgr_p3
+                                    .flush_slot_telemetry(&rid_p3, dial_freq, &rec_p3)
+                                    .await;
                             })
-                    } else {
-                        None
-                    };
+                        })
+                } else {
+                    None
+                };
 
                 if let Some(ref mut handle) = pass3_handle {
                     let deadline_ms = next_slot_ms + LIVE_DECODE_GRACE_MS;
@@ -1329,10 +1443,7 @@ impl SessionManager {
                 break;
             }
 
-            let active_slot_ts = UnixSecs(next_slot_ms.div_euclid(1000));
-            let active_parity = SlotParity::from_unix_secs(active_slot_ts);
-            let live_freq = self.live_dial_freq_hz(&radio_id, None);
-            let tx_plan = {
+            {
                 let now_roll_ms = Utc::now().timestamp_millis();
                 let overshoot_ms = (now_roll_ms - next_slot_ms).max(0) as usize;
                 let keep_tail_samples =
@@ -1341,51 +1452,10 @@ impl SessionManager {
                 if let Some(ref c) = rt.capture {
                     c.reset_for_new_slot(keep_tail_samples);
                 }
-                if let Some(f) = live_freq {
-                    rt.dial_freq_hz = Some(f);
-                }
                 let _ = rt.sequencer.maybe_finish_af_survey(next_slot_ms);
-                if rt.tx_state != "transmitting" {
-                    rt.sequencer
-                        .compose_tx_for_slot(active_parity, next_slot_ms)
-                        .map(|intent| {
-                            (
-                                intent,
-                                rt.audio_device_name.clone(),
-                                rt.audio_tx_gain_db,
-                                rt.dial_freq_hz,
-                            )
-                        })
-                } else {
-                    None
-                }
-            };
-
-            if let Some((intent, Some(audio_dev), gain_db, dial_freq_hz)) = tx_plan {
-                last_slot_was_tx = true;
-                let mgr_tx = Arc::clone(&self);
-                let rt_tx = Arc::clone(&rt_arc);
-                let rid_tx = radio_id.clone();
-                let actor_tx = actor.clone();
-                let cancel_tx = cancel.clone();
-                tokio::spawn(async move {
-                    mgr_tx
-                        .execute_live_tx(
-                            &rid_tx,
-                            &actor_tx,
-                            active_slot_ts,
-                            &intent,
-                            &audio_dev,
-                            gain_db,
-                            dial_freq_hz,
-                            rt_tx,
-                            cancel_tx,
-                        )
-                        .await;
-                });
-            } else {
-                last_slot_was_tx = false;
             }
+
+            self.reconcile_live_tx(&session).await;
 
             next_slot_ms += slot_ms;
             let after_ms = Utc::now().timestamp_millis();
@@ -1402,6 +1472,7 @@ impl SessionManager {
     async fn should_decode_slot(
         &self,
         rt_arc: &Arc<AsyncMutex<SessionRuntime>>,
+        slot_ts: UnixSecs,
         real_audio_start_ms: i64,
     ) -> bool {
         let now_ms = Utc::now().timestamp_millis();
@@ -1409,6 +1480,9 @@ impl SessionManager {
             return false;
         }
         let rt = rt_arc.lock().await;
+        if rt.did_tx_in_slot(slot_ts) {
+            return false;
+        }
         rt.capture
             .as_ref()
             .is_some_and(|c| c.buffered_len() >= MIN_LIVE_SLOT_SAMPLES_12K)
@@ -1430,20 +1504,18 @@ impl SessionManager {
 
     #[allow(clippy::too_many_arguments)]
     async fn run_streaming_pass(
-        &self,
+        self: &Arc<Self>,
         pass_num: u8,
         slot_ts: UnixSecs,
         pcm_12k: Vec<f32>,
         opts: DecodePassOptions,
-        radio_id: &str,
-        rt_arc: &Arc<AsyncMutex<SessionRuntime>>,
+        session: &ActiveSessionHandle,
         reconciler: &Arc<AsyncMutex<SlotDecodeReconciler>>,
-        cancel: &CancellationToken,
     ) {
         let (dec_tx, mut dec_rx) = mpsc::unbounded_channel::<Ft8Decode>();
         let decoder = Arc::clone(&self.hybrid_decoder);
-        let cancel_dec = cancel.clone();
-        let rid_err = radio_id.to_string();
+        let cancel_dec = session.cancel.clone();
+        let rid_err = session.radio_id.clone();
 
         let decode_task = tokio::spawn(async move {
             if let Err(e) = decoder
@@ -1468,14 +1540,14 @@ impl SessionManager {
                 continue;
             }
             let (my_call, dial_freq) = self
-                .ingest_live_decode_outcome(radio_id, rt_arc, outcome, &mut roster_batch)
+                .ingest_live_decode_outcome(session, outcome, &mut roster_batch)
                 .await;
             my_call_cached = my_call;
             dial_freq_cached = dial_freq;
 
             if last_roster_flush.elapsed() >= ROSTER_STREAM_FLUSH_INTERVAL {
                 self.flush_roster_batch(
-                    radio_id,
+                    &session.radio_id,
                     false,
                     &my_call_cached,
                     dial_freq_cached,
@@ -1487,12 +1559,12 @@ impl SessionManager {
 
         if !roster_batch.is_empty() {
             if my_call_cached.is_empty() {
-                let rt = rt_arc.lock().await;
+                let rt = session.runtime.lock().await;
                 my_call_cached = rt.sequencer.my_call.clone();
                 dial_freq_cached = rt.dial_freq_hz;
             }
             self.flush_roster_batch(
-                radio_id,
+                &session.radio_id,
                 false,
                 &my_call_cached,
                 dial_freq_cached,
@@ -1504,12 +1576,13 @@ impl SessionManager {
     }
 
     async fn ingest_live_decode_outcome(
-        &self,
-        radio_id: &str,
-        rt_arc: &Arc<AsyncMutex<SessionRuntime>>,
+        self: &Arc<Self>,
+        session: &ActiveSessionHandle,
         outcome: ReconcileOutcome,
         roster_batch: &mut Vec<(Ft8Decode, bool)>,
     ) -> (String, Option<i64>) {
+        let radio_id = &session.radio_id;
+        let rt_arc = &session.runtime;
         let live_freq = self.live_dial_freq_hz(radio_id, None);
         match outcome {
             ReconcileOutcome::New(dec) => {
@@ -1529,6 +1602,7 @@ impl SessionManager {
                 self.update_snapshot_cache(snap.clone());
                 self.broadcast_qso_update(&snap, completed.last().cloned());
                 roster_batch.push((dec, true));
+                self.reconcile_live_tx(session).await;
                 (my_call, dial_freq)
             }
             ReconcileOutcome::Refined { previous, updated } => {
@@ -1596,116 +1670,461 @@ impl SessionManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_live_tx(
-        &self,
-        radio_id: &str,
-        actor: &str,
-        slot_ts: UnixSecs,
-        intent: &TxIntent,
-        audio_dev: &str,
-        tx_gain_db: f64,
-        dial_freq_hz: Option<i64>,
-        rt_arc: Arc<AsyncMutex<SessionRuntime>>,
-        cancel: CancellationToken,
-    ) {
-        let pcm_48k = match Ft8LibTxModulator::modulate_pcm(
-            &intent.message,
-            f32::from(intent.af_hz),
-            DSP_SAMPLE_RATE,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                self.emit_tx_error(
-                    radio_id,
-                    format!(
-                        "Failed to modulate FT8 TX waveform '{}': {e}",
-                        intent.message
-                    ),
-                );
+    async fn abort_current_tx_locked(&self, session: &ActiveSessionHandle) {
+        let (active_opt, pb_opt, snap) = {
+            let mut rt = session.runtime.lock().await;
+            let active = rt.active_tx.take();
+            if let Some(ref a) = active {
+                a.aborted_by_control.store(true, Ordering::SeqCst);
+                a.tx_cancel.cancel();
+            }
+            let pb = rt.playback.take();
+            if let Some(ref p) = pb {
+                p.abort();
+            }
+            let had_tx = active.is_some() || pb.is_some() || rt.tx_state == "transmitting";
+            rt.tx_state = "idle".to_string();
+            rt.armed_message = None;
+            let snap = rt.to_snapshot();
+            if !had_tx {
                 return;
             }
+            (active, pb, snap)
         };
 
-        let dev_owned = audio_dev.to_string();
-        let wd_fault = Arc::clone(&self.watchdog);
-        let rid_fault = radio_id.to_string();
-        let playback = match tokio::task::spawn_blocking(move || {
-            AudioManager::start_playback(
-                &dev_owned,
-                pcm_48k,
-                tx_gain_db,
-                Arc::new(move |detail| {
-                    let wd = Arc::clone(&wd_fault);
-                    let r = rid_fault.clone();
-                    tokio::spawn(async move {
-                        wd.on_audio_fault(&r, &detail).await;
-                    });
-                }),
-            )
-        })
-        .await
-        {
-            Ok(Ok(pb)) => pb,
-            Ok(Err(e)) => {
-                self.emit_tx_error(
-                    radio_id,
-                    format!("Failed to open TX audio playback stream on '{audio_dev}': {e}"),
-                );
-                return;
-            }
-            Err(e) => {
-                self.emit_tx_error(radio_id, format!("TX playback task error: {e}"));
-                return;
-            }
-        };
-
-        let abort_flag = playback.abort_handle();
-        if let Err((_, msg)) = self.supervisor.set_ptt(radio_id, true).await {
-            let mut pb = playback;
+        if let Some(pb) = pb_opt {
             pb.stop();
-            self.emit_tx_error(radio_id, format!("Failed to assert CAT PTT for TX: {msg}"));
+        }
+        self.watchdog.disarm_tx(&session.radio_id).await;
+        if !session.is_demo {
+            let _ = self.supervisor.set_ptt(&session.radio_id, false).await;
+        }
+        if let Some(active) = active_opt {
+            let _ = active.task.await;
+        }
+
+        self.update_snapshot_cache(snap.clone());
+        let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
+            radio_id: session.radio_id.clone(),
+            state: "idle".to_string(),
+            af_hz: Some(snap.tx_af_hz),
+            slot: None,
+            message: None,
+            ptt_elapsed_ms: 0,
+        });
+        self.broadcast_qso_update(&snap, None);
+    }
+
+    /// Reconcile desired TX state against current slot time: start immediately (offset-truncated
+    /// when `<= 6.0s` into the slot), hot-swap audio in place if an active QSO advances mid-TX, or
+    /// abort immediately if stale/cancelled. Never called while holding `session.runtime`.
+    async fn reconcile_live_tx(self: &Arc<Self>, session: &ActiveSessionHandle) {
+        if session.is_demo || session.cancel.is_cancelled() {
+            return;
+        }
+        let _reconcile_guard = session.tx_reconcile_lock.lock().await;
+        if session.cancel.is_cancelled() {
             return;
         }
 
-        self.watchdog
-            .arm_tx(radio_id, actor, Some(Arc::clone(&abort_flag)))
-            .await;
+        let slot_ms = {
+            let rt = session.runtime.lock().await;
+            rt.clock.spec().slot_ms
+        };
+        let now_ms = Utc::now().timestamp_millis();
+        let slot_start_ms = now_ms.div_euclid(slot_ms) * slot_ms;
+        let slot_ts = UnixSecs(slot_start_ms.div_euclid(1000));
+        let slot_parity = SlotParity::from_unix_secs(slot_ts);
+        let into_slot_ms = (now_ms - slot_start_ms).max(0);
+        let live_freq = self.live_dial_freq_hz(&session.radio_id, None);
 
-        {
-            let mut rt = rt_arc.lock().await;
-            rt.playback = Some(playback);
-            rt.tx_state = "transmitting".to_string();
-            rt.armed_message = Some(intent.message.clone());
-            self.update_snapshot_cache(rt.to_snapshot());
+        enum Plan {
+            Noop,
+            Abort,
+            Start {
+                intent: TxIntent,
+                audio_dev: String,
+                gain_db: f64,
+                dial_freq_hz: Option<i64>,
+            },
+            HotSwap {
+                intent: TxIntent,
+                playback: Arc<AudioPlaybackHandle>,
+                expected_gen: u64,
+            },
         }
 
-        let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
-            radio_id: radio_id.to_string(),
-            state: "transmitting".to_string(),
-            af_hz: Some(intent.af_hz),
-            slot: Some(intent.slot.as_str().to_string()),
-            message: Some(intent.message.clone()),
-            ptt_elapsed_ms: 0,
-        });
+        let plan = {
+            let mut rt = session.runtime.lock().await;
+            if let Some(f) = live_freq {
+                rt.dial_freq_hz = Some(f);
+            }
+            let active_intent = rt
+                .active_tx
+                .as_ref()
+                .filter(|a| a.slot_ts == slot_ts)
+                .map(|a| a.intent.clone());
+            let desired_intent = rt.sequencer.compose_tx_for_slot(slot_parity, now_ms);
+            let decision = decide_tx_action(
+                active_intent.as_ref(),
+                desired_intent.as_ref(),
+                into_slot_ms,
+                MAX_LATE_TX_START_MS,
+            );
+            match decision {
+                TxReconcileDecision::Noop | TxReconcileDecision::TooLateWaitNextSlot => Plan::Noop,
+                TxReconcileDecision::Abort => Plan::Abort,
+                TxReconcileDecision::Start { intent, .. } => {
+                    if let Some(audio_dev) = rt.audio_device_name.clone() {
+                        Plan::Start {
+                            intent,
+                            audio_dev,
+                            gain_db: rt.audio_tx_gain_db,
+                            dial_freq_hz: rt.dial_freq_hz,
+                        }
+                    } else {
+                        Plan::Noop
+                    }
+                }
+                TxReconcileDecision::HotSwap { intent, .. } => {
+                    match (rt.playback.clone(), rt.active_tx.as_ref().map(|a| a.tx_gen)) {
+                        (Some(playback), Some(expected_gen)) => Plan::HotSwap {
+                            intent,
+                            playback,
+                            expected_gen,
+                        },
+                        _ => Plan::Abort,
+                    }
+                }
+            }
+        };
 
-        let tx_end = TokioInstant::now() + Duration::from_millis(12_700);
+        match plan {
+            Plan::Noop => {}
+            Plan::Abort => {
+                self.abort_current_tx_locked(session).await;
+            }
+            Plan::HotSwap {
+                intent,
+                playback,
+                expected_gen,
+            } => {
+                let offset_ms = (Utc::now().timestamp_millis() - slot_start_ms).max(0) as u64;
+                if (offset_ms as i64) > MAX_LATE_TX_START_MS {
+                    self.abort_current_tx_locked(session).await;
+                    return;
+                }
+                let msg_mod = intent.message.clone();
+                let af_mod = f32::from(intent.af_hz);
+                let pcm_res = tokio::task::spawn_blocking(move || {
+                    Ft8LibTxModulator::modulate_pcm_from_offset(
+                        &msg_mod,
+                        af_mod,
+                        DSP_SAMPLE_RATE,
+                        offset_ms,
+                    )
+                })
+                .await;
+                let pcm_48k = match pcm_res {
+                    Ok(Ok(p)) if !p.is_empty() => p,
+                    Ok(Ok(_)) => {
+                        self.abort_current_tx_locked(session).await;
+                        return;
+                    }
+                    Ok(Err(e)) => {
+                        self.emit_tx_error(
+                            &session.radio_id,
+                            format!(
+                                "Failed to modulate hot-swap FT8 TX waveform '{}': {e}",
+                                intent.message
+                            ),
+                        );
+                        self.abort_current_tx_locked(session).await;
+                        return;
+                    }
+                    Err(e) => {
+                        self.emit_tx_error(
+                            &session.radio_id,
+                            format!("TX modulate task error: {e}"),
+                        );
+                        self.abort_current_tx_locked(session).await;
+                        return;
+                    }
+                };
+
+                let pb_swap = Arc::clone(&playback);
+                let swap_res =
+                    tokio::task::spawn_blocking(move || pb_swap.replace_samples(pcm_48k)).await;
+                match swap_res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        self.emit_tx_error(
+                            &session.radio_id,
+                            format!("Failed to hot-swap TX playback buffer: {e}"),
+                        );
+                        self.abort_current_tx_locked(session).await;
+                        return;
+                    }
+                    Err(e) => {
+                        self.emit_tx_error(
+                            &session.radio_id,
+                            format!("TX buffer hot-swap task error: {e}"),
+                        );
+                        self.abort_current_tx_locked(session).await;
+                        return;
+                    }
+                }
+
+                let snap_opt = {
+                    let mut rt = session.runtime.lock().await;
+                    let confirmed_arc = match rt.active_tx.as_mut() {
+                        Some(a) if a.tx_gen == expected_gen => {
+                            a.intent = intent.clone();
+                            Some(Arc::clone(&a.confirmed_intent))
+                        }
+                        _ => None,
+                    };
+                    if let Some(arc) = confirmed_arc {
+                        *arc.lock().await = intent.clone();
+                        rt.armed_message = Some(intent.message.clone());
+                        Some(rt.to_snapshot())
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(snap) = snap_opt {
+                    let ptt_elapsed_ms =
+                        (Utc::now().timestamp_millis() - slot_start_ms).max(0) as u64;
+                    self.update_snapshot_cache(snap.clone());
+                    let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
+                        radio_id: session.radio_id.clone(),
+                        state: "transmitting".to_string(),
+                        af_hz: Some(intent.af_hz),
+                        slot: Some(intent.slot.as_str().to_string()),
+                        message: Some(intent.message),
+                        ptt_elapsed_ms,
+                    });
+                    self.broadcast_qso_update(&snap, None);
+                }
+            }
+            Plan::Start {
+                intent,
+                audio_dev,
+                gain_db,
+                dial_freq_hz,
+            } => {
+                let offset_ms = (Utc::now().timestamp_millis() - slot_start_ms).max(0) as u64;
+                if (offset_ms as i64) > MAX_LATE_TX_START_MS {
+                    return;
+                }
+                let msg_mod = intent.message.clone();
+                let af_mod = f32::from(intent.af_hz);
+                let pcm_res = tokio::task::spawn_blocking(move || {
+                    Ft8LibTxModulator::modulate_pcm_from_offset(
+                        &msg_mod,
+                        af_mod,
+                        DSP_SAMPLE_RATE,
+                        offset_ms,
+                    )
+                })
+                .await;
+                let pcm_48k = match pcm_res {
+                    Ok(Ok(p)) if !p.is_empty() => p,
+                    Ok(Ok(_)) => return,
+                    Ok(Err(e)) => {
+                        self.emit_tx_error(
+                            &session.radio_id,
+                            format!(
+                                "Failed to modulate FT8 TX waveform '{}': {e}",
+                                intent.message
+                            ),
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        self.emit_tx_error(
+                            &session.radio_id,
+                            format!("TX modulate task error: {e}"),
+                        );
+                        return;
+                    }
+                };
+
+                let dev_owned = audio_dev.clone();
+                let wd_fault = Arc::clone(&self.watchdog);
+                let rid_fault = session.radio_id.clone();
+                let playback = match tokio::task::spawn_blocking(move || {
+                    AudioManager::start_playback(
+                        &dev_owned,
+                        pcm_48k,
+                        gain_db,
+                        Arc::new(move |detail| {
+                            let wd = Arc::clone(&wd_fault);
+                            let r = rid_fault.clone();
+                            tokio::spawn(async move {
+                                wd.on_audio_fault(&r, &detail).await;
+                            });
+                        }),
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(pb)) => Arc::new(pb),
+                    Ok(Err(e)) => {
+                        self.emit_tx_error(
+                            &session.radio_id,
+                            format!(
+                                "Failed to open TX audio playback stream on '{audio_dev}': {e}"
+                            ),
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        self.emit_tx_error(
+                            &session.radio_id,
+                            format!("TX playback task error: {e}"),
+                        );
+                        return;
+                    }
+                };
+
+                let abort_flag = playback.abort_handle();
+                if let Err((_, msg)) = self.supervisor.set_ptt(&session.radio_id, true).await {
+                    playback.stop();
+                    self.emit_tx_error(
+                        &session.radio_id,
+                        format!("Failed to assert CAT PTT for TX: {msg}"),
+                    );
+                    return;
+                }
+
+                self.watchdog
+                    .arm_tx(
+                        &session.radio_id,
+                        &session.actor,
+                        Some(Arc::clone(&abort_flag)),
+                    )
+                    .await;
+
+                let tx_cancel = CancellationToken::new();
+                let aborted_by_control = Arc::new(AtomicBool::new(false));
+                let confirmed_intent = Arc::new(AsyncMutex::new(intent.clone()));
+
+                let snap = {
+                    let mut rt = session.runtime.lock().await;
+                    let tx_gen = rt.next_tx_gen;
+                    rt.next_tx_gen = rt.next_tx_gen.wrapping_add(1).max(1);
+
+                    let mgr_wait = Arc::clone(self);
+                    let rt_wait = Arc::clone(&session.runtime);
+                    let rid_wait = session.radio_id.clone();
+                    let sess_cancel_wait = session.cancel.clone();
+                    let tx_cancel_wait = tx_cancel.clone();
+                    let aborted_ctrl_wait = Arc::clone(&aborted_by_control);
+                    let abort_flag_wait = Arc::clone(&abort_flag);
+                    let confirmed_wait = Arc::clone(&confirmed_intent);
+
+                    let task = tokio::spawn(async move {
+                        mgr_wait
+                            .wait_for_live_tx_end(
+                                rid_wait,
+                                tx_gen,
+                                slot_ts,
+                                slot_start_ms,
+                                dial_freq_hz,
+                                rt_wait,
+                                confirmed_wait,
+                                abort_flag_wait,
+                                aborted_ctrl_wait,
+                                tx_cancel_wait,
+                                sess_cancel_wait,
+                            )
+                            .await;
+                    });
+
+                    rt.playback = Some(Arc::clone(&playback));
+                    rt.active_tx = Some(ActiveTxHandle {
+                        tx_gen,
+                        slot_ts,
+                        intent: intent.clone(),
+                        confirmed_intent,
+                        tx_cancel,
+                        aborted_by_control,
+                        task,
+                    });
+                    rt.tx_occurred_in_slot_ts = Some(slot_ts);
+                    rt.tx_state = "transmitting".to_string();
+                    rt.armed_message = Some(intent.message.clone());
+                    rt.to_snapshot()
+                };
+
+                let ptt_elapsed_ms = (Utc::now().timestamp_millis() - slot_start_ms).max(0) as u64;
+                self.update_snapshot_cache(snap.clone());
+                let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
+                    radio_id: session.radio_id.clone(),
+                    state: "transmitting".to_string(),
+                    af_hz: Some(intent.af_hz),
+                    slot: Some(intent.slot.as_str().to_string()),
+                    message: Some(intent.message),
+                    ptt_elapsed_ms,
+                });
+                self.broadcast_qso_update(&snap, None);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn wait_for_live_tx_end(
+        &self,
+        radio_id: String,
+        tx_gen: u64,
+        slot_ts: UnixSecs,
+        slot_start_ms: i64,
+        dial_freq_hz: Option<i64>,
+        rt_arc: Arc<AsyncMutex<SessionRuntime>>,
+        confirmed_intent: Arc<AsyncMutex<TxIntent>>,
+        abort_flag: Arc<AtomicBool>,
+        aborted_by_control: Arc<AtomicBool>,
+        tx_cancel: CancellationToken,
+        session_cancel: CancellationToken,
+    ) {
+        let end_wall_ms = slot_start_ms + FT8_TX_END_OFFSET_MS;
+        let wait_ms = (end_wall_ms - Utc::now().timestamp_millis()).max(50) as u64;
+        let tx_end = TokioInstant::now() + Duration::from_millis(wait_ms);
+
         tokio::select! {
-            _ = cancel.cancelled() => {}
+            _ = session_cancel.cancelled() => {}
+            _ = tx_cancel.cancelled() => {}
             _ = sleep_until(tx_end) => {}
         }
 
-        let aborted = abort_flag.load(Ordering::SeqCst);
-        self.watchdog.disarm_tx(radio_id).await;
-        let _ = self.supervisor.set_ptt(radio_id, false).await;
+        let aborted = abort_flag.load(Ordering::SeqCst)
+            || aborted_by_control.load(Ordering::SeqCst)
+            || tx_cancel.is_cancelled()
+            || session_cancel.is_cancelled();
 
+        let pb_opt = {
+            let mut rt = rt_arc.lock().await;
+            if !rt.active_tx.as_ref().is_some_and(|a| a.tx_gen == tx_gen) {
+                return;
+            }
+            rt.active_tx = None;
+            rt.playback.take()
+        };
+
+        self.watchdog.disarm_tx(&radio_id).await;
+        let _ = self.supervisor.set_ptt(&radio_id, false).await;
+        if let Some(pb) = pb_opt {
+            pb.stop();
+        }
+
+        let final_intent = confirmed_intent.lock().await.clone();
         let (completed, snap) = {
             let mut rt = rt_arc.lock().await;
-            if let Some(mut pb) = rt.playback.take() {
-                pb.stop();
-            }
-            let done = if !aborted && !cancel.is_cancelled() {
-                rt.sequencer.on_tx_confirmed(slot_ts, intent, dial_freq_hz)
+            let done = if !aborted {
+                rt.sequencer
+                    .on_tx_confirmed(slot_ts, &final_intent, dial_freq_hz)
             } else {
                 None
             };
@@ -1715,12 +2134,12 @@ impl SessionManager {
         };
 
         if let Some(ref rec) = completed {
-            self.persist_completed_qso(radio_id, rec);
+            self.persist_completed_qso(&radio_id, rec);
         }
         self.update_snapshot_cache(snap.clone());
         self.broadcast_qso_update(&snap, completed);
         let _ = self.ws_tx.send(WsBroadcastEvent::TxState {
-            radio_id: radio_id.to_string(),
+            radio_id,
             state: "idle".to_string(),
             af_hz: Some(snap.tx_af_hz),
             slot: None,
@@ -1783,5 +2202,92 @@ fn synthesize_demo_waterfall(even_occ: &[u16], odd_occ: &[u16], tx_af: u16) -> W
         rms_db: -42.0,
         peak_db: -24.0,
         clipped: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_intent(slot: SlotParity, af_hz: u16, msg: &str) -> TxIntent {
+        TxIntent {
+            af_hz,
+            slot,
+            message: msg.to_string(),
+        }
+    }
+
+    #[test]
+    fn decide_tx_action_covers_late_start_hotswap_abort_and_noop() {
+        let cq = mk_intent(SlotParity::Even, 1500, "CQ N1MPM FN33");
+        let rep = mk_intent(SlotParity::Even, 1500, "K1ABC N1MPM -08");
+        let rr73 = mk_intent(SlotParity::Even, 1500, "K1ABC N1MPM RR73");
+
+        // Idle -> None
+        assert_eq!(
+            decide_tx_action(None, None, 1_000, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::Noop
+        );
+
+        // Idle -> Start at 0ms and at 6000ms cutoff
+        assert_eq!(
+            decide_tx_action(None, Some(&cq), 0, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::Start {
+                intent: cq.clone(),
+                offset_ms: 0
+            }
+        );
+        assert_eq!(
+            decide_tx_action(None, Some(&cq), 6_000, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::Start {
+                intent: cq.clone(),
+                offset_ms: 6_000
+            }
+        );
+
+        // Idle -> TooLateWaitNextSlot past 6000ms
+        assert_eq!(
+            decide_tx_action(None, Some(&cq), 6_001, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::TooLateWaitNextSlot
+        );
+
+        // Active -> None => Abort regardless of offset
+        assert_eq!(
+            decide_tx_action(Some(&cq), None, 2_000, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::Abort
+        );
+        assert_eq!(
+            decide_tx_action(Some(&cq), None, 9_000, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::Abort
+        );
+
+        // Active -> same message & slot (even if AF changed) => Noop
+        let cq_new_af = mk_intent(SlotParity::Even, 1800, "CQ N1MPM FN33");
+        assert_eq!(
+            decide_tx_action(Some(&cq), Some(&cq_new_af), 2_000, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::Noop
+        );
+
+        // Active -> different message within <= 6000ms => HotSwap
+        assert_eq!(
+            decide_tx_action(Some(&rep), Some(&rr73), 1_200, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::HotSwap {
+                intent: rr73.clone(),
+                offset_ms: 1_200
+            }
+        );
+        assert_eq!(
+            decide_tx_action(Some(&rep), Some(&rr73), 6_000, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::HotSwap {
+                intent: rr73.clone(),
+                offset_ms: 6_000
+            }
+        );
+
+        // Active -> different message past 6000ms => Abort stale TX immediately
+        assert_eq!(
+            decide_tx_action(Some(&rep), Some(&rr73), 6_001, MAX_LATE_TX_START_MS),
+            TxReconcileDecision::Abort
+        );
     }
 }
