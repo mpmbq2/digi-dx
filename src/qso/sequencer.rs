@@ -857,6 +857,10 @@ impl QsoSequencer {
             completion_reason: completion_reason.to_string(),
             transcript_json: serde_json::to_string(&qso.transcript)
                 .unwrap_or_else(|_| "[]".to_string()),
+            qrz_status: None,
+            qrz_logid: None,
+            qrz_pushed_at_utc: None,
+            qrz_error: None,
         }
     }
 }

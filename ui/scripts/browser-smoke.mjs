@@ -224,19 +224,28 @@ async function main() {
 
     await page.click('[data-testid="call-cq-btn"]');
     await page.click('[data-testid="nav-logbook"]');
+    await page.waitForSelector('[data-testid="push-qrz-btn"]', { timeout: 5000 });
+    await page.waitForSelector('[data-testid="qrz-settings-toggle"]', { timeout: 5000 });
     await page.click('[data-testid="tab-demo-log"]');
     await page.waitForSelector('[data-testid="demo-qso-row"]', { timeout: 15000 });
     const demoRowText = await page.textContent('[data-testid="demo-qso-row"]');
     assert.match(demoRowText ?? "", /QQ0DEMO/);
     assert.match(demoRowText ?? "", /QQ\d/);
 
-    // 9. Confirm ADIF export strictly excludes demo QSOs
+    // 9. Confirm ADIF export and QRZ queue strictly exclude demo QSOs
     const adifRes = await fetch(`${baseUrl}/api/v1/qsos/export.adi`);
     assert.equal(adifRes.status, 200);
     const adifText = await adifRes.text();
     assert(adifText.includes("<EOH>"), "ADIF header missing");
     assert(!adifText.includes("<EOR>"), "Demo QSO leaked into ADIF export");
     assert(!adifText.includes("QQ"), "QQ callsign leaked into ADIF export");
+
+    const qrzRes = await fetch(`${baseUrl}/api/v1/qrz/status`);
+    assert.equal(qrzRes.status, 200);
+    const qrzJson = await qrzRes.json();
+    assert.equal(qrzJson.pending_count, 0, "Demo QSO leaked into QRZ pending count");
+    assert.equal(qrzJson.failed_count, 0);
+    assert.equal(qrzJson.synced_count, 0);
 
     // 10. Return to FT8 Operation and stop demo session cleanly
     await page.click('[data-testid="nav-setup"]');

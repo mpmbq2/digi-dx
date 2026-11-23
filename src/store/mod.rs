@@ -14,6 +14,7 @@ use crate::telemetry::TelemetryEnvelope;
 const INITIAL_MIGRATION_SQL: &str = include_str!("migrations/001_initial_schema.sql");
 const ROSTER_MIGRATION_SQL: &str = include_str!("migrations/002_channel_roster.sql");
 const ROSTER_ROLE_MIGRATION_SQL: &str = include_str!("migrations/003_channel_roster_role.sql");
+const QRZ_SYNC_MIGRATION_SQL: &str = include_str!("migrations/004_qrz_sync.sql");
 pub const CHANNEL_ROSTER_WINDOW_MS: i64 = 300_000;
 
 pub fn channel_key_for_freq(mode: &str, dial_freq_hz: Option<i64>) -> String {
@@ -229,6 +230,32 @@ pub struct OutboxStats {
     pub oldest_pending_utc: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QrzQsoCounts {
+    pub pending: i64,
+    pub synced: i64,
+    pub failed: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QrzPushErrorItem {
+    pub qso_id: String,
+    pub their_call: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QrzPushSummary {
+    pub total: usize,
+    pub pushed: usize,
+    pub duplicates: usize,
+    pub failed: usize,
+    pub skipped_demo: usize,
+    pub aborted_reason: Option<String>,
+    pub errors: Vec<QrzPushErrorItem>,
+    pub pushed_at_utc: String,
+}
+
 #[derive(Clone)]
 pub struct StateStore {
     conn: Arc<Mutex<Connection>>,
@@ -334,6 +361,23 @@ impl StateStore {
             tx.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at_utc) VALUES (?1, ?2, ?3)",
                 params![3_i64, "003_channel_roster_role", now_utc_str()],
+            )?;
+            tx.commit()?;
+        }
+
+        let qrz_applied: Option<i64> = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE version = 4",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if qrz_applied.is_none() {
+            let tx = conn.transaction()?;
+            tx.execute_batch(QRZ_SYNC_MIGRATION_SQL)?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at_utc) VALUES (?1, ?2, ?3)",
+                params![4_i64, "004_qrz_sync", now_utc_str()],
             )?;
             tx.commit()?;
         }
@@ -839,7 +883,8 @@ impl StateStore {
             if band.is_some() {
                 "SELECT qso_id, NULL as radio_id, started_at_utc, completed_at_utc, my_call, my_grid,
                         their_call, their_grid, mode, dial_freq_hz, band, NULL as af_hz,
-                        rst_sent, rst_rcvd, completion_reason, transcript_json
+                        rst_sent, rst_rcvd, completion_reason, transcript_json,
+                        NULL as qrz_status, NULL as qrz_logid, NULL as qrz_pushed_at_utc, NULL as qrz_error
                  FROM demo_qso_log
                  WHERE band = ?1
                  ORDER BY completed_at_utc DESC
@@ -847,7 +892,8 @@ impl StateStore {
             } else {
                 "SELECT qso_id, NULL as radio_id, started_at_utc, completed_at_utc, my_call, my_grid,
                         their_call, their_grid, mode, dial_freq_hz, band, NULL as af_hz,
-                        rst_sent, rst_rcvd, completion_reason, transcript_json
+                        rst_sent, rst_rcvd, completion_reason, transcript_json,
+                        NULL as qrz_status, NULL as qrz_logid, NULL as qrz_pushed_at_utc, NULL as qrz_error
                  FROM demo_qso_log
                  ORDER BY completed_at_utc DESC
                  LIMIT ?1 OFFSET ?2"
@@ -855,7 +901,8 @@ impl StateStore {
         } else if band.is_some() {
             "SELECT qso_id, radio_id, started_at_utc, completed_at_utc, my_call, my_grid,
                     their_call, their_grid, mode, dial_freq_hz, band, af_hz,
-                    rst_sent, rst_rcvd, completion_reason, transcript_json
+                    rst_sent, rst_rcvd, completion_reason, transcript_json,
+                    qrz_status, qrz_logid, qrz_pushed_at_utc, qrz_error
              FROM qso_log
              WHERE band = ?1
              ORDER BY completed_at_utc DESC
@@ -863,7 +910,8 @@ impl StateStore {
         } else {
             "SELECT qso_id, radio_id, started_at_utc, completed_at_utc, my_call, my_grid,
                     their_call, their_grid, mode, dial_freq_hz, band, af_hz,
-                    rst_sent, rst_rcvd, completion_reason, transcript_json
+                    rst_sent, rst_rcvd, completion_reason, transcript_json,
+                    qrz_status, qrz_logid, qrz_pushed_at_utc, qrz_error
              FROM qso_log
              ORDER BY completed_at_utc DESC
              LIMIT ?1 OFFSET ?2"
@@ -889,7 +937,8 @@ impl StateStore {
         let mut stmt = conn.prepare(
             "SELECT qso_id, radio_id, started_at_utc, completed_at_utc, my_call, my_grid,
                     their_call, their_grid, mode, dial_freq_hz, band, af_hz,
-                    rst_sent, rst_rcvd, completion_reason, transcript_json
+                    rst_sent, rst_rcvd, completion_reason, transcript_json,
+                    qrz_status, qrz_logid, qrz_pushed_at_utc, qrz_error
              FROM qso_log
              ORDER BY completed_at_utc ASC",
         )?;
@@ -899,6 +948,137 @@ impl StateStore {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn get_qrz_api_key(&self) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT qrz_api_key FROM station_config WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+    }
+
+    pub fn set_qrz_api_key(&self, api_key: Option<&str>) -> Result<(), StoreError> {
+        let cleaned = api_key.map(str::trim).filter(|s| !s.is_empty());
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE station_config SET qrz_api_key = ?1, updated_at_utc = ?2 WHERE id = 1",
+            params![cleaned, now_utc_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Reads strictly from `qso_log` (never `demo_qso_log`).
+    pub fn list_unpushed_real_qsos(&self) -> Result<Vec<QsoRecord>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT qso_id, radio_id, started_at_utc, completed_at_utc, my_call, my_grid,
+                    their_call, their_grid, mode, dial_freq_hz, band, af_hz,
+                    rst_sent, rst_rcvd, completion_reason, transcript_json,
+                    qrz_status, qrz_logid, qrz_pushed_at_utc, qrz_error
+             FROM qso_log
+             WHERE qrz_status IN ('pending', 'failed')
+             ORDER BY completed_at_utc ASC",
+        )?;
+        let rows = stmt.query_map([], map_qso_record)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn count_qrz_qso_states(&self) -> Result<QrzQsoCounts, StoreError> {
+        let conn = self.lock()?;
+        let (pending, synced, failed): (i64, i64, i64) = conn.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN qrz_status = 'pending' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN qrz_status = 'synced' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN qrz_status = 'failed' THEN 1 ELSE 0 END), 0)
+             FROM qso_log",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(QrzQsoCounts {
+            pending,
+            synced,
+            failed,
+        })
+    }
+
+    pub fn mark_qso_qrz_synced(
+        &self,
+        qso_id: &str,
+        logid: Option<&str>,
+        pushed_at_utc: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE qso_log
+             SET qrz_status = 'synced',
+                 qrz_logid = COALESCE(?2, qrz_logid),
+                 qrz_pushed_at_utc = ?3,
+                 qrz_error = NULL
+             WHERE qso_id = ?1",
+            params![qso_id, logid, pushed_at_utc],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_qso_qrz_failed(&self, qso_id: &str, error: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE qso_log
+             SET qrz_status = 'failed',
+                 qrz_error = ?2
+             WHERE qso_id = ?1",
+            params![qso_id, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_qrz_push_result(
+        &self,
+        pushed_at_utc: &str,
+        summary: &QrzPushSummary,
+    ) -> Result<(), StoreError> {
+        let summary_json = serde_json::to_string(summary).unwrap_or_else(|_| "{}".to_string());
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE station_config
+             SET qrz_last_push_at_utc = ?1,
+                 qrz_last_push_summary_json = ?2
+             WHERE id = 1",
+            params![pushed_at_utc, summary_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_qrz_last_push(
+        &self,
+    ) -> Result<(Option<String>, Option<QrzPushSummary>), StoreError> {
+        let conn = self.lock()?;
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT qrz_last_push_at_utc, qrz_last_push_summary_json
+                 FROM station_config
+                 WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((ts, raw_json)) = row else {
+            return Ok((None, None));
+        };
+        let summary = raw_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<QrzPushSummary>(s).ok());
+        Ok((ts, summary))
     }
 
     pub fn enqueue_telemetry(&self, env: &TelemetryEnvelope) -> Result<(), StoreError> {
@@ -1374,6 +1554,10 @@ fn map_qso_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<QsoRecord> {
         rst_rcvd: row.get(13)?,
         completion_reason: row.get(14)?,
         transcript_json: row.get(15)?,
+        qrz_status: row.get(16)?,
+        qrz_logid: row.get(17)?,
+        qrz_pushed_at_utc: row.get(18)?,
+        qrz_error: row.get(19)?,
     })
 }
 
@@ -1452,6 +1636,10 @@ mod tests {
             rst_rcvd: Some("-05".to_string()),
             completion_reason: "73_sent".to_string(),
             transcript_json: "[]".to_string(),
+            qrz_status: None,
+            qrz_logid: None,
+            qrz_pushed_at_utc: None,
+            qrz_error: None,
         };
         store.insert_demo_qso(&demo).unwrap();
 
@@ -1656,5 +1844,129 @@ mod tests {
             .list_channel_roster(false, &ch_20m, t0 + 30_000 + CHANNEL_ROSTER_WINDOW_MS + 1)
             .unwrap();
         assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn qrz_sync_store_tracks_states_isolates_demo_and_redacts_station_config() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("digi-dx.db");
+        let store = StateStore::open(&db_path).unwrap();
+
+        // Key set & get without leaking through StationConfig JSON
+        assert_eq!(store.get_qrz_api_key().unwrap(), None);
+        store
+            .set_qrz_api_key(Some("  ABCD-1234-EFGH-5678  "))
+            .unwrap();
+        assert_eq!(
+            store.get_qrz_api_key().unwrap().as_deref(),
+            Some("ABCD-1234-EFGH-5678")
+        );
+        let station_json = serde_json::to_string(&store.get_station_config().unwrap()).unwrap();
+        assert!(!station_json.contains("ABCD-1234-EFGH-5678"));
+        assert!(!station_json.contains("qrz_api_key"));
+
+        // Re-opening runs migration 004 idempotently
+        let store2 = StateStore::open(&db_path).unwrap();
+        assert_eq!(
+            store2.get_qrz_api_key().unwrap().as_deref(),
+            Some("ABCD-1234-EFGH-5678")
+        );
+
+        let demo = QsoRecord {
+            qso_id: Uuid::now_v7().to_string(),
+            radio_id: None,
+            started_at_utc: "2026-11-21T22:00:00Z".to_string(),
+            completed_at_utc: "2026-11-21T22:01:30Z".to_string(),
+            my_call: "QQ0DEMO".to_string(),
+            my_grid: "FN33".to_string(),
+            their_call: "QQ1XYZ".to_string(),
+            their_grid: Some("PM95".to_string()),
+            mode: "FT8".to_string(),
+            dial_freq_hz: Some(14_074_000),
+            band: Some("20m".to_string()),
+            af_hz: Some(1400),
+            rst_sent: Some("-10".to_string()),
+            rst_rcvd: Some("-05".to_string()),
+            completion_reason: "73_sent".to_string(),
+            transcript_json: "[]".to_string(),
+            qrz_status: None,
+            qrz_logid: None,
+            qrz_pushed_at_utc: None,
+            qrz_error: None,
+        };
+        store2.insert_demo_qso(&demo).unwrap();
+
+        let real1 = QsoRecord {
+            qso_id: "qso-real-1".to_string(),
+            my_call: "N1MPM".to_string(),
+            their_call: "JA1ABC".to_string(),
+            completed_at_utc: "2026-11-21T22:02:00Z".to_string(),
+            ..demo.clone()
+        };
+        let real2 = QsoRecord {
+            qso_id: "qso-real-2".to_string(),
+            my_call: "N1MPM".to_string(),
+            their_call: "DL2XYZ".to_string(),
+            completed_at_utc: "2026-11-21T22:05:00Z".to_string(),
+            ..demo
+        };
+        store2.insert_qso(&real1).unwrap();
+        store2.insert_qso(&real2).unwrap();
+
+        let unpushed = store2.list_unpushed_real_qsos().unwrap();
+        assert_eq!(unpushed.len(), 2);
+        assert_eq!(unpushed[0].qso_id, "qso-real-1");
+        assert_eq!(unpushed[1].qso_id, "qso-real-2");
+        assert_eq!(unpushed[0].qrz_status.as_deref(), Some("pending"));
+
+        store2
+            .mark_qso_qrz_synced("qso-real-1", Some("987654"), "2026-11-21T22:06:00Z")
+            .unwrap();
+        store2
+            .mark_qso_qrz_failed("qso-real-2", "outside date range")
+            .unwrap();
+
+        let counts = store2.count_qrz_qso_states().unwrap();
+        assert_eq!(
+            counts,
+            QrzQsoCounts {
+                pending: 0,
+                synced: 1,
+                failed: 1,
+            }
+        );
+
+        let retry_list = store2.list_unpushed_real_qsos().unwrap();
+        assert_eq!(retry_list.len(), 1);
+        assert_eq!(retry_list[0].qso_id, "qso-real-2");
+        assert_eq!(retry_list[0].qrz_status.as_deref(), Some("failed"));
+        assert_eq!(
+            retry_list[0].qrz_error.as_deref(),
+            Some("outside date range")
+        );
+
+        let summary = QrzPushSummary {
+            total: 2,
+            pushed: 1,
+            duplicates: 0,
+            failed: 1,
+            skipped_demo: 0,
+            aborted_reason: None,
+            errors: vec![QrzPushErrorItem {
+                qso_id: "qso-real-2".to_string(),
+                their_call: "DL2XYZ".to_string(),
+                reason: "outside date range".to_string(),
+            }],
+            pushed_at_utc: "2026-11-21T22:06:05Z".to_string(),
+        };
+        store2
+            .record_qrz_push_result("2026-11-21T22:06:05Z", &summary)
+            .unwrap();
+        let (ts, loaded) = store2.get_qrz_last_push().unwrap();
+        assert_eq!(ts.as_deref(), Some("2026-11-21T22:06:05Z"));
+        assert_eq!(loaded, Some(summary));
+
+        store2.set_qrz_api_key(Some("   ")).unwrap();
+        assert_eq!(store2.get_qrz_api_key().unwrap(), None);
     }
 }

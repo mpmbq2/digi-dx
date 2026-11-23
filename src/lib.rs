@@ -6,6 +6,7 @@ pub mod config;
 pub mod domain;
 pub mod modem;
 pub mod preflight;
+pub mod qrz;
 pub mod qso;
 pub mod server;
 pub mod store;

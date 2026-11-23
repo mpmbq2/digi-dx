@@ -176,6 +176,7 @@ export function App() {
                 navigate({ view: "logbook" });
                 void daemon.refreshQsos(false);
                 void daemon.refreshQsos(true);
+                void daemon.refreshQrzStatus();
               }}
             >
               Logbook &amp; ADIF
@@ -274,7 +275,13 @@ export function App() {
           <LogbookPanel
             realQsos={daemon.realQsos}
             demoQsos={daemon.demoQsos}
+            qrzStatus={daemon.qrzStatus}
+            authRequired={daemon.authRequired}
+            authToken={daemon.authToken}
+            onAuthTokenChange={daemon.setAuthToken}
+            onSendCommand={daemon.sendCommand}
             onRefresh={daemon.refreshQsos}
+            onRefreshQrz={daemon.refreshQrzStatus}
           />
         )}
 

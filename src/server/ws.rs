@@ -143,6 +143,7 @@ fn build_snapshot(state: &AppState) -> String {
         .expect("preflight lock poisoned")
         .clone();
     let outbox_stats = state.store.outbox_stats(&state.sink_name).ok();
+    let qrz_status = state.qrz.status_snapshot().ok();
     let radios = build_radio_summaries(state).unwrap_or_default();
     let usb_devices = state.supervisor.list_usb_inventory().unwrap_or_default();
     let leases = state.bus.leases().snapshot();
@@ -157,6 +158,7 @@ fn build_snapshot(state: &AppState) -> String {
         "slot_clock": session.slot_clock.clone(),
         "preflight": preflight,
         "outbox_stats": outbox_stats,
+        "qrz_status": qrz_status,
         "radios": radios,
         "usb_devices": usb_devices,
         "leases": leases,

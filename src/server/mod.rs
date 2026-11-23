@@ -19,6 +19,7 @@ use crate::command_bus::leases::ControlLeaseManager;
 use crate::command_bus::{CommandBus, WsBroadcastEvent};
 use crate::config::DaemonConfig;
 use crate::preflight::{print_human_report, run_preflight, PreflightReport};
+use crate::qrz::{HttpQrzClient, QrzSyncService};
 use crate::qso::SessionManager;
 use crate::store::StateStore;
 use crate::supervisor::discovery::{DeviceScanner, OsDeviceScanner};
@@ -37,6 +38,7 @@ pub struct AppState {
     pub supervisor: Arc<DeviceSupervisor>,
     pub watchdog: Arc<PttWatchdog>,
     pub sessions: Arc<SessionManager>,
+    pub qrz: Arc<QrzSyncService>,
     pub hamlib_models: Arc<Vec<HamlibModelEntry>>,
     pub preflight: Arc<RwLock<PreflightReport>>,
     pub ws_tx: broadcast::Sender<WsBroadcastEvent>,
@@ -106,12 +108,20 @@ impl AppState {
             config.jt9_path.as_deref(),
             Some(jt9_data_dir.as_path()),
         );
+        let qrz = Arc::new(QrzSyncService::new_for_test(
+            store.clone(),
+            Arc::new(HttpQrzClient::new(config.qrz_api_url.clone())),
+            config.qrz_api_key.clone(),
+            ws_tx.clone(),
+            CancellationToken::new(),
+        ));
         let bus = Arc::new(CommandBus::new(
             store.clone(),
             leases,
             Arc::clone(&supervisor),
             Arc::clone(&watchdog),
             Arc::clone(&sessions),
+            Arc::clone(&qrz),
             config.auth_token.clone(),
             ws_tx.clone(),
         ));
@@ -122,6 +132,7 @@ impl AppState {
             supervisor,
             watchdog,
             sessions,
+            qrz,
             hamlib_models: Arc::new(vec![HamlibModelEntry {
                 id: 1,
                 manufacturer: "Hamlib".into(),
@@ -161,6 +172,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/commands", post(routes::dispatch_command))
         .route("/api/v1/qsos", get(routes::qsos))
         .route("/api/v1/qsos/export.adi", get(routes::qsos_export_adi))
+        .route("/api/v1/qrz/status", get(routes::qrz_status))
         .route("/api/v1/roster", get(routes::roster))
         .route("/api/v1/outbox/stats", get(routes::outbox_stats))
         .route("/api/v1/ws", get(ws::ws_handler))
@@ -266,6 +278,13 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
         config.jt9_path.as_deref(),
         Some(jt9_data_dir.as_path()),
     );
+    let qrz = Arc::new(QrzSyncService::new(
+        store.clone(),
+        Arc::new(HttpQrzClient::new(config.qrz_api_url.clone())),
+        config.qrz_api_key.clone(),
+        ws_tx.clone(),
+        shutdown.clone(),
+    ));
 
     let bus = Arc::new(CommandBus::new(
         store.clone(),
@@ -273,6 +292,7 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
         Arc::clone(&supervisor),
         Arc::clone(&watchdog),
         Arc::clone(&sessions),
+        Arc::clone(&qrz),
         config.auth_token.clone(),
         ws_tx.clone(),
     ));
@@ -284,6 +304,7 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
         supervisor: Arc::clone(&supervisor),
         watchdog: Arc::clone(&watchdog),
         sessions: Arc::clone(&sessions),
+        qrz,
         hamlib_models,
         preflight: Arc::new(RwLock::new(preflight_report)),
         ws_tx,

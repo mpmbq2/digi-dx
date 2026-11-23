@@ -12,6 +12,7 @@ import type {
   HealthResponse,
   OutboxStats,
   PreflightReport,
+  QrzStatusSnapshot,
   QsoLogItem,
   RadioLiveSettings,
   RadioSummary,
@@ -55,6 +56,7 @@ export interface DaemonState {
   authRequired: boolean;
   slotClock: SlotClockSpec | null;
   outboxStats: OutboxStats | null;
+  qrzStatus: QrzStatusSnapshot | null;
   audioDevices: AudioDeviceSummary[];
   usbDevices: UsbInventoryEntry[];
   hamlibModels: HamlibModel[];
@@ -75,6 +77,7 @@ export interface DaemonState {
   clearAlert: () => void;
   refreshAll: (refreshPreflight?: boolean) => Promise<void>;
   refreshQsos: (demo: boolean, band?: string) => Promise<void>;
+  refreshQrzStatus: () => Promise<void>;
   refreshRoster: (
     freqHz: number | null,
     isDemo: boolean,
@@ -109,6 +112,7 @@ export function useDaemonSocket(): DaemonState {
   const [authRequired, setAuthRequired] = useState<boolean>(false);
   const [slotClock, setSlotClock] = useState<SlotClockSpec | null>(null);
   const [outboxStats, setOutboxStats] = useState<OutboxStats | null>(null);
+  const [qrzStatus, setQrzStatus] = useState<QrzStatusSnapshot | null>(null);
   const [audioDevices, setAudioDevices] = useState<AudioDeviceSummary[]>([]);
   const [usbDevices, setUsbDevices] = useState<UsbInventoryEntry[]>([]);
   const [hamlibModels, setHamlibModels] = useState<HamlibModel[]>([]);
@@ -225,6 +229,16 @@ export function useDaemonSocket(): DaemonState {
     []
   );
 
+  const refreshQrzStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/v1/qrz/status");
+      if (!res.ok) return;
+      setQrzStatus((await res.json()) as QrzStatusSnapshot);
+    } catch {
+      // Ignore transient poll errors
+    }
+  }, []);
+
   const refreshLiveState = useCallback(async () => {
     try {
       const [hRes, oRes, rRes] = await Promise.all([
@@ -249,11 +263,12 @@ export function useDaemonSocket(): DaemonState {
         const preflightUrl = refreshPreflight
           ? "/api/v1/preflight?refresh=true"
           : "/api/v1/preflight";
-        const [hRes, pRes, sRes, oRes, aRes, uRes, rRes] = await Promise.all([
+        const [hRes, pRes, sRes, oRes, qrzRes, aRes, uRes, rRes] = await Promise.all([
           fetch("/api/v1/health"),
           fetch(preflightUrl),
           fetch("/api/v1/station"),
           fetch("/api/v1/outbox/stats"),
+          fetch("/api/v1/qrz/status"),
           fetch("/api/v1/devices/audio"),
           fetch("/api/v1/devices/usb"),
           fetch("/api/v1/radios"),
@@ -269,6 +284,7 @@ export function useDaemonSocket(): DaemonState {
           }
         }
         if (oRes.ok) setOutboxStats((await oRes.json()) as OutboxStats);
+        if (qrzRes.ok) setQrzStatus((await qrzRes.json()) as QrzStatusSnapshot);
         if (aRes.ok) {
           const data = (await aRes.json()) as { devices: AudioDeviceSummary[] };
           setAudioDevices(data.devices ?? []);
@@ -353,6 +369,7 @@ export function useDaemonSocket(): DaemonState {
               setStation(snap.station);
             }
             if (snap.outbox_stats) setOutboxStats(snap.outbox_stats);
+            if (snap.qrz_status) setQrzStatus(snap.qrz_status);
             if (Array.isArray(snap.radios)) setRadios(snap.radios);
             if (Array.isArray(snap.usb_devices)) setUsbDevices(snap.usb_devices);
             if (snap.session) setSession(snap.session);
@@ -508,6 +525,24 @@ export function useDaemonSocket(): DaemonState {
                 `Logged ${isDemo ? "DEMO " : ""}QSO with ${completed.their_call} (${completed.completion_reason})`
               );
               void refreshQsos(isDemo);
+              if (!isDemo) {
+                void refreshQrzStatus();
+              }
+            }
+          } else if (evType === "qrz_sync_update") {
+            const next = parsed.status as QrzStatusSnapshot | undefined;
+            if (next) {
+              setQrzStatus(next);
+              if (!next.in_progress) {
+                void refreshQsos(false);
+                const s = next.last_push_summary;
+                if (s) {
+                  pushEvent(
+                    "qrz_sync",
+                    `QRZ sync: ${s.pushed} pushed, ${s.duplicates} already on QRZ, ${s.failed} failed`
+                  );
+                }
+              }
             }
           } else if (evType === "watchdog_abort") {
             pushEvent(
@@ -709,7 +744,7 @@ export function useDaemonSocket(): DaemonState {
       leaseTimersRef.current = {};
       wsRef.current?.close();
     };
-  }, [clearLeaseTimer, pushEvent, refreshAll, refreshLiveState, refreshQsos]);
+  }, [clearLeaseTimer, pushEvent, refreshAll, refreshLiveState, refreshQrzStatus, refreshQsos]);
 
   const sendCommand = useCallback(
     async (
@@ -847,6 +882,7 @@ export function useDaemonSocket(): DaemonState {
     authRequired,
     slotClock,
     outboxStats,
+    qrzStatus,
     audioDevices,
     usbDevices,
     hamlibModels,
@@ -867,6 +903,7 @@ export function useDaemonSocket(): DaemonState {
     clearAlert,
     refreshAll,
     refreshQsos,
+    refreshQrzStatus,
     refreshRoster,
     sendCommand,
     claimLease,

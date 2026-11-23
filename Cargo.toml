@@ -30,6 +30,8 @@ subtle = "2"
 tokio-util = "0.7"
 futures-util = "0.3"
 notify = "8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2"] }
+form_urlencoded = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
