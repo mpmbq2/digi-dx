@@ -299,6 +299,48 @@ export interface QsoLogItem {
   rst_sent: string | null;
   rst_rcvd: string | null;
   completion_reason: string;
+  qrz_status?: "pending" | "synced" | "failed" | null;
+  qrz_logid?: string | null;
+  qrz_pushed_at_utc?: string | null;
+  qrz_error?: string | null;
+}
+
+export interface QrzPushErrorItem {
+  qso_id: string;
+  their_call: string;
+  reason: string;
+}
+
+export interface QrzPushSummary {
+  total: number;
+  pushed: number;
+  duplicates: number;
+  failed: number;
+  skipped_demo: number;
+  aborted_reason: string | null;
+  errors: QrzPushErrorItem[];
+  pushed_at_utc: string;
+}
+
+export interface QrzPushProgress {
+  completed: number;
+  total: number;
+  pushed: number;
+  duplicates: number;
+  failed: number;
+}
+
+export interface QrzStatusSnapshot {
+  configured: boolean;
+  key_source: "env" | "database" | "none";
+  key_hint: string | null;
+  pending_count: number;
+  failed_count: number;
+  synced_count: number;
+  in_progress: boolean;
+  progress: QrzPushProgress | null;
+  last_push_at_utc: string | null;
+  last_push_summary: QrzPushSummary | null;
 }
 
 export interface CommandEnvelope {
@@ -331,6 +373,7 @@ export interface SnapshotEvent {
   slot_clock: SlotClockSpec;
   preflight: PreflightReport;
   outbox_stats: OutboxStats | null;
+  qrz_status?: QrzStatusSnapshot | null;
   radios: RadioSummary[];
   usb_devices: UsbInventoryEntry[];
   leases: ControlLease[];

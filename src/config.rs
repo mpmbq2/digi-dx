@@ -19,6 +19,8 @@ pub struct DaemonConfig {
     pub gcp_credentials_path: Option<PathBuf>,
     pub outbox_max_rows: usize,
     pub outbox_retention_days: i64,
+    pub qrz_api_key: Option<String>,
+    pub qrz_api_url: String,
 }
 
 impl DaemonConfig {
@@ -59,6 +61,9 @@ impl DaemonConfig {
                 .and_then(|v| v.parse::<i64>().ok())
                 .filter(|&v| v > 0)
                 .unwrap_or(14),
+            qrz_api_key: env_nonempty("DIGI_DX_QRZ_API_KEY"),
+            qrz_api_url: env_nonempty("DIGI_DX_QRZ_API_URL")
+                .unwrap_or_else(|| "https://logbook.qrz.com/api".to_string()),
         }
     }
 

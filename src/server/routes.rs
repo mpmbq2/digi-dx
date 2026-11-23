@@ -257,9 +257,14 @@ pub async fn dispatch_command(
         CommandStatus::Ok => StatusCode::OK,
         CommandStatus::Rejected | CommandStatus::Failed => match ack.error_code {
             Some(ErrorCode::AuthFailed) => StatusCode::UNAUTHORIZED,
-            Some(ErrorCode::ValidationFailed) => StatusCode::BAD_REQUEST,
-            Some(ErrorCode::LeaseRequired | ErrorCode::LeaseHeld) => StatusCode::CONFLICT,
+            Some(ErrorCode::ValidationFailed | ErrorCode::QrzNotConfigured) => {
+                StatusCode::BAD_REQUEST
+            }
+            Some(
+                ErrorCode::LeaseRequired | ErrorCode::LeaseHeld | ErrorCode::QrzSyncInProgress,
+            ) => StatusCode::CONFLICT,
             Some(ErrorCode::RadioNotFound) => StatusCode::NOT_FOUND,
+            Some(ErrorCode::QrzRequestFailed) => StatusCode::BAD_GATEWAY,
             Some(ErrorCode::InternalError) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         },
@@ -333,6 +338,17 @@ pub async fn qsos_export_adi(State(state): State<Arc<AppState>>) -> impl IntoRes
             )
                 .into_response()
         }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "INTERNAL_ERROR", "message": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn qrz_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.qrz.status_snapshot() {
+        Ok(status) => (StatusCode::OK, Json(json!(status))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "INTERNAL_ERROR", "message": e.to_string() })),

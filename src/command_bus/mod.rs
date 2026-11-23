@@ -14,6 +14,7 @@ use crate::domain::adif::QsoRecord;
 use crate::domain::clock::{SlotClockSpec, SlotParity};
 use crate::domain::ft8::{validate_station_callsign, validate_station_grid, validate_tx_message};
 use crate::modem::TxIntent;
+use crate::qrz::{QrzClientError, QrzPushError, QrzStatusSnapshot, QrzSyncService};
 use crate::qso::sequencer::{ActiveQso, QsoAction};
 use crate::qso::SessionManager;
 use crate::store::{
@@ -83,6 +84,10 @@ pub enum ErrorCode {
     PortUnavailable,
     DecoderFailed,
     PttWatchdogAbort,
+    QrzNotConfigured,
+    QrzAuthFailed,
+    QrzSyncInProgress,
+    QrzRequestFailed,
     InternalError,
 }
 
@@ -264,6 +269,9 @@ pub enum WsBroadcastEvent {
         active_qsos: Vec<ActiveQso>,
         completed_qso: Option<Box<QsoRecord>>,
     },
+    QrzSyncUpdate {
+        status: Box<QrzStatusSnapshot>,
+    },
 }
 
 pub struct CommandBus {
@@ -272,6 +280,7 @@ pub struct CommandBus {
     supervisor: Arc<DeviceSupervisor>,
     watchdog: Arc<PttWatchdog>,
     sessions: Arc<SessionManager>,
+    qrz: Arc<QrzSyncService>,
     auth_token: Option<String>,
     ws_tx: broadcast::Sender<WsBroadcastEvent>,
 }
@@ -284,6 +293,7 @@ impl CommandBus {
         supervisor: Arc<DeviceSupervisor>,
         watchdog: Arc<PttWatchdog>,
         sessions: Arc<SessionManager>,
+        qrz: Arc<QrzSyncService>,
         auth_token: Option<String>,
         ws_tx: broadcast::Sender<WsBroadcastEvent>,
     ) -> Self {
@@ -293,6 +303,7 @@ impl CommandBus {
             supervisor,
             watchdog,
             sessions,
+            qrz,
             auth_token,
             ws_tx,
         }
@@ -471,6 +482,9 @@ impl CommandBus {
             "qso.survey_af" => self.exec_qso_survey_af(envelope).await,
             "qso.set_af" => self.exec_qso_set_af(envelope).await,
             "qso.set_tx_enabled" => self.exec_qso_set_tx_enabled(envelope).await,
+            "qrz.update_config" => self.exec_qrz_update_config(envelope).await,
+            "qrz.test_connection" => self.exec_qrz_test_connection(envelope).await,
+            "qrz.push" => self.exec_qrz_push(envelope).await,
             other => CommandAck::err(
                 envelope.command_id.clone(),
                 CommandStatus::Rejected,
@@ -532,6 +546,106 @@ impl CommandBus {
                 )
             }
             Err(e) => CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Failed,
+                ErrorCode::InternalError,
+                e.to_string(),
+            ),
+        }
+    }
+
+    async fn exec_qrz_update_config(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let api_key = match envelope.payload.get("api_key") {
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(Value::Null) | None => None,
+            _ => {
+                return CommandAck::err(
+                    envelope.command_id.clone(),
+                    CommandStatus::Rejected,
+                    ErrorCode::ValidationFailed,
+                    "api_key must be a string or null",
+                );
+            }
+        };
+
+        match self.qrz.update_api_key(api_key) {
+            Ok(status) => CommandAck::ok(
+                envelope.command_id.clone(),
+                serde_json::to_value(status).unwrap_or(Value::Null),
+            ),
+            Err(e) => CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Failed,
+                ErrorCode::InternalError,
+                e.to_string(),
+            ),
+        }
+    }
+
+    async fn exec_qrz_test_connection(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let override_key = envelope.payload.get("api_key").and_then(Value::as_str);
+
+        match self.qrz.test_connection(override_key).await {
+            Ok(account) => CommandAck::ok(
+                envelope.command_id.clone(),
+                serde_json::to_value(account).unwrap_or(Value::Null),
+            ),
+            Err(QrzClientError::Auth(msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Failed,
+                ErrorCode::QrzAuthFailed,
+                msg,
+            ),
+            Err(
+                QrzClientError::Rejected(msg)
+                | QrzClientError::Transport(msg)
+                | QrzClientError::InvalidResponse(msg),
+            ) => CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Failed,
+                ErrorCode::QrzRequestFailed,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_qrz_push(&self, envelope: &CommandEnvelope) -> CommandAck {
+        match self.qrz.push_pending().await {
+            Ok(summary) => CommandAck::ok(
+                envelope.command_id.clone(),
+                serde_json::to_value(summary).unwrap_or(Value::Null),
+            ),
+            Err(QrzPushError::NotConfigured) => CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::QrzNotConfigured,
+                "QRZ API key is not configured",
+            ),
+            Err(QrzPushError::AlreadyInProgress) => CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::QrzSyncInProgress,
+                "A QRZ logbook push is already in progress",
+            ),
+            Err(QrzPushError::AuthFailed { reason, summary }) => CommandAck {
+                msg_type: "command_ack".to_string(),
+                command_id: envelope.command_id.clone(),
+                status: CommandStatus::Failed,
+                error_code: Some(ErrorCode::QrzAuthFailed),
+                error_message: Some(reason),
+                result: Some(serde_json::to_value(summary).unwrap_or(Value::Null)),
+                completed_at_utc: now_utc_str(),
+            },
+            Err(QrzPushError::TransportFailed { reason, summary }) => CommandAck {
+                msg_type: "command_ack".to_string(),
+                command_id: envelope.command_id.clone(),
+                status: CommandStatus::Failed,
+                error_code: Some(ErrorCode::QrzRequestFailed),
+                error_message: Some(reason),
+                result: Some(serde_json::to_value(summary).unwrap_or(Value::Null)),
+                completed_at_utc: now_utc_str(),
+            },
+            Err(QrzPushError::Store(e)) => CommandAck::err(
                 envelope.command_id.clone(),
                 CommandStatus::Failed,
                 ErrorCode::InternalError,
@@ -1954,6 +2068,38 @@ fn validate_command(envelope: &CommandEnvelope) -> Result<(), (ErrorCode, String
             }
             Ok(())
         }
+        "qrz.update_config" | "qrz.test_connection" => {
+            if let Some(val) = envelope.payload.get("api_key") {
+                match val {
+                    Value::Null => {}
+                    Value::String(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.len() > 128 || s.chars().any(|c| c.is_control()) {
+                            return Err((
+                                ErrorCode::ValidationFailed,
+                                "api_key must be at most 128 printable characters".to_string(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err((
+                            ErrorCode::ValidationFailed,
+                            "api_key must be a string or null".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "qrz.push" => {
+            if !envelope.payload.is_object() && !envelope.payload.is_null() {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "qrz.push payload must be an object".to_string(),
+                ));
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1964,7 +2110,9 @@ fn status_for_error(code: ErrorCode) -> CommandStatus {
         | ErrorCode::AuthFailed
         | ErrorCode::LeaseRequired
         | ErrorCode::LeaseHeld
-        | ErrorCode::RadioNotFound => CommandStatus::Rejected,
+        | ErrorCode::RadioNotFound
+        | ErrorCode::QrzNotConfigured
+        | ErrorCode::QrzSyncInProgress => CommandStatus::Rejected,
         _ => CommandStatus::Failed,
     }
 }
