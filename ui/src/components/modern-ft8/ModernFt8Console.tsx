@@ -58,6 +58,8 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
   );
   const [rxHz, setRxHz] = useState<number>(1500);
   const [pendingDialFreqHz, setPendingDialFreqHz] = useState<number | null>(null);
+  const [atuTuning, setAtuTuning] = useState<boolean>(false);
+  const atuTimerRef = useRef<number | null>(null);
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(
     null
   );
@@ -141,6 +143,10 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
 
   useEffect(() => {
     return () => {
+      if (atuTimerRef.current !== null) {
+        window.clearTimeout(atuTimerRef.current);
+        atuTimerRef.current = null;
+      }
       if (isTuningRef.current && ridRef.current) {
         void sendCmdRef.current("tx.tune", { enabled: false }, undefined, ridRef.current);
       }
@@ -245,6 +251,31 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
       enabled: next,
       af_hz: activeSession?.tx_af_hz ?? 1500,
     });
+  };
+
+  const handleAtuTune = async () => {
+    if (atuTimerRef.current !== null) {
+      window.clearTimeout(atuTimerRef.current);
+      atuTimerRef.current = null;
+    }
+    setAtuTuning(true);
+    const ok = await runRadioCmd("radio.atu_tune", {}, "Internal ATU tune triggered");
+    if (!ok) {
+      setAtuTuning(false);
+      return;
+    }
+    atuTimerRef.current = window.setTimeout(() => {
+      atuTimerRef.current = null;
+      setAtuTuning(false);
+    }, 1800);
+  };
+
+  const handleToggleAtuBypass = async (enabled: boolean) => {
+    await runRadioCmd(
+      "radio.set_func",
+      { name: "TUNER", enabled },
+      enabled ? "Internal ATU enabled" : "Internal ATU set to bypass"
+    );
   };
 
   const handleHaltTx = async () => {
@@ -582,6 +613,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                   pendingDialFreqHz={pendingDialFreqHz}
                   txState={effectiveTxState}
                   isTuning={isTuning}
+                  isAtuTuning={atuTuning}
                   feedOnLeft={feedOnLeft}
                   onToggleFlipFeed={toggleFlipFeed}
                   onSelectBand={(b) => void handleSelectBand(b)}
@@ -594,6 +626,8 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                   }
                   onHaltTx={() => void handleHaltTx()}
                   onToggleTune={() => void handleToggleTune()}
+                  onAtuTune={() => void handleAtuTune()}
+                  onToggleAtuBypass={(enabled) => void handleToggleAtuBypass(enabled)}
                   onStartLive={() =>
                     void runRadioCmd(
                       "session.start",

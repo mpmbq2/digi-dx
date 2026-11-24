@@ -136,6 +136,7 @@ export interface RigCapabilities {
   set_levels: string[];
   get_funcs: string[];
   set_funcs: string[];
+  vfo_ops?: string[];
   max_rit_hz: number | null;
   max_xit_hz: number | null;
   has_split: boolean;

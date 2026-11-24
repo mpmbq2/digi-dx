@@ -295,11 +295,66 @@ async function main() {
       `Expected strictly 1 CAT level write after release, got ${setLevelRequests.length}`
     );
 
-    // 5. Momentary TUNE toggle ON -> OFF
+    // 5. Internal ATU controls (status ON/BYPASS + trigger) and Momentary TUNE toggle ON -> OFF
+    await page.waitForSelector('[data-testid="mft8-atu-group"]', { timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('[data-testid="mft8-atu-status"]');
+        return el && el.textContent && el.textContent.includes("BYPASS");
+      },
+      { timeout: 10000 }
+    );
+    await page.click('[data-testid="mft8-atu-status"]');
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('[data-testid="mft8-atu-status"]');
+        return el && el.textContent && el.textContent.includes("ON");
+      },
+      { timeout: 10000 }
+    );
+    await page.click('[data-testid="mft8-atu-status"]');
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('[data-testid="mft8-atu-status"]');
+        return el && el.textContent && el.textContent.includes("BYPASS");
+      },
+      { timeout: 10000 }
+    );
+    await page.click('[data-testid="mft8-atu-tune-btn"]');
+    await page.waitForFunction(
+      () => {
+        const alertStrip = document.querySelector(".mft8-alert-strip");
+        return (
+          alertStrip &&
+          !alertStrip.classList.contains("err") &&
+          alertStrip.textContent &&
+          alertStrip.textContent.includes("Internal ATU tune triggered")
+        );
+      },
+      { timeout: 10000 }
+    );
+    await page.waitForFunction(
+      () => {
+        const btn = document.querySelector('[data-testid="mft8-atu-tune-btn"]');
+        return btn && !btn.disabled;
+      },
+      { timeout: 10000 }
+    );
+
     await page.click('[data-testid="mft8-tune-btn"]');
     await page.waitForFunction(() => {
       const btn = document.querySelector('[data-testid="mft8-tune-btn"]');
-      return btn && btn.textContent && btn.textContent.includes("TUNING");
+      const atuBtn = document.querySelector('[data-testid="mft8-atu-tune-btn"]');
+      const atuStatus = document.querySelector('[data-testid="mft8-atu-status"]');
+      return (
+        btn &&
+        btn.textContent &&
+        btn.textContent.includes("TUNING") &&
+        atuBtn &&
+        atuBtn.disabled &&
+        atuStatus &&
+        atuStatus.disabled
+      );
     });
     await page.click('[data-testid="mft8-tune-btn"]');
     await page.waitForFunction(() => {

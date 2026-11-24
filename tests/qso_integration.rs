@@ -582,6 +582,153 @@ async fn session_set_mode_and_tx_tune_work_on_dummy_rig() {
     assert_eq!(tune_off.result.as_ref().unwrap()["tuning"], false);
     assert!(!state.supervisor.get_radio_snapshot(&rad_id).unwrap().ptt);
 
+    // 1b. Internal ATU trigger (radio.atu_tune) & TUNER bypass toggle + TX guards
+    let atu_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "radio.atu_tune".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({}),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(atu_ack.status, CommandStatus::Ok, "{atu_ack:?}");
+    assert_eq!(atu_ack.result.as_ref().unwrap()["method"], "vfo_op_tune");
+
+    let tuner_on = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "radio.set_func".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "name": "TUNER", "enabled": true }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(tuner_on.status, CommandStatus::Ok, "{tuner_on:?}");
+    assert_eq!(tuner_on.result.as_ref().unwrap()["enabled"], true);
+
+    let tuner_off = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "radio.set_func".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "name": "TUNER", "enabled": false }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(tuner_off.status, CommandStatus::Ok, "{tuner_off:?}");
+    assert_eq!(tuner_off.result.as_ref().unwrap()["enabled"], false);
+
+    // Reject ATU tune & TUNER switching while transmitting (PTT / tx.tune active)
+    let tune_guard_on = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "tx.tune".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "enabled": true, "af_hz": 1450 }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(tune_guard_on.status, CommandStatus::Ok, "{tune_guard_on:?}");
+
+    let atu_during_tx = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "radio.atu_tune".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({}),
+            },
+            None,
+        )
+        .await;
+    assert_ne!(atu_during_tx.status, CommandStatus::Ok, "{atu_during_tx:?}");
+    assert_eq!(
+        atu_during_tx.error_code,
+        Some(digi_dx::command_bus::ErrorCode::CatCommandFailed)
+    );
+
+    let tuner_during_tx = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "radio.set_func".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "name": "TUNER", "enabled": true }),
+            },
+            None,
+        )
+        .await;
+    assert_ne!(
+        tuner_during_tx.status,
+        CommandStatus::Ok,
+        "{tuner_during_tx:?}"
+    );
+    assert_eq!(
+        tuner_during_tx.error_code,
+        Some(digi_dx::command_bus::ErrorCode::CatCommandFailed)
+    );
+
+    let tune_guard_off = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "tx.tune".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "enabled": false }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(
+        tune_guard_off.status,
+        CommandStatus::Ok,
+        "{tune_guard_off:?}"
+    );
+
     // 2. Start demo session in FT8, switch to FT4 (7500ms slot), then back to FT8 (15000ms slot)
     let start_ack = state
         .bus

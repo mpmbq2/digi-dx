@@ -477,6 +477,7 @@ impl CommandBus {
             "radio.set_xit" => self.exec_radio_set_xit(envelope).await,
             "radio.set_level" => self.exec_radio_set_level(envelope).await,
             "radio.set_func" => self.exec_radio_set_func(envelope).await,
+            "radio.atu_tune" => self.exec_radio_atu_tune(envelope).await,
             "radio.refresh_settings" => self.exec_radio_refresh_settings(envelope).await,
             "control.claim_lease" => self.exec_claim_lease(envelope),
             "control.release_lease" => self.exec_release_lease(envelope).await,
@@ -1087,7 +1088,53 @@ impl CommandBus {
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if name.eq_ignore_ascii_case("TUNER") {
+            let sess = self.sessions.snapshot();
+            if sess.active
+                && sess.radio_id.as_deref() == Some(radio_id.as_str())
+                && sess.tx_state == "transmitting"
+            {
+                return CommandAck::err(
+                    envelope.command_id.clone(),
+                    CommandStatus::Rejected,
+                    ErrorCode::CatCommandFailed,
+                    "Cannot change ATU bypass state while transmitting — halt TX first",
+                );
+            }
+        }
         match self.supervisor.set_func(&radio_id, name, enabled).await {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_atu_tune(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let sess = self.sessions.snapshot();
+        if sess.active
+            && sess.radio_id.as_deref() == Some(radio_id.as_str())
+            && sess.tx_state == "transmitting"
+        {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::CatCommandFailed,
+                "Cannot start ATU tune while transmitting — halt TX first",
+            );
+        }
+        match self.supervisor.atu_tune(&radio_id).await {
             Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
             Err((code, msg)) => CommandAck::err(
                 envelope.command_id.clone(),
@@ -1819,6 +1866,7 @@ fn requires_lease(kind: &str) -> bool {
             | "radio.set_xit"
             | "radio.set_level"
             | "radio.set_func"
+            | "radio.atu_tune"
             | "control.release_lease"
             | "control.heartbeat"
             | "session.start"

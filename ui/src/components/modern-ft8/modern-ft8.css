@@ -344,6 +344,109 @@
   animation: mft8TunePulse 1.2s infinite;
 }
 
+.modern-ft8-root .mft8-atu-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--mft8-bg-inset);
+  border: 1px solid var(--mft8-border-strong);
+}
+
+.modern-ft8-root .mft8-atu-tune-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: #182336;
+  color: #7dd3fc;
+  font-family: var(--mft8-font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.modern-ft8-root .mft8-atu-tune-btn:hover:not(:disabled) {
+  background: #22314a;
+  border-color: rgba(56, 189, 248, 0.55);
+  color: #e0f2fe;
+}
+.modern-ft8-root .mft8-atu-tune-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.modern-ft8-root .mft8-atu-tune-btn.tuning {
+  background: rgba(245, 158, 11, 0.26);
+  border-color: #f59e0b;
+  color: #fef3c7;
+  animation: mft8TunePulse 1.2s infinite;
+}
+
+.modern-ft8-root .mft8-atu-status-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  font-family: var(--mft8-font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.modern-ft8-root .mft8-atu-status-btn.on {
+  background: rgba(16, 185, 129, 0.16);
+  border-color: rgba(52, 211, 153, 0.48);
+  color: #6ee7b7;
+}
+.modern-ft8-root .mft8-atu-status-btn.on:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.26);
+  border-color: #34d399;
+}
+.modern-ft8-root .mft8-atu-status-btn.bypass {
+  background: rgba(100, 116, 139, 0.14);
+  border-color: rgba(100, 116, 139, 0.35);
+  color: #94a3b8;
+}
+.modern-ft8-root .mft8-atu-status-btn.bypass:hover:not(:disabled) {
+  background: rgba(100, 116, 139, 0.24);
+  border-color: #64748b;
+  color: #cbd5e1;
+}
+.modern-ft8-root .mft8-atu-status-btn.unknown {
+  color: var(--mft8-text-muted);
+}
+.modern-ft8-root .mft8-atu-status-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.modern-ft8-root .mft8-atu-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #475569;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.modern-ft8-root .mft8-atu-dot.on {
+  background: #34d399;
+  box-shadow: 0 0 6px #34d399;
+}
+.modern-ft8-root .mft8-atu-dot.bypass {
+  background: #64748b;
+}
+
 .modern-ft8-root .mft8-btn-xs {
   padding: 2px 6px;
   font-size: 10px;

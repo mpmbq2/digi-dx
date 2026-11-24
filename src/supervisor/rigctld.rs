@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::store::RadioProfile;
 
 const DEFAULT_CAT_TIMEOUT: Duration = Duration::from_millis(2_000);
+const ATU_TUNE_TIMEOUT: Duration = Duration::from_secs(15);
 const EMERGENCY_PTT_TIMEOUT: Duration = Duration::from_millis(300);
 const STARTUP_TIMEOUT: Duration = Duration::from_millis(5_000);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_millis(5_000);
@@ -67,6 +68,8 @@ pub const CURATED_FUNCS: &[&str] = &[
     "TUNER", "NB", "NR", "COMP", "VOX", "LOCK", "ANF", "MON", "RIT", "XIT",
 ];
 
+pub const CURATED_VFO_OPS: &[&str] = &["TUNE"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgcLevelOption {
     pub value: i32,
@@ -85,6 +88,8 @@ pub struct RigCapabilities {
     pub set_levels: Vec<String>,
     pub get_funcs: Vec<String>,
     pub set_funcs: Vec<String>,
+    #[serde(default)]
+    pub vfo_ops: Vec<String>,
     pub max_rit_hz: Option<i32>,
     pub max_xit_hz: Option<i32>,
     pub has_split: bool,
@@ -409,6 +414,19 @@ impl RigctldClient {
         let upper = name.trim().to_ascii_uppercase();
         let flag = if enabled { 1 } else { 0 };
         self.send_extended(&format!("+U {upper} {flag}"), DEFAULT_CAT_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    /// Executes a Hamlib VFO operation (`+G <OP>`, e.g. `+G TUNE` to trigger internal ATU).
+    pub async fn vfo_op(&mut self, op: &str) -> Result<(), RigctldError> {
+        let upper = op.trim().to_ascii_uppercase();
+        let op_timeout = if upper == "TUNE" {
+            ATU_TUNE_TIMEOUT
+        } else {
+            DEFAULT_CAT_TIMEOUT
+        };
+        self.send_extended(&format!("+G {upper}"), op_timeout)
             .await?;
         Ok(())
     }
@@ -890,6 +908,7 @@ pub fn parse_rigctl_caps(model_id: i64, stdout: &str) -> RigCapabilities {
     let mut set_levels = Vec::new();
     let mut get_funcs = Vec::new();
     let mut set_funcs = Vec::new();
+    let mut vfo_ops = Vec::new();
     let mut max_rit_hz = None;
     let mut max_xit_hz = None;
     let mut targetable_vfo = false;
@@ -935,6 +954,8 @@ pub fn parse_rigctl_caps(model_id: i64, stdout: &str) -> RigCapabilities {
             get_funcs = parse_curated_token_list(rest, CURATED_FUNCS);
         } else if let Some(rest) = trimmed.strip_prefix("Set functions:") {
             set_funcs = parse_curated_token_list(rest, CURATED_FUNCS);
+        } else if let Some(rest) = trimmed.strip_prefix("VFO Ops:") {
+            vfo_ops = parse_curated_token_list(rest, CURATED_VFO_OPS);
         } else if let Some(rest) = trimmed.strip_prefix("Max RIT:") {
             max_rit_hz = parse_max_rit_xit_hz(rest);
         } else if let Some(rest) = trimmed.strip_prefix("Max XIT:") {
@@ -956,6 +977,7 @@ pub fn parse_rigctl_caps(model_id: i64, stdout: &str) -> RigCapabilities {
         set_levels,
         get_funcs,
         set_funcs,
+        vfo_ops,
         max_rit_hz,
         max_xit_hz,
         has_split,
@@ -1281,6 +1303,7 @@ Attenuator: 18dB
 AGC levels: 2=FAST 3=SLOW
 Get functions: FAGC NB COMP VOX TONE TSQL NR LOCK BC TUNER 
 Set functions: FAGC NB COMP VOX TONE TSQL NR LOCK BC TUNER 
+VFO Ops: UP DOWN 
 Get level: PREAMP(10..20/10) ATT(12..12/0) AF(0..1/0.0039) RF(0..1/0.0039) RFPOWER(0.05..1/0.01) STRENGTH(0..60/0) 
 Set level: PREAMP(10..20/10) ATT(12..12/0) AF(0..1/0.0039) RF(0..1/0.0039) RFPOWER(0.05..1/0.01) 
 Mode list: AM CW USB LSB RTTY FM 
@@ -1294,6 +1317,7 @@ VFO list: VFOA VFOB
         assert_eq!(caps.agc_levels.len(), 2);
         assert_eq!(caps.max_rit_hz, Some(9990));
         assert!(caps.set_funcs.contains(&"TUNER".to_string()));
+        assert!(!caps.vfo_ops.contains(&"TUNE".to_string()));
         assert!(caps.set_levels.contains(&"RFPOWER".to_string()));
         assert!(caps.get_levels.contains(&"STRENGTH".to_string()));
         assert!(!caps.set_levels.contains(&"STRENGTH".to_string()));
@@ -1302,12 +1326,18 @@ VFO list: VFOA VFOB
 Model name:\tIC-7300
 Preamp: 1dB 2dB
 Attenuator: 20dB
+Get functions: NB COMP TUNER 
+Set functions: NB COMP TUNER 
+VFO Ops: CPY XCHG FROM_VFO TO_VFO MCL TUNE 
 Mode list: AM CW USB LSB RTTY FM CWR RTTYR PKTLSB PKTUSB FM-D AM-D 
 VFO list: VFOA VFOB MEM 
 ";
         let ic_caps = parse_rigctl_caps(3073, ic7300);
         assert!(ic_caps.modes.contains(&"PKTUSB".to_string()));
         assert_eq!(ic_caps.preamp_db, vec![0, 1, 2]);
+        assert!(ic_caps.vfo_ops.contains(&"TUNE".to_string()));
+        assert!(ic_caps.get_funcs.contains(&"TUNER".to_string()));
+        assert!(ic_caps.set_funcs.contains(&"TUNER".to_string()));
     }
 
     #[tokio::test]
@@ -1345,6 +1375,7 @@ VFO list: VFOA VFOB MEM
 
         client.set_func("TUNER", true).await.unwrap();
         assert_eq!(client.get_func("TUNER").await.unwrap(), Some(true));
+        client.vfo_op("TUNE").await.unwrap();
 
         proc_handle.shutdown_gracefully(Some(&mut client)).await;
     }

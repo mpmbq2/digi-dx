@@ -13,6 +13,7 @@ interface Props {
   pendingDialFreqHz: number | null;
   txState: "idle" | "armed" | "transmitting";
   isTuning: boolean;
+  isAtuTuning: boolean;
   feedOnLeft: boolean;
   onToggleFlipFeed: () => void;
   onSelectBand: (band: string) => void;
@@ -21,6 +22,8 @@ interface Props {
   onToggleTxEnabled: () => void;
   onHaltTx: () => void;
   onToggleTune: () => void;
+  onAtuTune: () => void;
+  onToggleAtuBypass: (enabled: boolean) => void;
   onStartLive: () => void;
   onStartDemo: (scale: number) => void;
   onStopSession: () => void;
@@ -40,6 +43,7 @@ export function RadioControlBar({
   pendingDialFreqHz,
   txState,
   isTuning,
+  isAtuTuning,
   feedOnLeft,
   onToggleFlipFeed,
   onSelectBand,
@@ -48,6 +52,8 @@ export function RadioControlBar({
   onToggleTxEnabled,
   onHaltTx,
   onToggleTune,
+  onAtuTune,
+  onToggleAtuBypass,
   onStartLive,
   onStartDemo,
   onStopSession,
@@ -167,6 +173,27 @@ export function RadioControlBar({
     : "warn";
 
   const txEnabled = Boolean(activeSession?.tx_enabled);
+
+  const caps = radio?.capabilities ?? null;
+  const supportsAtuTune = Boolean(
+    caps &&
+      ((caps.vfo_ops ?? []).includes("TUNE") ||
+        (caps.set_funcs ?? []).includes("TUNER"))
+  );
+  const supportsAtuStatus = Boolean(
+    caps &&
+      ((caps.get_funcs ?? []).includes("TUNER") ||
+        (caps.set_funcs ?? []).includes("TUNER"))
+  );
+  const supportsAtuToggle = Boolean(
+    caps && (caps.set_funcs ?? []).includes("TUNER")
+  );
+  const rawTunerFunc = radio?.settings?.funcs?.TUNER;
+  const atuEnabled: boolean | null =
+    typeof rawTunerFunc === "boolean" ? rawTunerFunc : null;
+  const isTransmitting = Boolean(
+    radio?.ptt || txState === "transmitting" || isTuning
+  );
 
   return (
     <div class="mft8-telem-row" data-testid="mft8-radio-bar">
@@ -311,10 +338,80 @@ export function RadioControlBar({
           {txEnabled ? "● TX ARMED" : "○ ENABLE TX"}
         </button>
 
+        {(supportsAtuTune || supportsAtuStatus) && (
+          <div class="mft8-atu-group" data-testid="mft8-atu-group">
+            {supportsAtuTune && (
+              <button
+                type="button"
+                data-testid="mft8-atu-tune-btn"
+                class={`mft8-atu-tune-btn ${isAtuTuning ? "tuning" : ""}`}
+                disabled={!canControlCat || isTransmitting || isAtuTuning}
+                title="Trigger transceiver internal ATU tune cycle (CAT)"
+                onClick={onAtuTune}
+              >
+                {isAtuTuning ? "◉ ATU…" : "ATU"}
+              </button>
+            )}
+            {supportsAtuStatus && (
+              <button
+                type="button"
+                data-testid="mft8-atu-status"
+                class={`mft8-atu-status-btn ${
+                  atuEnabled === true
+                    ? "on"
+                    : atuEnabled === false
+                    ? "bypass"
+                    : "unknown"
+                }`}
+                disabled={
+                  !canControlCat ||
+                  !supportsAtuToggle ||
+                  isTransmitting ||
+                  isAtuTuning
+                }
+                title={
+                  atuEnabled === true
+                    ? supportsAtuToggle
+                      ? "Internal ATU active (inline) — click to bypass"
+                      : "Internal ATU active (inline)"
+                    : atuEnabled === false
+                    ? supportsAtuToggle
+                      ? "Internal ATU in bypass — click to enable"
+                      : "Internal ATU in bypass"
+                    : "Waiting for ATU status readback"
+                }
+                onClick={() => {
+                  if (supportsAtuToggle) {
+                    onToggleAtuBypass(!(atuEnabled ?? false));
+                  }
+                }}
+              >
+                <span
+                  class={`mft8-atu-dot ${
+                    atuEnabled === true
+                      ? "on"
+                      : atuEnabled === false
+                      ? "bypass"
+                      : ""
+                  }`}
+                />
+                <span>
+                  {atuEnabled === true
+                    ? "ON"
+                    : atuEnabled === false
+                    ? "BYPASS"
+                    : "—"}
+                </span>
+              </button>
+            )}
+          </div>
+        )}
+
         <button
           type="button"
           data-testid="mft8-tune-btn"
           class={`mft8-btn mft8-btn-tune ${isTuning ? "active" : ""}`}
+          title="Transmit audio carrier tone (for external tuner or ALC check)"
           disabled={!radio || (!canControlCat && !activeSession?.is_demo)}
           onClick={onToggleTune}
         >

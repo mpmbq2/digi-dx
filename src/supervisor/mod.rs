@@ -608,6 +608,20 @@ impl DeviceSupervisor {
         })?
     }
 
+    pub async fn atu_tune(&self, radio_id: &str) -> CmdResult {
+        let tx = self.worker_sender(radio_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCmd::AtuTune { reply: reply_tx })
+            .await
+            .map_err(|_| (ErrorCode::InternalError, "radio worker stopped".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            (
+                ErrorCode::InternalError,
+                "radio worker dropped reply".into(),
+            )
+        })?
+    }
+
     pub async fn refresh_settings(&self, radio_id: &str) -> CmdResult {
         let tx = self.worker_sender(radio_id).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
