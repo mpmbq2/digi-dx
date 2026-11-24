@@ -321,6 +321,34 @@ pub async fn qsos(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WorkedCallsQuery {
+    #[serde(default)]
+    pub demo: bool,
+}
+
+pub async fn qsos_worked(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<WorkedCallsQuery>,
+) -> impl IntoResponse {
+    match state.store.list_worked_callsigns(q.demo) {
+        Ok(callsigns) => (
+            StatusCode::OK,
+            Json(json!({
+                "demo": q.demo,
+                "count": callsigns.len(),
+                "callsigns": callsigns,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "INTERNAL_ERROR", "message": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn qsos_export_adi(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.store.list_real_qsos_for_adif() {
         Ok(records) => {

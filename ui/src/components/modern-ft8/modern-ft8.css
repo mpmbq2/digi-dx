@@ -344,6 +344,109 @@
   animation: mft8TunePulse 1.2s infinite;
 }
 
+.modern-ft8-root .mft8-atu-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--mft8-bg-inset);
+  border: 1px solid var(--mft8-border-strong);
+}
+
+.modern-ft8-root .mft8-atu-tune-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: #182336;
+  color: #7dd3fc;
+  font-family: var(--mft8-font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.modern-ft8-root .mft8-atu-tune-btn:hover:not(:disabled) {
+  background: #22314a;
+  border-color: rgba(56, 189, 248, 0.55);
+  color: #e0f2fe;
+}
+.modern-ft8-root .mft8-atu-tune-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.modern-ft8-root .mft8-atu-tune-btn.tuning {
+  background: rgba(245, 158, 11, 0.26);
+  border-color: #f59e0b;
+  color: #fef3c7;
+  animation: mft8TunePulse 1.2s infinite;
+}
+
+.modern-ft8-root .mft8-atu-status-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  font-family: var(--mft8-font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.modern-ft8-root .mft8-atu-status-btn.on {
+  background: rgba(16, 185, 129, 0.16);
+  border-color: rgba(52, 211, 153, 0.48);
+  color: #6ee7b7;
+}
+.modern-ft8-root .mft8-atu-status-btn.on:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.26);
+  border-color: #34d399;
+}
+.modern-ft8-root .mft8-atu-status-btn.bypass {
+  background: rgba(100, 116, 139, 0.14);
+  border-color: rgba(100, 116, 139, 0.35);
+  color: #94a3b8;
+}
+.modern-ft8-root .mft8-atu-status-btn.bypass:hover:not(:disabled) {
+  background: rgba(100, 116, 139, 0.24);
+  border-color: #64748b;
+  color: #cbd5e1;
+}
+.modern-ft8-root .mft8-atu-status-btn.unknown {
+  color: var(--mft8-text-muted);
+}
+.modern-ft8-root .mft8-atu-status-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.modern-ft8-root .mft8-atu-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #475569;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.modern-ft8-root .mft8-atu-dot.on {
+  background: #34d399;
+  box-shadow: 0 0 6px #34d399;
+}
+.modern-ft8-root .mft8-atu-dot.bypass {
+  background: #64748b;
+}
+
 .modern-ft8-root .mft8-btn-xs {
   padding: 2px 6px;
   font-size: 10px;
@@ -404,6 +507,30 @@
   border-color: #ef4444;
   color: #fecaca;
 }
+.modern-ft8-root .mft8-btn-arm-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.modern-ft8-root .mft8-btn-pause {
+  background: #141d2e;
+  border-color: #30415c;
+  color: #cbd5e1;
+}
+.modern-ft8-root .mft8-btn-pause.is-paused {
+  background: rgba(16, 185, 129, 0.18);
+  border-color: rgba(52, 211, 153, 0.55);
+  color: #6ee7b7;
+}
+.modern-ft8-root .mft8-btn-cq-active {
+  background: rgba(245, 158, 11, 0.24);
+  border-color: #f59e0b;
+  color: #fef3c7;
+  font-weight: 700;
+}
+.modern-ft8-root .mft8-btn-cq-active:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.34);
+  border-color: #fbbf24;
+}
 
 .modern-ft8-root .mft8-btn-dismiss {
   appearance: none;
@@ -440,6 +567,11 @@
   background: #334155;
   color: #cbd5e1;
   border: 1px solid #475569;
+}
+.modern-ft8-root .mft8-q-pill-cq {
+  background: rgba(245, 158, 11, 0.25);
+  color: #fde68a;
+  border: 1px solid rgba(245, 158, 11, 0.65);
 }
 
 .modern-ft8-root .mft8-tag {
@@ -483,6 +615,26 @@
   background: rgba(100, 116, 139, 0.22);
   color: #cbd5e1;
   border-color: rgba(100, 116, 139, 0.5);
+}
+.modern-ft8-root .mft8-tag-active {
+  background: rgba(56, 189, 248, 0.16);
+  color: #7dd3fc;
+  border-color: rgba(56, 189, 248, 0.42);
+}
+.modern-ft8-root .mft8-tag-armed {
+  background: rgba(239, 68, 68, 0.22);
+  color: #fecaca;
+  border-color: rgba(239, 68, 68, 0.6);
+}
+.modern-ft8-root .mft8-tag-caller {
+  background: rgba(56, 189, 248, 0.14);
+  color: #93c5fd;
+  border-color: rgba(56, 189, 248, 0.35);
+}
+.modern-ft8-root .mft8-tag-hunter {
+  background: rgba(245, 158, 11, 0.14);
+  color: #fde68a;
+  border-color: rgba(245, 158, 11, 0.35);
 }
 
 .modern-ft8-root .mft8-snr-hi { color: #34d399; font-weight: 700; }
@@ -863,11 +1015,39 @@
 }
 
 /* =========================================================================
-   PANEL 2: 5-LANE ATC FLIGHT STRIPS + COLLAPSIBLE LOGGED DRAWER
+   PANEL 2: 4-LANE ATC FLIGHT STRIPS + COLLAPSIBLE LOGGED DRAWER
    ========================================================================= */
+.modern-ft8-root .mft8-cq-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mft8-font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 99px;
+  background: rgba(100, 116, 139, 0.2);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  color: #cbd5e1;
+}
+.modern-ft8-root .mft8-cq-indicator.armed {
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(245, 158, 11, 0.65);
+  color: #fde68a;
+}
+
+.modern-ft8-root .mft8-seq-switch {
+  display: inline-flex;
+  background: var(--mft8-bg-inset);
+  border: 1px solid var(--mft8-border-strong);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+}
+
 .modern-ft8-root .mft8-swimlanes-board {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(96px, 120px);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(96px, 120px);
   gap: 6px;
   padding: 6px 8px;
   background: #0d131f;
@@ -957,6 +1137,14 @@
   border-color: rgba(239, 68, 68, 0.65);
   background: #192438;
 }
+.modern-ft8-root .mft8-qso-strip.is-paused {
+  opacity: 0.72;
+  background: #101725;
+  cursor: default;
+}
+.modern-ft8-root .mft8-qso-strip.is-paused:hover {
+  background: #131b2b;
+}
 
 .modern-ft8-root .mft8-strip-top {
   display: flex;
@@ -1011,6 +1199,7 @@
 .modern-ft8-root .mft8-strip-msg-rx { color: #94a3b8; }
 .modern-ft8-root .mft8-strip-msg-tx { color: #e2e8f0; font-weight: 700; }
 .modern-ft8-root .mft8-strip-msg-tx.armed { color: #fca5a5; }
+.modern-ft8-root .mft8-strip-msg-tx.paused { color: #64748b; font-weight: 500; }
 
 .modern-ft8-root .mft8-strip-footer {
   display: flex;
@@ -1201,6 +1390,14 @@
 .modern-ft8-root table.mft8-dense-table tr.stale-row td {
   opacity: 0.62;
 }
+.modern-ft8-root table.mft8-dense-table tr.worked-row td {
+  filter: grayscale(100%);
+  opacity: 0.48;
+}
+.modern-ft8-root table.mft8-dense-table tr.worked-row:hover td,
+.modern-ft8-root table.mft8-dense-table tr.worked-row.mft8-sync-hover td {
+  opacity: 0.85;
+}
 .modern-ft8-root table.mft8-dense-table tr.bucket-divider td {
   background: rgba(56, 189, 248, 0.06);
   color: #7dd3fc;
@@ -1333,6 +1530,17 @@
   font-weight: 700;
   color: #fff;
 }
+.modern-ft8-root .mft8-decode-row.worked-row {
+  filter: grayscale(100%);
+  opacity: 0.48;
+}
+.modern-ft8-root .mft8-decode-row.worked-row .mft8-dec-msg {
+  color: var(--mft8-text-muted);
+}
+.modern-ft8-root .mft8-decode-row.worked-row:hover,
+.modern-ft8-root .mft8-decode-row.worked-row.mft8-sync-hover {
+  opacity: 0.85;
+}
 
 .modern-ft8-root .mft8-dec-snr {
   text-align: right;
@@ -1364,7 +1572,7 @@
    ========================================================================= */
 @media (max-width: 1220px) {
   .modern-ft8-root .mft8-swimlanes-board {
-    grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(96px, 120px);
+    grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(96px, 120px);
   }
 }
 

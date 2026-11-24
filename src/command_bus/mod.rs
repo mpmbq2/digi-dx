@@ -15,7 +15,7 @@ use crate::domain::clock::{SlotClockSpec, SlotParity};
 use crate::domain::ft8::{validate_station_callsign, validate_station_grid, validate_tx_message};
 use crate::modem::TxIntent;
 use crate::qrz::{QrzClientError, QrzPushError, QrzStatusSnapshot, QrzSyncService};
-use crate::qso::sequencer::{ActiveQso, QsoAction};
+use crate::qso::sequencer::{ActiveQso, CqState, QsoAction, SequencerMode};
 use crate::qso::SessionManager;
 use crate::store::{
     now_utc_str, ChannelRosterEntry, CreateRadioProfileInput, StateStore, StoreError,
@@ -270,6 +270,12 @@ pub enum WsBroadcastEvent {
         tx_af_hz: u16,
         tx_af_occupied: bool,
         survey_active: bool,
+        #[serde(default)]
+        sequencer_mode: SequencerMode,
+        #[serde(default)]
+        armed_qso_id: Option<String>,
+        #[serde(default)]
+        cq: Option<CqState>,
         active_qsos: Vec<ActiveQso>,
         completed_qso: Option<Box<QsoRecord>>,
     },
@@ -471,6 +477,7 @@ impl CommandBus {
             "radio.set_xit" => self.exec_radio_set_xit(envelope).await,
             "radio.set_level" => self.exec_radio_set_level(envelope).await,
             "radio.set_func" => self.exec_radio_set_func(envelope).await,
+            "radio.atu_tune" => self.exec_radio_atu_tune(envelope).await,
             "radio.refresh_settings" => self.exec_radio_refresh_settings(envelope).await,
             "control.claim_lease" => self.exec_claim_lease(envelope),
             "control.release_lease" => self.exec_release_lease(envelope).await,
@@ -483,6 +490,8 @@ impl CommandBus {
             "tx.arm" => self.exec_tx_arm(envelope).await,
             "tx.cancel" => self.exec_tx_cancel(envelope).await,
             "qso.call_cq" => self.exec_qso_call_cq(envelope).await,
+            "qso.stop_cq" => self.exec_qso_stop_cq(envelope).await,
+            "qso.set_sequencer_mode" => self.exec_qso_set_sequencer_mode(envelope).await,
             "qso.reply" => self.exec_qso_reply(envelope).await,
             "qso.action" => self.exec_qso_action(envelope).await,
             "qso.survey_af" => self.exec_qso_survey_af(envelope).await,
@@ -1079,7 +1088,53 @@ impl CommandBus {
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if name.eq_ignore_ascii_case("TUNER") {
+            let sess = self.sessions.snapshot();
+            if sess.active
+                && sess.radio_id.as_deref() == Some(radio_id.as_str())
+                && sess.tx_state == "transmitting"
+            {
+                return CommandAck::err(
+                    envelope.command_id.clone(),
+                    CommandStatus::Rejected,
+                    ErrorCode::CatCommandFailed,
+                    "Cannot change ATU bypass state while transmitting — halt TX first",
+                );
+            }
+        }
         match self.supervisor.set_func(&radio_id, name, enabled).await {
+            Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_radio_atu_tune(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let sess = self.sessions.snapshot();
+        if sess.active
+            && sess.radio_id.as_deref() == Some(radio_id.as_str())
+            && sess.tx_state == "transmitting"
+        {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::CatCommandFailed,
+                "Cannot start ATU tune while transmitting — halt TX first",
+            );
+        }
+        match self.supervisor.atu_tune(&radio_id).await {
             Ok(res) => CommandAck::ok(envelope.command_id.clone(), res),
             Err((code, msg)) => CommandAck::err(
                 envelope.command_id.clone(),
@@ -1514,6 +1569,59 @@ impl CommandBus {
         }
     }
 
+    async fn exec_qso_stop_cq(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        match self.sessions.stop_cq(&radio_id).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_qso_set_sequencer_mode(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let raw_mode = envelope
+            .payload
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Ok(mode) = SequencerMode::parse(raw_mode) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                format!("Invalid sequencer mode '{raw_mode}'"),
+            );
+        };
+        match self.sessions.set_sequencer_mode(&radio_id, mode).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
     async fn exec_qso_reply(&self, envelope: &CommandEnvelope) -> CommandAck {
         let Some(radio_id) = resolve_radio_id(envelope) else {
             return CommandAck::err(
@@ -1758,6 +1866,7 @@ fn requires_lease(kind: &str) -> bool {
             | "radio.set_xit"
             | "radio.set_level"
             | "radio.set_func"
+            | "radio.atu_tune"
             | "control.release_lease"
             | "control.heartbeat"
             | "session.start"
@@ -1767,6 +1876,8 @@ fn requires_lease(kind: &str) -> bool {
             | "tx.arm"
             | "tx.cancel"
             | "qso.call_cq"
+            | "qso.stop_cq"
+            | "qso.set_sequencer_mode"
             | "qso.reply"
             | "qso.action"
             | "qso.survey_af"
@@ -2133,6 +2244,16 @@ fn validate_command(envelope: &CommandEnvelope) -> Result<(), (ErrorCode, String
                     ));
                 }
             }
+            Ok(())
+        }
+        "qso.stop_cq" => Ok(()),
+        "qso.set_sequencer_mode" => {
+            let mode_str = envelope
+                .payload
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            SequencerMode::parse(mode_str).map_err(|e| (ErrorCode::ValidationFailed, e))?;
             Ok(())
         }
         "qso.reply" => {

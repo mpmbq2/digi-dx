@@ -295,11 +295,66 @@ async function main() {
       `Expected strictly 1 CAT level write after release, got ${setLevelRequests.length}`
     );
 
-    // 5. Momentary TUNE toggle ON -> OFF
+    // 5. Internal ATU controls (status ON/BYPASS + trigger) and Momentary TUNE toggle ON -> OFF
+    await page.waitForSelector('[data-testid="mft8-atu-group"]', { timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('[data-testid="mft8-atu-status"]');
+        return el && el.textContent && el.textContent.includes("BYPASS");
+      },
+      { timeout: 10000 }
+    );
+    await page.click('[data-testid="mft8-atu-status"]');
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('[data-testid="mft8-atu-status"]');
+        return el && el.textContent && el.textContent.includes("ON");
+      },
+      { timeout: 10000 }
+    );
+    await page.click('[data-testid="mft8-atu-status"]');
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('[data-testid="mft8-atu-status"]');
+        return el && el.textContent && el.textContent.includes("BYPASS");
+      },
+      { timeout: 10000 }
+    );
+    await page.click('[data-testid="mft8-atu-tune-btn"]');
+    await page.waitForFunction(
+      () => {
+        const alertStrip = document.querySelector(".mft8-alert-strip");
+        return (
+          alertStrip &&
+          !alertStrip.classList.contains("err") &&
+          alertStrip.textContent &&
+          alertStrip.textContent.includes("Internal ATU tune triggered")
+        );
+      },
+      { timeout: 10000 }
+    );
+    await page.waitForFunction(
+      () => {
+        const btn = document.querySelector('[data-testid="mft8-atu-tune-btn"]');
+        return btn && !btn.disabled;
+      },
+      { timeout: 10000 }
+    );
+
     await page.click('[data-testid="mft8-tune-btn"]');
     await page.waitForFunction(() => {
       const btn = document.querySelector('[data-testid="mft8-tune-btn"]');
-      return btn && btn.textContent && btn.textContent.includes("TUNING");
+      const atuBtn = document.querySelector('[data-testid="mft8-atu-tune-btn"]');
+      const atuStatus = document.querySelector('[data-testid="mft8-atu-status"]');
+      return (
+        btn &&
+        btn.textContent &&
+        btn.textContent.includes("TUNING") &&
+        atuBtn &&
+        atuBtn.disabled &&
+        atuStatus &&
+        atuStatus.disabled
+      );
     });
     await page.click('[data-testid="mft8-tune-btn"]');
     await page.waitForFunction(() => {
@@ -316,19 +371,56 @@ async function main() {
     await page.waitForSelector('[data-testid="mft8-feed-row"]', { timeout: 10000 });
 
     // Confirm real waterfall frames rendered onto canvas (non-zero non-background pixels)
-    const hasWfSignal = await page.evaluate(() => {
-      const c = document.querySelector('[data-testid="mft8-waterfall-canvas"]');
-      if (!c) return false;
-      const ctx = c.getContext("2d");
-      const data = ctx.getImageData(0, 0, c.width, Math.min(20, c.height)).data;
-      for (let i = 0; i < data.length; i += 4) {
-        if (data[i] > 18 || data[i + 1] > 40 || data[i + 2] > 60) return true;
-      }
-      return false;
-    });
-    assert.equal(hasWfSignal, true, "Expected live FFT pixels rendered on waterfall canvas");
+    await page.waitForFunction(
+      () => {
+        const c = document.querySelector('[data-testid="mft8-waterfall-canvas"]');
+        if (!c) return false;
+        const ctx = c.getContext("2d");
+        const data = ctx.getImageData(0, 0, c.width, Math.min(20, c.height)).data;
+        for (let i = 0; i < data.length; i += 4) {
+          if (data[i] > 18 || data[i + 1] > 40 || data[i + 2] > 60) return true;
+        }
+        return false;
+      },
+      { timeout: 5000 }
+    );
 
-    // 7. Create Q1, then pause TX during Targeting-Others & Hover checks so Q1 stays active cleanly
+    // 6.5. Verify 4-column board (3 active lanes + LOGGED), CQ indicator without CQ card, and stop CQ
+    const laneCheck = await page.evaluate(() => ({
+      l0: Boolean(document.querySelector('[data-testid="mft8-lane-0"]')),
+      l1: Boolean(document.querySelector('[data-testid="mft8-lane-1"]')),
+      l2: Boolean(document.querySelector('[data-testid="mft8-lane-2"]')),
+      l3: Boolean(document.querySelector('[data-testid="mft8-lane-3"]')),
+      logged: Boolean(document.querySelector('[data-testid="mft8-logged-lane"]')),
+    }));
+    assert.deepEqual(laneCheck, {
+      l0: true,
+      l1: true,
+      l2: true,
+      l3: false,
+      logged: true,
+    });
+
+    await page.click('[data-testid="mft8-call-cq"]');
+    await page.waitForSelector('[data-testid="mft8-cq-indicator"]', { timeout: 5000 });
+    const cqCardCount = await page.evaluate(() => {
+      const strips = Array.from(document.querySelectorAll('[data-testid="mft8-qso-strip"]'));
+      return strips.filter((s) => s.textContent?.includes("CQ CALL")).length;
+    });
+    assert.equal(cqCardCount, 0, "Expected no CQ QSO card in swimlanes");
+    await page.click('[data-testid="mft8-stop-cq"]');
+    await page.waitForSelector('[data-testid="mft8-cq-indicator"]', {
+      state: "detached",
+      timeout: 5000,
+    });
+    // Clean up any simulated CQ reply if a 20x slot ticked during the check
+    while ((await page.locator('[data-testid="mft8-dismiss-qso"]').count()) > 0) {
+      await page.locator('[data-testid="mft8-dismiss-qso"]').first().click();
+      await page.waitForTimeout(100);
+    }
+
+    // 7. Create Q1, verify role/3-state tags + Pause/Activate + Manual/Auto-Sequence toggle,
+    //    then pause TX during Targeting-Others & Hover checks so Q1 stays active cleanly
     await page.click('[data-testid="mft8-roster-call-btn"]');
     await page.waitForSelector('[data-testid="mft8-qso-strip"]', { timeout: 5000 });
     await page.waitForFunction(() => {
@@ -340,6 +432,48 @@ async function main() {
       const btn = document.querySelector('[data-testid="mft8-tx-toggle"]');
       return btn && btn.textContent && btn.textContent.includes("ENABLE TX");
     });
+
+    const initialCardCheck = await page.evaluate(() => {
+      const lane0 = document.querySelector('[data-testid="mft8-lane-0"]');
+      const strip = lane0?.querySelector('[data-testid="mft8-qso-strip"]');
+      return {
+        inLane0: Boolean(strip),
+        role: strip?.querySelector('[data-testid="mft8-role-tag"]')?.textContent?.trim(),
+        state: strip?.querySelector('[data-testid="mft8-state-tag"]')?.textContent?.trim(),
+      };
+    });
+    assert.equal(initialCardCheck.inLane0, true, "Expected outbound Q1 in Lane 1 (INITIATING)");
+    assert.equal(initialCardCheck.role, "CALLER");
+    assert.equal(initialCardCheck.state, "ARMED");
+
+    // Pause ticket: remains in Lane 0, state becomes PAUSED, Arm button is disabled
+    await page.click('[data-testid="mft8-pause-toggle"]');
+    await page.waitForFunction(() => {
+      const lane0 = document.querySelector('[data-testid="mft8-lane-0"]');
+      const strip = lane0?.querySelector('[data-testid="mft8-qso-strip"]');
+      const state = strip?.querySelector('[data-testid="mft8-state-tag"]')?.textContent?.trim();
+      const armBtn = strip?.querySelector('[data-testid="mft8-arm-qso"]');
+      return state === "PAUSED" && armBtn?.disabled === true;
+    }, { timeout: 5000 });
+
+    // Activate ticket again -> returns to ARMED
+    await page.click('[data-testid="mft8-pause-toggle"]');
+    await page.waitForFunction(() => {
+      const strip = document.querySelector('[data-testid="mft8-qso-strip"]');
+      const state = strip?.querySelector('[data-testid="mft8-state-tag"]')?.textContent?.trim();
+      const armBtn = strip?.querySelector('[data-testid="mft8-arm-qso"]');
+      return state === "ARMED" && armBtn?.disabled === false;
+    }, { timeout: 5000 });
+
+    // Sequencer mode toggle: Manual <-> Auto-Sequence
+    await page.click('[data-testid="mft8-seq-manual"]');
+    await page.waitForFunction(() =>
+      document.querySelector('[data-testid="mft8-seq-manual"]')?.classList.contains("active")
+    );
+    await page.click('[data-testid="mft8-seq-auto"]');
+    await page.waitForFunction(() =>
+      document.querySelector('[data-testid="mft8-seq-auto"]')?.classList.contains("active")
+    );
 
     const activeQInfo = await page.evaluate(() => {
       const strip = document.querySelector('[data-testid="mft8-qso-strip"]');
@@ -501,6 +635,30 @@ async function main() {
     assert(loggedStyle.filter.includes("grayscale"), `Expected desaturated LOGGED chip, got ${loggedStyle.filter}`);
     assert.match(loggedStyle.cyc ?? "", /^(1|2) cyc$/);
     assert.equal(loggedStyle.expanded, "false", "Session drawer must be collapsed by default");
+
+    // Verify previously worked station is greyed out in BOTH the Live Batch Feed and Channel Roster
+    await page.waitForFunction(
+      (call) => {
+        const rosterRow = document.querySelector(
+          `[data-testid="mft8-roster-row"][data-callsign="${call}"]`
+        );
+        const feedRow = document.querySelector(
+          `[data-testid="mft8-feed-row"][data-callsign="${call}"]`
+        );
+        const rosterCell = rosterRow?.querySelector("td");
+        return (
+          rosterRow?.getAttribute("data-worked") === "true" &&
+          rosterRow?.classList.contains("worked-row") &&
+          rosterCell &&
+          getComputedStyle(rosterCell).filter.includes("grayscale") &&
+          feedRow?.getAttribute("data-worked") === "true" &&
+          feedRow?.classList.contains("worked-row") &&
+          getComputedStyle(feedRow).filter.includes("grayscale")
+        );
+      },
+      activeQInfo.callsign,
+      { timeout: 5000 }
+    );
 
     // Wait for 2 subsequent FT8 cycles at 20x (~1.5s) for auto-archive into drawer
     await page.waitForFunction(() => {

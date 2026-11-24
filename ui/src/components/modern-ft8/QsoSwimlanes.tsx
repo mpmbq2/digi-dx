@@ -2,6 +2,8 @@ import { useEffect, useState } from "preact/hooks";
 import type {
   ActiveQso,
   CompletedSessionQso,
+  CqState,
+  SequencerMode,
   SlotClockSpec,
   TranscriptEntry,
 } from "../../types";
@@ -16,6 +18,7 @@ import {
   mapActiveQsoToStage,
   normalizeCall,
   qrzUrl,
+  resolveQsoRole,
   snrClass,
 } from "./utils";
 
@@ -23,6 +26,8 @@ interface Props {
   activeQsos: ActiveQso[];
   identities: Map<string, QsoIdentity>;
   armedQsoId: string | null;
+  cqState: CqState | null;
+  sequencerMode: SequencerMode;
   recentlyAdvancedQsoIds: Set<string>;
   recentlyInboundQsoIds: Set<string>;
   sessionCompletedQsos: CompletedSessionQso[];
@@ -31,22 +36,26 @@ interface Props {
   rosterFreqMap: Map<string, number>;
   rosterGridMap: Map<string, string>;
   onArmQso: (q: ActiveQso, afHz: number | null) => void;
+  onTogglePauseQso: (qsoId: string, pause: boolean) => void;
   onDismissQso: (qsoId: string) => void;
   onCompleteQso: (qsoId: string) => void;
+  onStopCq: () => void;
+  onSetSequencerMode: (mode: SequencerMode) => void;
 }
 
-const LANES: Array<{ stage: SwimlaneStage | 4; title: string; minimal: boolean }> = [
-  { stage: 0, title: "1. INBOUND / QUEUED", minimal: false },
-  { stage: 1, title: "2. CALLING", minimal: false },
-  { stage: 2, title: "3. SENT RPT", minimal: false },
-  { stage: 3, title: "4. R-RPT / RR73", minimal: false },
-  { stage: 4, title: "5. LOGGED", minimal: true },
+const LANES: Array<{ stage: SwimlaneStage | 3; title: string; minimal: boolean }> = [
+  { stage: 0, title: "1. INITIATING", minimal: false },
+  { stage: 1, title: "2. SIGNAL REPORTS", minimal: false },
+  { stage: 2, title: "3. RR73 / 73", minimal: false },
+  { stage: 3, title: "LOGGED", minimal: true },
 ];
 
 export function QsoSwimlanes({
   activeQsos,
   identities,
   armedQsoId,
+  cqState,
+  sequencerMode,
   recentlyAdvancedQsoIds,
   recentlyInboundQsoIds,
   sessionCompletedQsos,
@@ -55,8 +64,11 @@ export function QsoSwimlanes({
   rosterFreqMap,
   rosterGridMap,
   onArmQso,
+  onTogglePauseQso,
   onDismissQso,
   onCompleteQso,
+  onStopCq,
+  onSetSequencerMode,
 }: Props) {
   const { hover } = useCrossHighlight();
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -97,6 +109,8 @@ export function QsoSwimlanes({
     return null;
   };
 
+  const realQsos = activeQsos.filter((q) => !q.is_cq);
+
   return (
     <section
       class="mft8-panel mft8-panel-swimlanes"
@@ -104,15 +118,80 @@ export function QsoSwimlanes({
       aria-label="Active QSO Sequencers"
     >
       <div class="mft8-panel-header">
-        <h2 class="mft8-panel-title">
-          Active QSO Sequencers
-          <span class="mft8-count-chip" data-testid="mft8-active-qso-count">
-            {activeQsos.length}
+        <div
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "8px",
+            flexWrap: "wrap",
+          }}
+        >
+          <h2 class="mft8-panel-title">
+            Active QSO Sequencers
+            <span class="mft8-count-chip" data-testid="mft8-active-qso-count">
+              {realQsos.length}
+            </span>
+          </h2>
+          {cqState && (
+            <span
+              class={`mft8-cq-indicator ${cqState.armed ? "armed" : ""}`}
+              data-testid="mft8-cq-indicator"
+              title={
+                cqState.armed
+                  ? "Calling CQ (Armed for next TX)"
+                  : "Calling CQ (Queued behind active QSOs)"
+              }
+            >
+              <span>
+                ● CALLING CQ
+                {cqState.directed_cq ? ` ${cqState.directed_cq}` : ""} ·{" "}
+                {cqState.tx_slot.toUpperCase()}
+                {cqState.attempts > 0 ? ` (${cqState.attempts})` : ""}
+              </span>
+              <button
+                type="button"
+                class="mft8-btn-dismiss"
+                data-testid="mft8-stop-cq"
+                title="Stop Calling CQ"
+                onClick={onStopCq}
+              >
+                ×
+              </button>
+            </span>
+          )}
+        </div>
+        <div
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "8px",
+            flexWrap: "wrap",
+          }}
+        >
+          <div class="mft8-seq-switch" role="group" aria-label="Sequencer Mode">
+            <button
+              type="button"
+              data-testid="mft8-seq-auto"
+              class={`mft8-mode-btn ${
+                sequencerMode === "auto_sequence" ? "active" : ""
+              }`}
+              onClick={() => onSetSequencerMode("auto_sequence")}
+            >
+              Auto-Sequence
+            </button>
+            <button
+              type="button"
+              data-testid="mft8-seq-manual"
+              class={`mft8-mode-btn ${sequencerMode === "manual" ? "active" : ""}`}
+              onClick={() => onSetSequencerMode("manual")}
+            >
+              Manual
+            </button>
+          </div>
+          <span style={{ fontSize: "10px", color: "var(--mft8-text-muted)" }}>
+            Auto-archives after 2 cycles
           </span>
-        </h2>
-        <span style={{ fontSize: "10px", color: "var(--mft8-text-muted)" }}>
-          ATC Flight Strips · Logged contacts turn grey &amp; auto-archive after 2 cycles
-        </span>
+        </div>
       </div>
 
       <div class="mft8-swimlanes-board" data-testid="mft8-swimlanes-board">
@@ -185,7 +264,7 @@ export function QsoSwimlanes({
             );
           }
 
-          const laneItems = activeQsos.filter(
+          const laneItems = realQsos.filter(
             (q) => mapActiveQsoToStage(q) === lane.stage
           );
 
@@ -221,7 +300,9 @@ export function QsoSwimlanes({
                       lastRx?.message ?? null,
                       dist?.km ?? null
                     );
-                    const isArmed = q.qso_id === armedQsoId;
+                    const isPaused = q.status === "paused";
+                    const isArmed = !isPaused && q.qso_id === armedQsoId;
+                    const role = resolveQsoRole(q);
                     const isAdv = recentlyAdvancedQsoIds.has(q.qso_id);
                     const isInb = recentlyInboundQsoIds.has(q.qso_id);
                     const isHovered = Boolean(
@@ -238,17 +319,19 @@ export function QsoSwimlanes({
                         key={q.qso_id}
                         data-testid="mft8-qso-strip"
                         data-qso-id={q.qso_id}
-                        data-callsign={q.is_cq ? undefined : call}
+                        data-callsign={call}
                         data-hz={afHz ?? undefined}
                         data-color={identity.color}
-                        class={`mft8-qso-strip ${isArmed ? "is-armed" : ""} ${animClass} ${
-                          isHovered ? "mft8-sync-hover" : ""
-                        }`}
+                        class={`mft8-qso-strip ${isArmed ? "is-armed" : ""} ${
+                          isPaused ? "is-paused" : ""
+                        } ${animClass} ${isHovered ? "mft8-sync-hover" : ""}`}
                         style={{
                           borderLeftColor: identity.color,
                           boxShadow: `inset 3px 0 12px ${hexToRgba(identity.color, 0.14)}`,
                         }}
-                        onClick={() => onArmQso(q, afHz)}
+                        onClick={() => {
+                          if (!isPaused) onArmQso(q, afHz);
+                        }}
                       >
                         <div class="mft8-strip-top">
                           <div class="mft8-strip-id">
@@ -258,8 +341,21 @@ export function QsoSwimlanes({
                             >
                               {identity.badge}
                             </span>
-                            <span class="mft8-strip-call">
-                              {q.is_cq ? "CQ CALL" : call}
+                            <span class="mft8-strip-call">{call}</span>
+                            <span
+                              data-testid="mft8-role-tag"
+                              class={`mft8-tag ${
+                                role === "caller"
+                                  ? "mft8-tag-caller"
+                                  : "mft8-tag-hunter"
+                              }`}
+                              title={
+                                role === "caller"
+                                  ? "They called CQ (you are hunting)"
+                                  : "They answered your CQ (Hunter)"
+                              }
+                            >
+                              {role === "caller" ? "CALLER" : "HUNTER"}
                             </span>
                           </div>
                           <button
@@ -287,47 +383,51 @@ export function QsoSwimlanes({
                           </span>
                         </div>
 
-                        {(tags.length > 0 ||
-                          isAdv ||
-                          q.attempts_on_step >= 2 ||
-                          q.status === "paused") && (
-                          <div
-                            style={{
-                              display: "flex",
-                              flexWrap: "wrap",
-                              gap: "3px",
-                              alignItems: "center",
-                            }}
+                        <div
+                          style={{
+                            display: "flex",
+                            flexWrap: "wrap",
+                            gap: "3px",
+                            alignItems: "center",
+                          }}
+                        >
+                          <span
+                            data-testid="mft8-state-tag"
+                            class={`mft8-tag ${
+                              isArmed
+                                ? "mft8-tag-armed"
+                                : isPaused
+                                ? "mft8-tag-paused"
+                                : "mft8-tag-active"
+                            }`}
                           >
-                            {tags.map((t) => (
-                              <span
-                                key={t}
-                                class={`mft8-tag ${
-                                  t === "SOTA"
-                                    ? "mft8-tag-sota"
-                                    : t === "POTA"
-                                    ? "mft8-tag-pota"
-                                    : "mft8-tag-dx"
-                                }`}
-                              >
-                                {t}
-                              </span>
-                            ))}
-                            {isAdv && (
-                              <span class="mft8-tag mft8-tag-adv mft8-anim-pop">
-                                ADVANCED
-                              </span>
-                            )}
-                            {q.status === "paused" && (
-                              <span class="mft8-tag mft8-tag-paused">PAUSED</span>
-                            )}
-                            {q.attempts_on_step >= 2 && (
-                              <span class="mft8-tag mft8-tag-stall">
-                                WAIT {q.attempts_on_step}c
-                              </span>
-                            )}
-                          </div>
-                        )}
+                            {isArmed ? "ARMED" : isPaused ? "PAUSED" : "ACTIVE"}
+                          </span>
+                          {tags.map((t) => (
+                            <span
+                              key={t}
+                              class={`mft8-tag ${
+                                t === "SOTA"
+                                  ? "mft8-tag-sota"
+                                  : t === "POTA"
+                                  ? "mft8-tag-pota"
+                                  : "mft8-tag-dx"
+                              }`}
+                            >
+                              {t}
+                            </span>
+                          ))}
+                          {isAdv && (
+                            <span class="mft8-tag mft8-tag-adv mft8-anim-pop">
+                              ADVANCED
+                            </span>
+                          )}
+                          {q.attempts_on_step >= 2 && (
+                            <span class="mft8-tag mft8-tag-stall">
+                              WAIT {q.attempts_on_step}c
+                            </span>
+                          )}
+                        </div>
 
                         <div class="mft8-strip-msgs">
                           <div class="mft8-strip-msg-line mft8-strip-msg-rx">
@@ -335,10 +435,12 @@ export function QsoSwimlanes({
                           </div>
                           <div
                             class={`mft8-strip-msg-line mft8-strip-msg-tx ${
-                              isArmed ? "armed" : ""
+                              isArmed ? "armed" : isPaused ? "paused" : ""
                             }`}
                           >
-                            TX: {formatQsoNextTx(q)}
+                            {isPaused
+                              ? `PAUSED · Next: ${formatQsoNextTx(q)}`
+                              : `TX: ${formatQsoNextTx(q)}`}
                           </div>
                         </div>
 
@@ -348,39 +450,59 @@ export function QsoSwimlanes({
                               type="button"
                               class={`mft8-btn-arm-chip ${isArmed ? "armed" : ""}`}
                               data-testid="mft8-arm-qso"
+                              disabled={isPaused}
+                              title={
+                                isPaused
+                                  ? "Activate QSO before arming TX"
+                                  : "Arm this QSO for TX"
+                              }
                               onClick={(e) => {
                                 e.stopPropagation();
-                                onArmQso(q, afHz);
+                                if (!isPaused) onArmQso(q, afHz);
                               }}
                             >
-                              {isArmed ? "● TX ARMED" : "ARM TX"}
+                              {isArmed ? "● ARMED" : "Arm TX"}
                             </button>
-                            {!q.is_cq && (
-                              <button
-                                type="button"
-                                class="mft8-btn mft8-btn-xs"
-                                title="Log QSO Now"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  onCompleteQso(q.qso_id);
-                                }}
-                              >
-                                Log
-                              </button>
-                            )}
-                          </div>
-                          {!q.is_cq && (
-                            <a
-                              class="mft8-btn-qrz"
-                              data-testid="mft8-strip-qrz"
-                              href={qrzUrl(call)}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              onClick={(e) => e.stopPropagation()}
+                            <button
+                              type="button"
+                              class={`mft8-btn mft8-btn-xs mft8-btn-pause ${
+                                isPaused ? "is-paused" : ""
+                              }`}
+                              data-testid="mft8-pause-toggle"
+                              title={
+                                isPaused
+                                  ? "Make Active (eligible for TX)"
+                                  : "Pause (RX advances only, no TX)"
+                              }
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onTogglePauseQso(q.qso_id, !isPaused);
+                              }}
                             >
-                              QRZ ↗
-                            </a>
-                          )}
+                              {isPaused ? "Activate" : "Pause"}
+                            </button>
+                            <button
+                              type="button"
+                              class="mft8-btn mft8-btn-xs"
+                              title="Log QSO Now"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onCompleteQso(q.qso_id);
+                              }}
+                            >
+                              Log
+                            </button>
+                          </div>
+                          <a
+                            class="mft8-btn-qrz"
+                            data-testid="mft8-strip-qrz"
+                            href={qrzUrl(call)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            QRZ ↗
+                          </a>
                         </div>
                       </div>
                     );

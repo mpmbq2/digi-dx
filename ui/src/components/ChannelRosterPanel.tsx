@@ -364,13 +364,13 @@ export function ChannelRosterPanel({
                   <tr
                     key={entry.callsign}
                     data-testid="roster-row"
-                    class={
+                    class={`${
                       entry.calling_me
                         ? "row-mine"
                         : entry.is_cq
                         ? "row-cq"
                         : ""
-                    }
+                    } ${isWorked ? "row-worked" : ""}`.trim()}
                   >
                     <td style={{ fontWeight: 700 }}>{entry.callsign}</td>
                     <td>

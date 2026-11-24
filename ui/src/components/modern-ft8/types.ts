@@ -1,6 +1,6 @@
 export type DigitalMode = "FT8" | "FT4";
 
-export type SwimlaneStage = 0 | 1 | 2 | 3;
+export type SwimlaneStage = 0 | 1 | 2;
 
 export type FeedSection = "TARGETING_ME" | "CQ" | "TARGETING_OTHERS";
 

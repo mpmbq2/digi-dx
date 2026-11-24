@@ -950,6 +950,31 @@ impl StateStore {
         Ok(out)
     }
 
+    /// Return all distinct normalized `their_call` callsigns from the real or demo logbook.
+    pub fn list_worked_callsigns(&self, demo: bool) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let sql = if demo {
+            "SELECT DISTINCT UPPER(TRIM(their_call)) FROM demo_qso_log WHERE TRIM(their_call) != ''"
+        } else {
+            "SELECT DISTINCT UPPER(TRIM(their_call)) FROM qso_log WHERE TRIM(their_call) != ''"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let clean = r?
+                .trim()
+                .trim_matches(|c| c == '<' || c == '>')
+                .to_ascii_uppercase();
+            if !clean.is_empty() {
+                out.push(clean);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     pub fn get_qrz_api_key(&self) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
         let raw: Option<String> = conn
@@ -1657,6 +1682,23 @@ mod tests {
         let adif_rows = store.list_real_qsos_for_adif().unwrap();
         assert_eq!(adif_rows.len(), 1);
         assert_eq!(adif_rows[0].their_call, "JA1ABC");
+
+        let real_bracket = QsoRecord {
+            qso_id: Uuid::now_v7().to_string(),
+            my_call: "N1MPM".to_string(),
+            their_call: "<ja1abc>".to_string(),
+            ..real
+        };
+        store.insert_qso(&real_bracket).unwrap();
+
+        assert_eq!(
+            store.list_worked_callsigns(false).unwrap(),
+            vec!["JA1ABC".to_string()]
+        );
+        assert_eq!(
+            store.list_worked_callsigns(true).unwrap(),
+            vec!["QQ1XYZ".to_string()]
+        );
     }
 
     #[test]

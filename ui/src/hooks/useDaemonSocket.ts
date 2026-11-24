@@ -7,6 +7,7 @@ import type {
   CommandEnvelope,
   CompletedSessionQso,
   ConnectionState,
+  CqState,
   DecodeItem,
   EventLogItem,
   HamlibModel,
@@ -18,6 +19,7 @@ import type {
   RadioLiveSettings,
   RadioSummary,
   RigCapabilities,
+  SequencerMode,
   SessionSnapshot,
   SlotClockSpec,
   SlotParity,
@@ -71,6 +73,8 @@ export interface DaemonState {
   oddOccupiedHz: number[];
   realQsos: QsoLogItem[];
   demoQsos: QsoLogItem[];
+  workedRealCalls: string[];
+  workedDemoCalls: string[];
   sessionCompletedQsos: CompletedSessionQso[];
   channelRoster: ChannelRosterEntry[];
   rosterChannelKey: string | null;
@@ -79,6 +83,7 @@ export interface DaemonState {
   clearAlert: () => void;
   refreshAll: (refreshPreflight?: boolean) => Promise<void>;
   refreshQsos: (demo: boolean, band?: string) => Promise<void>;
+  refreshWorkedCalls: (demo: boolean) => Promise<void>;
   refreshQrzStatus: () => Promise<void>;
   refreshRoster: (
     freqHz: number | null,
@@ -129,6 +134,8 @@ export function useDaemonSocket(): DaemonState {
   const [oddOccupiedHz, setOddOccupiedHz] = useState<number[]>([]);
   const [realQsos, setRealQsos] = useState<QsoLogItem[]>([]);
   const [demoQsos, setDemoQsos] = useState<QsoLogItem[]>([]);
+  const [workedRealCalls, setWorkedRealCalls] = useState<string[]>([]);
+  const [workedDemoCalls, setWorkedDemoCalls] = useState<string[]>([]);
   const [sessionCompletedQsos, setSessionCompletedQsos] = useState<CompletedSessionQso[]>([]);
   const [channelRoster, setChannelRoster] = useState<ChannelRosterEntry[]>([]);
   const [rosterChannelKey, setRosterChannelKey] = useState<string | null>(null);
@@ -193,6 +200,22 @@ export function useDaemonSocket(): DaemonState {
         setDemoQsos(data.items ?? []);
       } else {
         setRealQsos(data.items ?? []);
+      }
+    } catch {
+      // Ignore transient poll errors
+    }
+  }, []);
+
+  const refreshWorkedCalls = useCallback(async (demo: boolean) => {
+    try {
+      const qs = new URLSearchParams({ demo: demo ? "true" : "false" });
+      const res = await fetch(`/api/v1/qsos/worked?${qs.toString()}`);
+      if (!res.ok) return;
+      const data = (await res.json()) as { callsigns?: string[] };
+      if (demo) {
+        setWorkedDemoCalls(data.callsigns ?? []);
+      } else {
+        setWorkedRealCalls(data.callsigns ?? []);
       }
     } catch {
       // Ignore transient poll errors
@@ -317,7 +340,9 @@ export function useDaemonSocket(): DaemonState {
       .catch(() => {});
     void refreshQsos(false);
     void refreshQsos(true);
-  }, [refreshQsos]);
+    void refreshWorkedCalls(false);
+    void refreshWorkedCalls(true);
+  }, [refreshQsos, refreshWorkedCalls]);
 
   useEffect(() => {
     void refreshAll(false);
@@ -440,6 +465,13 @@ export function useDaemonSocket(): DaemonState {
                 tx_state: prev?.tx_state ?? "idle",
                 armed_message: prev?.armed_message ?? null,
                 survey_active: active ? (prev?.survey_active ?? false) : false,
+                sequencer_mode:
+                  !active || sessionChanged
+                    ? "auto_sequence"
+                    : prev?.sequencer_mode ?? "auto_sequence",
+                armed_qso_id:
+                  !active || sessionChanged ? null : prev?.armed_qso_id ?? null,
+                cq: !active || sessionChanged ? null : prev?.cq ?? null,
                 active_qsos: active ? (prev?.active_qsos ?? []) : [],
                 recent_decodes: active ? (prev?.recent_decodes ?? []) : [],
               };
@@ -553,6 +585,19 @@ export function useDaemonSocket(): DaemonState {
               tx_state: prev?.tx_state ?? "idle",
               armed_message: prev?.armed_message ?? null,
               survey_active: Boolean(parsed.survey_active),
+              sequencer_mode:
+                parsed.sequencer_mode === "manual" ||
+                parsed.sequencer_mode === "auto_sequence"
+                  ? (parsed.sequencer_mode as SequencerMode)
+                  : prev?.sequencer_mode ?? "auto_sequence",
+              armed_qso_id:
+                parsed.armed_qso_id !== undefined
+                  ? (parsed.armed_qso_id as string | null)
+                  : prev?.armed_qso_id ?? null,
+              cq:
+                parsed.cq !== undefined
+                  ? (parsed.cq as CqState | null)
+                  : prev?.cq ?? null,
               active_qsos: qsos,
               recent_decodes: prev?.recent_decodes ?? [],
             }));
@@ -583,6 +628,7 @@ export function useDaemonSocket(): DaemonState {
                 `Logged ${isDemo ? "DEMO " : ""}QSO with ${completed.their_call} (${completed.completion_reason})`
               );
               void refreshQsos(isDemo);
+              void refreshWorkedCalls(isDemo);
               if (!isDemo) {
                 void refreshQrzStatus();
               }
@@ -954,6 +1000,8 @@ export function useDaemonSocket(): DaemonState {
     oddOccupiedHz,
     realQsos,
     demoQsos,
+    workedRealCalls,
+    workedDemoCalls,
     sessionCompletedQsos,
     channelRoster,
     rosterChannelKey,
@@ -962,6 +1010,7 @@ export function useDaemonSocket(): DaemonState {
     clearAlert,
     refreshAll,
     refreshQsos,
+    refreshWorkedCalls,
     refreshQrzStatus,
     refreshRoster,
     sendCommand,

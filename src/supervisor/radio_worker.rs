@@ -202,6 +202,9 @@ pub enum WorkerCmd {
         enabled: bool,
         reply: oneshot::Sender<CmdResult>,
     },
+    AtuTune {
+        reply: oneshot::Sender<CmdResult>,
+    },
     RefreshSettings {
         reply: oneshot::Sender<CmdResult>,
     },
@@ -231,6 +234,8 @@ pub struct RadioWorker {
     running: Option<RunningRig>,
     serial_attached: bool,
     halted_by_operator: bool,
+    app_ptt_active: bool,
+    atu_refresh_polls_remaining: u8,
     pending_recovery_at: Option<Instant>,
     pending_standby_probe_at: Option<Instant>,
     poll_counter: u32,
@@ -269,6 +274,8 @@ impl RadioWorker {
             running: None,
             serial_attached,
             halted_by_operator: false,
+            app_ptt_active: false,
+            atu_refresh_polls_remaining: 0,
             pending_recovery_at: None,
             pending_standby_probe_at: None,
             poll_counter: 0,
@@ -329,7 +336,7 @@ impl RadioWorker {
                         self.start_rigctld(true).await;
                     }
                 }
-                _ = poll_timer.tick(), if self.running.is_some() && !self.snapshot.ptt => {
+                _ = poll_timer.tick(), if self.running.is_some() && !self.app_ptt_active => {
                     self.poll_rig().await;
                 }
                 maybe_cmd = self.rx.recv() => {
@@ -538,6 +545,10 @@ impl RadioWorker {
                 let res = self.exec_set_func(&name, enabled).await;
                 let _ = reply.send(res);
             }
+            WorkerCmd::AtuTune { reply } => {
+                let res = self.exec_atu_tune().await;
+                let _ = reply.send(res);
+            }
             WorkerCmd::RefreshSettings { reply } => {
                 let res = self.exec_refresh_settings().await;
                 let _ = reply.send(res);
@@ -622,6 +633,8 @@ impl RadioWorker {
                         self.halted_by_operator = true;
                         self.snapshot.rigctld_pid = None;
                         self.snapshot.ptt = false;
+                        self.app_ptt_active = false;
+                        self.atu_refresh_polls_remaining = 0;
                         let safety_msg = "Safety halt: radio reported TX active immediately on connect; rigctld stopped to release serial port. Check transceiver USB SEND / DTR / RTS menu settings.";
                         self.snapshot.last_error = Some(safety_msg.to_string());
                         self.set_state(RadioLifecycleState::Degraded, Some(safety_msg.to_string()));
@@ -640,6 +653,8 @@ impl RadioWorker {
                 self.snapshot.last_error = None;
                 self.snapshot.last_poll_utc = Some(now_utc_str());
                 self.snapshot.ptt = ptt;
+                self.app_ptt_active = false;
+                self.atu_refresh_polls_remaining = 0;
                 if let Some(f) = freq {
                     self.snapshot.freq_hz = Some(f);
                     self.snapshot.band = derive_band(f).map(str::to_string);
@@ -761,6 +776,7 @@ impl RadioWorker {
         }
         let refresh_full = self.poll_counter.is_multiple_of(5);
         if refresh_full {
+            self.atu_refresh_polls_remaining = self.atu_refresh_polls_remaining.saturating_sub(1);
             let caps_clone = self.snapshot.capabilities.clone();
             let freq_snap = Some(freq);
             let mode_snap = mode_pair
@@ -776,6 +792,18 @@ impl RadioWorker {
                 &mut next_settings,
             )
             .await;
+        } else if self.atu_refresh_polls_remaining > 0 {
+            self.atu_refresh_polls_remaining -= 1;
+            if self
+                .snapshot
+                .capabilities
+                .as_ref()
+                .is_none_or(|c| c.get_funcs.iter().any(|f| f == "TUNER"))
+            {
+                if let Ok(Some(enabled)) = rig.client.get_func("TUNER").await {
+                    next_settings.funcs.insert("TUNER".to_string(), enabled);
+                }
+            }
         }
 
         let mut changed = false;
@@ -926,10 +954,26 @@ impl RadioWorker {
             .await
             .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
         let confirmed = rig.client.get_freq().await.unwrap_or(freq_hz);
+        let tuner_enabled = if self
+            .snapshot
+            .capabilities
+            .as_ref()
+            .is_none_or(|c| c.get_funcs.iter().any(|f| f == "TUNER"))
+        {
+            rig.client.get_func("TUNER").await.ok().flatten()
+        } else {
+            None
+        };
         let band = derive_band(confirmed).map(str::to_string);
 
         self.snapshot.freq_hz = Some(confirmed);
         self.snapshot.band = band.clone();
+        if let Some(enabled) = tuner_enabled {
+            self.snapshot
+                .settings
+                .funcs
+                .insert("TUNER".to_string(), enabled);
+        }
         self.snapshot.last_poll_utc = Some(now_utc_str());
         let _ = self
             .store
@@ -1002,6 +1046,7 @@ impl RadioWorker {
         };
         ptt_res.map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
 
+        self.app_ptt_active = true;
         self.snapshot.ptt = true;
         self.publish_snapshot(Some(format!("PTT test pulse ({capped_ms} ms)")));
 
@@ -1015,6 +1060,7 @@ impl RadioWorker {
             Some(ref mut rig) => rig.client.set_ptt(0).await,
             None => Ok(()),
         };
+        self.app_ptt_active = false;
         self.snapshot.ptt = false;
         self.publish_snapshot(Some("PTT test complete (+T 0)".into()));
         unkey_res.map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
@@ -1049,6 +1095,7 @@ impl RadioWorker {
             .set_ptt(ptt_val)
             .await
             .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+        self.app_ptt_active = active;
         self.snapshot.ptt = active;
         self.publish_snapshot(Some(if active {
             format!("PTT asserted (+T {ptt_val})")
@@ -1302,6 +1349,13 @@ impl RadioWorker {
     }
 
     async fn exec_set_func(&mut self, name: &str, enabled: bool) -> CmdResult {
+        let upper = name.trim().to_ascii_uppercase();
+        if upper == "TUNER" && (self.snapshot.ptt || self.app_ptt_active) {
+            return Err((
+                ErrorCode::CatCommandFailed,
+                "Cannot change ATU bypass state while transmitting — halt TX first".to_string(),
+            ));
+        }
         let Some(ref mut rig) = self.running else {
             return Err((
                 ErrorCode::RadioNotReady,
@@ -1312,7 +1366,12 @@ impl RadioWorker {
                 ),
             ));
         };
-        let upper = name.trim().to_ascii_uppercase();
+        if upper == "TUNER" && rig.client.get_ptt().await.ok().flatten() == Some(true) {
+            return Err((
+                ErrorCode::CatCommandFailed,
+                "Cannot change ATU bypass state while transmitting — halt TX first".to_string(),
+            ));
+        }
         rig.client
             .set_func(&upper, enabled)
             .await
@@ -1337,6 +1396,93 @@ impl RadioWorker {
             "radio_id": self.profile.radio_id,
             "name": upper,
             "enabled": confirmed,
+        }))
+    }
+
+    async fn exec_atu_tune(&mut self) -> CmdResult {
+        if self.snapshot.ptt || self.app_ptt_active {
+            return Err((
+                ErrorCode::CatCommandFailed,
+                "Cannot start ATU tune while transmitting — halt TX first".to_string(),
+            ));
+        }
+
+        let (has_vfo_op_tune, has_set_tuner, has_get_tuner) = {
+            let caps = self.snapshot.capabilities.as_ref();
+            (
+                caps.is_none_or(|c| c.vfo_ops.iter().any(|op| op == "TUNE")),
+                caps.is_none_or(|c| c.set_funcs.iter().any(|f| f == "TUNER")),
+                caps.is_none_or(|c| c.get_funcs.iter().any(|f| f == "TUNER")),
+            )
+        };
+
+        if !has_vfo_op_tune && !has_set_tuner {
+            return Err((
+                ErrorCode::CatCommandFailed,
+                "Transceiver does not advertise CAT ATU tuning in Hamlib capabilities".to_string(),
+            ));
+        }
+
+        let Some(ref mut rig) = self.running else {
+            return Err((
+                ErrorCode::RadioNotReady,
+                format!(
+                    "Radio '{}' is in state {}",
+                    self.profile.radio_id,
+                    self.snapshot.lifecycle_state.as_str()
+                ),
+            ));
+        };
+
+        if rig.client.get_ptt().await.ok().flatten() == Some(true) {
+            return Err((
+                ErrorCode::CatCommandFailed,
+                "Cannot start ATU tune while transmitting — halt TX first".to_string(),
+            ));
+        }
+
+        let method = if has_vfo_op_tune {
+            match rig.client.vfo_op("TUNE").await {
+                Ok(()) => "vfo_op_tune",
+                Err(RigctldError::HamlibError { code: -4 | -11, .. }) if has_set_tuner => {
+                    rig.client
+                        .set_func("TUNER", true)
+                        .await
+                        .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+                    "set_func_tuner"
+                }
+                Err(e) => return Err(map_rigctld_err(e, ErrorCode::CatCommandFailed)),
+            }
+        } else {
+            rig.client
+                .set_func("TUNER", true)
+                .await
+                .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
+            "set_func_tuner"
+        };
+
+        let tuner_enabled = if has_get_tuner {
+            rig.client.get_func("TUNER").await.ok().flatten()
+        } else {
+            None
+        };
+
+        if let Some(enabled) = tuner_enabled {
+            self.snapshot
+                .settings
+                .funcs
+                .insert("TUNER".to_string(), enabled);
+        }
+        if has_get_tuner {
+            self.atu_refresh_polls_remaining = 4;
+        }
+        self.snapshot.last_poll_utc = Some(now_utc_str());
+        self.publish_snapshot(Some(format!("ATU tune triggered ({method})")));
+
+        Ok(json!({
+            "radio_id": self.profile.radio_id,
+            "method": method,
+            "tuner_enabled": self.snapshot.settings.funcs.get("TUNER").copied(),
         }))
     }
 
@@ -1402,6 +1548,7 @@ impl RadioWorker {
                 Some(teardown_reason.to_string()),
             );
         } else {
+            self.app_ptt_active = false;
             self.snapshot.ptt = false;
             self.publish_snapshot(Some(confirmed_detail));
         }
@@ -1414,6 +1561,8 @@ impl RadioWorker {
         }
         self.snapshot.rigctld_pid = None;
         self.snapshot.ptt = false;
+        self.app_ptt_active = false;
+        self.atu_refresh_polls_remaining = 0;
     }
 
     fn set_state(&mut self, new_state: RadioLifecycleState, detail: Option<String>) {

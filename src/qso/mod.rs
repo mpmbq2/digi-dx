@@ -40,7 +40,9 @@ use crate::telemetry::TelemetryEnvelope;
 use crate::watchdog::PttWatchdog;
 
 use self::reconciler::{ReconcileOutcome, SlotDecodeReconciler};
-use self::sequencer::{ActiveQso, QsoAction, QsoSequencer, RecentDecodeEntry, TranscriptEntry};
+use self::sequencer::{
+    ActiveQso, CqState, QsoAction, QsoSequencer, RecentDecodeEntry, SequencerMode, TranscriptEntry,
+};
 
 const MIN_LIVE_SLOT_SAMPLES_12K: usize = 72_000; // >= 6 seconds captured before running decoder
 const MIN_LIVE_SLOT_REAL_AUDIO_MS: i64 = 6_000; // >= 6 seconds real captured audio in slot
@@ -136,6 +138,12 @@ pub struct SessionSnapshot {
     pub tx_state: String,
     pub armed_message: Option<String>,
     pub survey_active: bool,
+    #[serde(default)]
+    pub sequencer_mode: SequencerMode,
+    #[serde(default)]
+    pub armed_qso_id: Option<String>,
+    #[serde(default)]
+    pub cq: Option<CqState>,
     pub active_qsos: Vec<ActiveQso>,
     pub recent_decodes: Vec<RecentDecodeEntry>,
 }
@@ -157,6 +165,9 @@ impl SessionSnapshot {
             tx_state: "idle".to_string(),
             armed_message: None,
             survey_active: false,
+            sequencer_mode: SequencerMode::AutoSequence,
+            armed_qso_id: None,
+            cq: None,
             active_qsos: Vec::new(),
             recent_decodes: Vec::new(),
         }
@@ -228,6 +239,9 @@ impl SessionRuntime {
             tx_state: self.tx_state.clone(),
             armed_message: self.armed_message.clone(),
             survey_active: self.sequencer.survey.is_some(),
+            sequencer_mode: self.sequencer.mode,
+            armed_qso_id: self.sequencer.armed_qso_id(),
+            cq: self.sequencer.cq.clone(),
             active_qsos: self.sequencer.queue.clone(),
             recent_decodes: self.sequencer.recent_decodes.iter().cloned().collect(),
         }
@@ -1094,6 +1108,43 @@ impl SessionManager {
         Ok(serde_json::to_value(cq).unwrap_or(Value::Null))
     }
 
+    pub async fn stop_cq(self: &Arc<Self>, radio_id: &str) -> CmdResult {
+        let session = self.get_active_runtime(radio_id).await?;
+        let snap = {
+            let mut rt = session.runtime.lock().await;
+            rt.sequencer.stop_cq();
+            rt.to_snapshot()
+        };
+        self.update_snapshot_cache(snap.clone());
+        self.broadcast_qso_update(&snap, None);
+        self.reconcile_live_tx(&session).await;
+        Ok(json!({
+            "cq": snap.cq,
+            "armed_qso_id": snap.armed_qso_id,
+        }))
+    }
+
+    pub async fn set_sequencer_mode(
+        self: &Arc<Self>,
+        radio_id: &str,
+        mode: SequencerMode,
+    ) -> CmdResult {
+        let session = self.get_active_runtime(radio_id).await?;
+        let snap = {
+            let mut rt = session.runtime.lock().await;
+            rt.sequencer.set_mode(mode);
+            rt.to_snapshot()
+        };
+        self.update_snapshot_cache(snap.clone());
+        self.broadcast_qso_update(&snap, None);
+        self.reconcile_live_tx(&session).await;
+        Ok(json!({
+            "sequencer_mode": snap.sequencer_mode,
+            "armed_qso_id": snap.armed_qso_id,
+            "cq": snap.cq,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn reply_qso(
         self: &Arc<Self>,
@@ -1479,6 +1530,9 @@ impl SessionManager {
             tx_af_hz: snap.tx_af_hz,
             tx_af_occupied: snap.tx_af_occupied,
             survey_active: snap.survey_active,
+            sequencer_mode: snap.sequencer_mode,
+            armed_qso_id: snap.armed_qso_id.clone(),
+            cq: snap.cq.clone(),
             active_qsos: snap.active_qsos.clone(),
             completed_qso: completed.map(Box::new),
         });

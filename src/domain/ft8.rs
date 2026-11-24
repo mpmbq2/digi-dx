@@ -152,6 +152,47 @@ pub fn is_maidenhead_grid(token: &str) -> bool {
     true
 }
 
+pub fn grid_to_lat_lon(grid: &str) -> Option<(f64, f64)> {
+    let g = grid.trim().to_ascii_uppercase();
+    if is_terminal_payload(&g) || !is_maidenhead_grid(&g) {
+        return None;
+    }
+    let bytes = g.as_bytes();
+    let lon_field = f64::from(bytes[0] - b'A');
+    let lat_field = f64::from(bytes[1] - b'A');
+    let lon_square = f64::from(bytes[2] - b'0');
+    let lat_square = f64::from(bytes[3] - b'0');
+
+    let mut lon = lon_field * 20.0 - 180.0 + lon_square * 2.0;
+    let mut lat = lat_field * 10.0 - 90.0 + lat_square * 1.0;
+
+    if bytes.len() == 6 {
+        let lon_sub = f64::from(bytes[4] - b'A');
+        let lat_sub = f64::from(bytes[5] - b'A');
+        lon += (lon_sub + 0.5) * (2.0 / 24.0);
+        lat += (lat_sub + 0.5) * (1.0 / 24.0);
+    } else {
+        lon += 1.0;
+        lat += 0.5;
+    }
+    Some((lat, lon))
+}
+
+pub fn maidenhead_distance_km(from_grid: &str, to_grid: &str) -> Option<u32> {
+    let (lat1_deg, lon1_deg) = grid_to_lat_lon(from_grid)?;
+    let (lat2_deg, lon2_deg) = grid_to_lat_lon(to_grid)?;
+    let lat1 = lat1_deg.to_radians();
+    let lat2 = lat2_deg.to_radians();
+    let d_lat = (lat2_deg - lat1_deg).to_radians();
+    let d_lon = (lon2_deg - lon1_deg).to_radians();
+
+    let sin_dlat = (d_lat / 2.0).sin();
+    let sin_dlon = (d_lon / 2.0).sin();
+    let h = sin_dlat * sin_dlat + lat1.cos() * lat2.cos() * sin_dlon * sin_dlon;
+    let c = 2.0 * h.clamp(0.0, 1.0).sqrt().atan2((1.0 - h).max(0.0).sqrt());
+    Some((6371.0 * c).round() as u32)
+}
+
 pub fn parse_signal_report(token: &str) -> Option<SignalReport> {
     let upper = token.trim().to_ascii_uppercase();
     let (is_roger, num_part) = if let Some(rest) = upper.strip_prefix('R') {
@@ -484,5 +525,20 @@ mod tests {
             infer_station_role(&parse_ft8_message("SOME FREE TEXT")),
             None
         );
+    }
+
+    #[test]
+    fn computes_maidenhead_distances_and_rejects_invalid_or_terminal() {
+        assert_eq!(maidenhead_distance_km("FN33", "FN33"), Some(0));
+        assert_eq!(maidenhead_distance_km("FN33ab", "FN33ab"), Some(0));
+        let dx_km = maidenhead_distance_km("FN33", "PM95").expect("valid grids");
+        assert!(
+            (10_500..=11_200).contains(&dx_km),
+            "expected ~10800 km FN33->PM95, got {dx_km}"
+        );
+        let eu_km = maidenhead_distance_km("FN33", "JO31").expect("valid grids");
+        assert!(eu_km > 5_000 && eu_km < dx_km);
+        assert_eq!(maidenhead_distance_km("FN33", "RR73"), None);
+        assert_eq!(maidenhead_distance_km("", "PM95"), None);
     }
 }

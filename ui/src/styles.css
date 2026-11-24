@@ -877,6 +877,11 @@ body {
   background: rgba(239, 68, 68, 0.14);
 }
 
+.row-worked td {
+  filter: grayscale(100%);
+  opacity: 0.52;
+}
+
 /* Radio Fleet & Setup Splash */
 .radio-fleet-grid {
   display: grid;

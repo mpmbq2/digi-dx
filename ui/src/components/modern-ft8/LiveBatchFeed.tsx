@@ -19,6 +19,7 @@ interface Props {
   slotMs: number;
   activeQsos: ActiveQso[];
   identities: Map<string, QsoIdentity>;
+  workedCalls: Set<string>;
   recentlyAdvancedQsoIds: Set<string>;
   sessionActive: boolean;
   onCallStation: (callsign: string, dec: DecodeItem) => void;
@@ -67,6 +68,7 @@ export function LiveBatchFeed({
   slotMs,
   activeQsos,
   identities,
+  workedCalls,
   recentlyAdvancedQsoIds,
   sessionActive,
   onCallStation,
@@ -130,6 +132,7 @@ export function LiveBatchFeed({
           const rowCall = normalizeCall(
             parsedFrom || (linkedQso ? linkedQso.their_call : "")
           );
+          const isWorked = Boolean(!identity && rowCall && workedCalls.has(rowCall));
           const isHovered = Boolean(
             hover.hoveredCallsign && rowCall && hover.hoveredCallsign === rowCall
           );
@@ -153,13 +156,14 @@ export function LiveBatchFeed({
               data-callsign={rowCall || undefined}
               data-hz={dec.af_hz}
               data-color={identity?.color}
+              data-worked={isWorked ? "true" : undefined}
               class={`mft8-decode-row ${identity ? "in-qso" : ""} ${
-                isHovered ? "mft8-sync-hover" : ""
-              }`}
+                isWorked ? "worked-row" : ""
+              } ${isHovered ? "mft8-sync-hover" : ""}`}
               style={rowStyle}
               title={
                 rowCall
-                  ? `Click to Call / Arm ${rowCall}`
+                  ? `${isWorked ? "Previously worked · " : ""}Click to Call / Arm ${rowCall}`
                   : dec.message
               }
               onClick={() => {
@@ -189,7 +193,7 @@ export function LiveBatchFeed({
                 {isAdvancedHere && (
                   <span class="mft8-tag mft8-tag-adv mft8-anim-pop">↳ ADV</span>
                 )}
-                {identity && (
+                {identity ? (
                   <span
                     class="mft8-q-pill"
                     data-testid="mft8-feed-qso-pill"
@@ -197,7 +201,15 @@ export function LiveBatchFeed({
                   >
                     {identity.badge}
                   </span>
-                )}
+                ) : isWorked ? (
+                  <span
+                    class="mft8-q-pill mft8-q-pill-log"
+                    data-testid="mft8-feed-worked-pill"
+                    title="Previously worked in logbook"
+                  >
+                    LOG
+                  </span>
+                ) : null}
               </span>
             </div>
           );

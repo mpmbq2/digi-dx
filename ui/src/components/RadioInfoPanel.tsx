@@ -735,10 +735,28 @@ export function RadioInfoPanel({ daemon, radio, onOpenFt8, onDeleted }: Props) {
             )}
 
             {/* Toggle Function Chips */}
-            {funcChoices.length > 0 && (
+            {(funcChoices.length > 0 ||
+              (caps?.vfo_ops ?? []).includes("TUNE")) && (
               <div>
                 <h3 class="subhead">Transceiver Functions</h3>
                 <div class="func-chips">
+                  {(caps?.vfo_ops ?? []).includes("TUNE") && (
+                    <button
+                      type="button"
+                      data-testid="radio-info-atu-tune"
+                      class="btn btn-xs btn-secondary func-chip"
+                      disabled={!isReady || radio.ptt}
+                      onClick={() =>
+                        void ensureLeaseAndRun(
+                          "radio.atu_tune",
+                          {},
+                          "Internal ATU tune triggered"
+                        )
+                      }
+                    >
+                      Run ATU Tune
+                    </button>
+                  )}
                   {funcChoices.map((fnName) => {
                     const active = Boolean(settings?.funcs?.[fnName]);
                     return (
