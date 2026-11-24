@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "preact/hooks";
 import { EventStreamDrawer } from "./components/EventStreamDrawer";
 import { LogbookPanel } from "./components/LogbookPanel";
+import { ModernFt8Console } from "./components/modern-ft8/ModernFt8Console";
 import { OperatingConsole } from "./components/OperatingConsole";
 import { RadioInfoPanel } from "./components/RadioInfoPanel";
 import { SetupSplash } from "./components/SetupSplash";
@@ -10,19 +11,23 @@ import { useDaemonSocket } from "./hooks/useDaemonSocket";
 type Route =
   | { view: "splash" }
   | { view: "logbook" }
-  | { view: "radio"; radioId: string; tab: "info" | "ft8" };
+  | { view: "modern-ft8" }
+  | { view: "radio"; radioId: string; tab: "info" | "ft8" | "modern-ft8" };
 
 function parseHashRoute(hash: string): Route {
   const clean = hash.replace(/^#/, "");
   if (clean === "/logbook") {
     return { view: "logbook" };
   }
-  const radioMatch = clean.match(/^\/radio\/([^/]+)\/(info|ft8)$/);
+  if (clean === "/modern-ft8") {
+    return { view: "modern-ft8" };
+  }
+  const radioMatch = clean.match(/^\/radio\/([^/]+)\/(info|ft8|modern-ft8)$/);
   if (radioMatch) {
     return {
       view: "radio",
       radioId: decodeURIComponent(radioMatch[1]),
-      tab: radioMatch[2] as "info" | "ft8",
+      tab: radioMatch[2] as "info" | "ft8" | "modern-ft8",
     };
   }
   return { view: "splash" };
@@ -34,6 +39,8 @@ function routeToHash(route: Route): string {
       return "#/";
     case "logbook":
       return "#/logbook";
+    case "modern-ft8":
+      return "#/modern-ft8";
     case "radio":
       return `#/radio/${encodeURIComponent(route.radioId)}/${route.tab}`;
   }
@@ -67,12 +74,28 @@ export function App() {
       ? daemon.radios.find((r) => r.profile.radio_id === route.radioId) ?? null
       : null;
 
+  const isModernFt8 =
+    (route.view === "radio" && route.tab === "modern-ft8") ||
+    route.view === "modern-ft8";
+
+  const modernRadio =
+    activeRadio ??
+    (daemon.session?.radio_id
+      ? daemon.radios.find(
+          (r) => r.profile.radio_id === daemon.session?.radio_id
+        ) ?? null
+      : null) ??
+    daemon.radios.find((r) => r.lifecycle_state === "READY") ??
+    daemon.radios[0] ??
+    null;
+
   const showClock =
-    (route.view === "radio" && route.tab === "ft8") ||
-    Boolean(daemon.session?.active);
+    !isModernFt8 &&
+    ((route.view === "radio" && route.tab === "ft8") ||
+      Boolean(daemon.session?.active));
 
   return (
-    <div class="app-shell">
+    <div class={`app-shell ${isModernFt8 ? "app-shell--modern-ft8" : ""}`}>
       <header class="topbar">
         <div
           class="brand"
@@ -163,7 +186,52 @@ export function App() {
                 >
                   FT8 Operation
                 </button>
+                <button
+                  type="button"
+                  data-testid="tab-radio-modern-ft8"
+                  class={`btn btn-sm ${
+                    route.tab === "modern-ft8" ? "btn-primary" : "btn-secondary"
+                  }`}
+                  onClick={() =>
+                    navigate({
+                      view: "radio",
+                      radioId: route.radioId,
+                      tab: "modern-ft8",
+                    })
+                  }
+                >
+                  Modern FT8 UI
+                </button>
               </>
+            )}
+
+            {route.view !== "radio" && (
+              <button
+                type="button"
+                data-testid="nav-modern-ft8"
+                class={`btn btn-sm ${
+                  route.view === "modern-ft8" ? "btn-primary" : "btn-secondary"
+                }`}
+                onClick={() => {
+                  const targetRadioId =
+                    daemon.session?.radio_id ??
+                    daemon.radios.find((r) => r.lifecycle_state === "READY")
+                      ?.profile.radio_id ??
+                    daemon.radios[0]?.profile.radio_id ??
+                    null;
+                  if (targetRadioId) {
+                    navigate({
+                      view: "radio",
+                      radioId: targetRadioId,
+                      tab: "modern-ft8",
+                    });
+                  } else {
+                    navigate({ view: "modern-ft8" });
+                  }
+                }}
+              >
+                Modern FT8 UI
+              </button>
             )}
 
             <button
@@ -268,6 +336,17 @@ export function App() {
                 tab: "info",
               })
             }
+          />
+        )}
+
+        {((route.view === "radio" &&
+          activeRadio &&
+          route.tab === "modern-ft8") ||
+          route.view === "modern-ft8") && (
+          <ModernFt8Console
+            daemon={daemon}
+            radio={modernRadio}
+            onNavigateSetup={() => navigate({ view: "splash" })}
           />
         )}
 

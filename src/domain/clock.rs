@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const DEFAULT_SLOT_MS: i64 = 15_000;
+pub const FT4_SLOT_MS: i64 = 7_500;
 pub const MIN_WALL_FLOOR_MS: i64 = 50;
 pub const PRE_ARM_VIRTUAL_MS: i64 = 2_000;
 
@@ -23,6 +24,15 @@ pub enum SlotParity {
 impl SlotParity {
     pub fn from_unix_secs(secs: UnixSecs) -> Self {
         if secs.0.div_euclid(15).rem_euclid(2) == 0 {
+            Self::Even
+        } else {
+            Self::Odd
+        }
+    }
+
+    pub fn from_virtual_ms(virtual_ms: i64, slot_ms: i64) -> Self {
+        let step = slot_ms.max(1);
+        if virtual_ms.div_euclid(step).rem_euclid(2) == 0 {
             Self::Even
         } else {
             Self::Odd
@@ -111,7 +121,7 @@ impl SlotClock {
     }
 
     pub fn parity_at(&self, wall_ms: i64) -> SlotParity {
-        SlotParity::from_unix_secs(self.unix_secs_at(wall_ms))
+        SlotParity::from_virtual_ms(self.virtual_ms_at(wall_ms).0, self.spec.slot_ms)
     }
 
     pub fn ms_into_slot_virtual(&self, wall_ms: i64) -> i64 {
@@ -195,5 +205,40 @@ mod tests {
             scale: 1.0,
         });
         assert_eq!(bad_slot.unwrap_err(), ClockError::InvalidSlotMs(0));
+    }
+
+    #[test]
+    fn ft4_7_5s_parity_alternates_every_7500ms() {
+        assert_eq!(
+            SlotParity::from_virtual_ms(0, FT4_SLOT_MS),
+            SlotParity::Even
+        );
+        assert_eq!(
+            SlotParity::from_virtual_ms(7_499, FT4_SLOT_MS),
+            SlotParity::Even
+        );
+        assert_eq!(
+            SlotParity::from_virtual_ms(7_500, FT4_SLOT_MS),
+            SlotParity::Odd
+        );
+        assert_eq!(
+            SlotParity::from_virtual_ms(14_999, FT4_SLOT_MS),
+            SlotParity::Odd
+        );
+        assert_eq!(
+            SlotParity::from_virtual_ms(15_000, FT4_SLOT_MS),
+            SlotParity::Even
+        );
+
+        let ft4_clock = SlotClock::new(SlotClockSpec {
+            epoch_ms: 0,
+            anchor_wall_ms: 1_000,
+            slot_ms: FT4_SLOT_MS,
+            scale: 1.0,
+        })
+        .unwrap();
+        assert_eq!(ft4_clock.parity_at(1_000), SlotParity::Even);
+        assert_eq!(ft4_clock.parity_at(8_500), SlotParity::Odd);
+        assert_eq!(ft4_clock.parity_at(16_000), SlotParity::Even);
     }
 }

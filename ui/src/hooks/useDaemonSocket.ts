@@ -5,6 +5,7 @@ import type {
   ChannelRosterEntry,
   CommandAck,
   CommandEnvelope,
+  CompletedSessionQso,
   ConnectionState,
   DecodeItem,
   EventLogItem,
@@ -70,6 +71,7 @@ export interface DaemonState {
   oddOccupiedHz: number[];
   realQsos: QsoLogItem[];
   demoQsos: QsoLogItem[];
+  sessionCompletedQsos: CompletedSessionQso[];
   channelRoster: ChannelRosterEntry[];
   rosterChannelKey: string | null;
   events: EventLogItem[];
@@ -101,6 +103,7 @@ export function useDaemonSocket(): DaemonState {
   const pendingHbRef = useRef<Record<string, string>>({});
   const authTokenRef = useRef<string>("");
   const stationRef = useRef<StationConfig | null>(null);
+  const slotClockRef = useRef<SlotClockSpec | null>(null);
 
   const [authToken, setAuthTokenState] = useState<string>("");
   const [connectionState, setConnectionState] =
@@ -126,6 +129,7 @@ export function useDaemonSocket(): DaemonState {
   const [oddOccupiedHz, setOddOccupiedHz] = useState<number[]>([]);
   const [realQsos, setRealQsos] = useState<QsoLogItem[]>([]);
   const [demoQsos, setDemoQsos] = useState<QsoLogItem[]>([]);
+  const [sessionCompletedQsos, setSessionCompletedQsos] = useState<CompletedSessionQso[]>([]);
   const [channelRoster, setChannelRoster] = useState<ChannelRosterEntry[]>([]);
   const [rosterChannelKey, setRosterChannelKey] = useState<string | null>(null);
   const expectedRosterRef = useRef<{ channelKey: string; isDemo: boolean }>({
@@ -362,6 +366,7 @@ export function useDaemonSocket(): DaemonState {
 
           if (evType === "snapshot") {
             const snap = parsed as unknown as SnapshotEvent;
+            slotClockRef.current = snap.slot_clock;
             setSlotClock(snap.slot_clock);
             setPreflight(snap.preflight);
             if (snap.station) {
@@ -391,37 +396,60 @@ export function useDaemonSocket(): DaemonState {
             const nextClock = parsed.slot_clock as SlotClockSpec;
             const active = Boolean(parsed.active);
             const isDemo = Boolean(parsed.is_demo);
+            const rawMode =
+              typeof parsed.digital_mode === "string"
+                ? parsed.digital_mode.toUpperCase()
+                : undefined;
+            const nextDigitalMode =
+              rawMode === "FT4" || rawMode === "FT8"
+                ? (rawMode as "FT8" | "FT4")
+                : nextClock.slot_ms === 7500
+                ? "FT4"
+                : "FT8";
+            slotClockRef.current = nextClock;
             setSlotClock(nextClock);
-            setSession((prev) => ({
-              active,
-              radio_id: (parsed.radio_id as string | null) ?? null,
-              is_demo: isDemo,
-              decoder_backend: (parsed.decoder_backend as string | null) ?? null,
-              my_call: active
-                ? isDemo
-                  ? "QQ0DEMO"
-                  : stationRef.current?.callsign ?? null
-                : null,
-              my_grid: active
-                ? isDemo
-                  ? "FN33"
-                  : stationRef.current?.grid ?? null
-                : null,
-              slot_clock: nextClock,
-              tx_af_hz: prev?.tx_af_hz ?? 1500,
-              tx_af_occupied: prev?.tx_af_occupied ?? false,
-              tx_enabled: active ? (prev?.tx_enabled ?? true) : false,
-              tx_state: prev?.tx_state ?? "idle",
-              armed_message: prev?.armed_message ?? null,
-              survey_active: active ? (prev?.survey_active ?? false) : false,
-              active_qsos: active ? (prev?.active_qsos ?? []) : [],
-              recent_decodes: active ? (prev?.recent_decodes ?? []) : [],
-            }));
+            setSession((prev) => {
+              const sessionChanged =
+                !active ||
+                !prev?.active ||
+                prev.radio_id !== ((parsed.radio_id as string | null) ?? null) ||
+                prev.is_demo !== isDemo;
+              if (sessionChanged) {
+                setSessionCompletedQsos([]);
+              }
+              return {
+                active,
+                radio_id: (parsed.radio_id as string | null) ?? null,
+                is_demo: isDemo,
+                decoder_backend: (parsed.decoder_backend as string | null) ?? null,
+                digital_mode: nextDigitalMode,
+                my_call: active
+                  ? isDemo
+                    ? "QQ0DEMO"
+                    : stationRef.current?.callsign ?? null
+                  : null,
+                my_grid: active
+                  ? isDemo
+                    ? "FN33"
+                    : stationRef.current?.grid ?? null
+                  : null,
+                slot_clock: nextClock,
+                tx_af_hz: prev?.tx_af_hz ?? 1500,
+                tx_af_occupied: prev?.tx_af_occupied ?? false,
+                tx_enabled: active ? (prev?.tx_enabled ?? true) : false,
+                tx_state: prev?.tx_state ?? "idle",
+                armed_message: prev?.armed_message ?? null,
+                survey_active: active ? (prev?.survey_active ?? false) : false,
+                active_qsos: active ? (prev?.active_qsos ?? []) : [],
+                recent_decodes: active ? (prev?.recent_decodes ?? []) : [],
+              };
+            });
             if (!active) {
               setWaterfallFrames([]);
               setEvenOccupiedHz([]);
               setOddOccupiedHz([]);
               setRecentDecodes([]);
+              setSessionCompletedQsos([]);
             }
             pushEvent(
               "session",
@@ -477,7 +505,7 @@ export function useDaemonSocket(): DaemonState {
             );
           } else if (evType === "waterfall") {
             const wf = parsed as unknown as WaterfallEvent;
-            setWaterfallFrames((prev) => [...prev.slice(-79), wf]);
+            setWaterfallFrames((prev) => [...prev.slice(-159), wf]);
             if (Array.isArray(wf.even_occupied_hz)) {
               setEvenOccupiedHz(wf.even_occupied_hz);
             }
@@ -489,11 +517,20 @@ export function useDaemonSocket(): DaemonState {
             const active = Boolean(parsed.active);
             const qsos = (parsed.active_qsos as ActiveQso[]) ?? [];
             const completed = (parsed.completed_qso as QsoLogItem | null) ?? null;
+            const rawMode =
+              typeof parsed.digital_mode === "string"
+                ? parsed.digital_mode.toUpperCase()
+                : undefined;
+            const nextDigitalMode =
+              rawMode === "FT4" || rawMode === "FT8"
+                ? (rawMode as "FT8" | "FT4")
+                : undefined;
             setSession((prev) => ({
               active,
               radio_id: (parsed.radio_id as string | null) ?? prev?.radio_id ?? null,
               is_demo: isDemo,
               decoder_backend: prev?.decoder_backend ?? null,
+              digital_mode: nextDigitalMode ?? prev?.digital_mode ?? "FT8",
               my_call:
                 (parsed.my_call as string | null) ??
                 (isDemo
@@ -504,7 +541,7 @@ export function useDaemonSocket(): DaemonState {
                 (isDemo
                   ? "FN33"
                   : stationRef.current?.grid ?? prev?.my_grid ?? null),
-              slot_clock: prev?.slot_clock ?? slotClock ?? {
+              slot_clock: prev?.slot_clock ?? slotClockRef.current ?? {
                 epoch_ms: Date.now(),
                 anchor_wall_ms: Date.now(),
                 slot_ms: 15000,
@@ -520,6 +557,27 @@ export function useDaemonSocket(): DaemonState {
               recent_decodes: prev?.recent_decodes ?? [],
             }));
             if (completed) {
+              const nowWall = Date.now();
+              const spec = slotClockRef.current;
+              const virtualMs = spec
+                ? spec.epoch_ms + Math.round((nowWall - spec.anchor_wall_ms) * spec.scale)
+                : nowWall;
+              const slotMsAtLog = spec?.slot_ms ?? 15000;
+              const loggedSlotStartMs = Math.floor(virtualMs / slotMsAtLog) * slotMsAtLog;
+              setSessionCompletedQsos((prev) => {
+                if (prev.some((item) => item.qso.qso_id === completed.qso_id)) {
+                  return prev;
+                }
+                return [
+                  {
+                    qso: completed,
+                    loggedSlotStartMs,
+                    slotMsAtLog,
+                    loggedAtWallMs: nowWall,
+                  },
+                  ...prev,
+                ];
+              });
               pushEvent(
                 "qso_completed",
                 `Logged ${isDemo ? "DEMO " : ""}QSO with ${completed.their_call} (${completed.completion_reason})`
@@ -896,6 +954,7 @@ export function useDaemonSocket(): DaemonState {
     oddOccupiedHz,
     realQsos,
     demoQsos,
+    sessionCompletedQsos,
     channelRoster,
     rosterChannelKey,
     events,

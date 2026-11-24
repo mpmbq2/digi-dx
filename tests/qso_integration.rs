@@ -462,3 +462,189 @@ async fn station_grid_update_propagates_to_qso_sequencer_and_ignores_demo() {
     state.watchdog.disarm_all().await;
     state.supervisor.shutdown_all().await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_set_mode_and_tx_tune_work_on_dummy_rig() {
+    use digi_dx::command_bus::{CommandEnvelope, CommandOrigin, CommandStatus};
+
+    let dir = tempdir().unwrap();
+    let cfg = make_cfg(dir.path());
+    let store = StateStore::open(cfg.db_path()).unwrap();
+    let mut sup_cfg = SupervisorConfig::from_daemon_config(&cfg);
+    sup_cfg.timing = fast_test_worker_timing();
+
+    let state = AppState::build_for_test_with_supervisor(
+        cfg,
+        store,
+        make_preflight(),
+        sup_cfg,
+        build_dummy_scanner_for_test(vec![]),
+    );
+    let shutdown = CancellationToken::new();
+    state.supervisor.start(shutdown.clone()).await;
+
+    let create_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: None,
+                kind: "radio.create_profile".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({
+                    "name": "Mode/Tune Dummy",
+                    "hamlib_model": 1,
+                    "is_dummy": true,
+                    "rigctld_port": 4572
+                }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(create_ack.status, CommandStatus::Ok, "{create_ack:?}");
+    let rad_id = create_ack.result.unwrap()["profile"]["radio_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        if state
+            .supervisor
+            .get_radio_snapshot(&rad_id)
+            .is_some_and(|s| s.lifecycle_state == RadioLifecycleState::Ready)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let claim_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "control.claim_lease".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({}),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(claim_ack.status, CommandStatus::Ok);
+
+    // 1. Momentary TUNE on/off while idle (before session)
+    let tune_on = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "tx.tune".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "enabled": true, "af_hz": 1450 }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(tune_on.status, CommandStatus::Ok, "{tune_on:?}");
+    assert_eq!(tune_on.result.as_ref().unwrap()["tuning"], true);
+    assert!(state.supervisor.get_radio_snapshot(&rad_id).unwrap().ptt);
+
+    let tune_off = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "tx.tune".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "enabled": false }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(tune_off.status, CommandStatus::Ok, "{tune_off:?}");
+    assert_eq!(tune_off.result.as_ref().unwrap()["tuning"], false);
+    assert!(!state.supervisor.get_radio_snapshot(&rad_id).unwrap().ptt);
+
+    // 2. Start demo session in FT8, switch to FT4 (7500ms slot), then back to FT8 (15000ms slot)
+    let start_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "session.start".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "demo": true, "scale": 20.0, "mode": "FT8" }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(start_ack.status, CommandStatus::Ok, "{start_ack:?}");
+    assert_eq!(state.sessions.snapshot().digital_mode, "FT8");
+    assert_eq!(state.sessions.snapshot().slot_clock.slot_ms, 15_000);
+
+    let set_ft4 = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "session.set_mode".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "mode": "FT4" }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(set_ft4.status, CommandStatus::Ok, "{set_ft4:?}");
+    assert_eq!(state.sessions.snapshot().digital_mode, "FT4");
+    assert_eq!(state.sessions.snapshot().slot_clock.slot_ms, 7_500);
+
+    let set_ft8 = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: uuid::Uuid::now_v7().to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "tester".into(),
+                radio_id: Some(rad_id.clone()),
+                kind: "session.set_mode".into(),
+                issued_at_utc: "2026-11-23T00:00:00Z".into(),
+                payload: json!({ "mode": "FT8" }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(set_ft8.status, CommandStatus::Ok, "{set_ft8:?}");
+    assert_eq!(state.sessions.snapshot().digital_mode, "FT8");
+    assert_eq!(state.sessions.snapshot().slot_clock.slot_ms, 15_000);
+
+    shutdown.cancel();
+    state.sessions.stop_if_active().await;
+    state.watchdog.disarm_all().await;
+    state.supervisor.shutdown_all().await;
+}
