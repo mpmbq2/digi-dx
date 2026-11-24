@@ -1,6 +1,6 @@
 import { Fragment } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
-import type { ActiveQso, ChannelRosterEntry, CompletedSessionQso } from "../../types";
+import type { ActiveQso, ChannelRosterEntry } from "../../types";
 import { gridDistance } from "../../utils/maidenhead";
 import { useCrossHighlight } from "./CrossHighlightContext";
 import type {
@@ -23,7 +23,7 @@ interface Props {
   entries: ChannelRosterEntry[];
   activeQsos: ActiveQso[];
   identities: Map<string, QsoIdentity>;
-  sessionCompletedQsos: CompletedSessionQso[];
+  workedCalls: Set<string>;
   myGrid: string | null;
   digitalMode: DigitalMode;
   clockScale: number;
@@ -42,7 +42,7 @@ interface EnrichedRow {
   tags: string[];
   activeQso: ActiveQso | null;
   identity: QsoIdentity | null;
-  isSessionLogged: boolean;
+  isWorked: boolean;
 }
 
 function compareNullable<T>(
@@ -64,7 +64,7 @@ export function ModernChannelRoster({
   entries,
   activeQsos,
   identities,
-  sessionCompletedQsos,
+  workedCalls,
   myGrid,
   digitalMode,
   clockScale,
@@ -99,14 +99,6 @@ export function ModernChannelRoster({
     return map;
   }, [activeQsos]);
 
-  const loggedCallSet = useMemo(() => {
-    const set = new Set<string>();
-    for (const item of sessionCompletedQsos) {
-      set.add(normalizeCall(item.qso.their_call));
-    }
-    return set;
-  }, [sessionCompletedQsos]);
-
   const rows = useMemo<EnrichedRow[]>(() => {
     const qUpper = search.trim().toUpperCase();
     const enriched = entries
@@ -122,7 +114,7 @@ export function ModernChannelRoster({
         const tags = extractStationTags(callNorm, entry.last_message, distKm);
         const activeQso = activeByCall.get(callNorm) ?? null;
         const identity = activeQso ? identities.get(activeQso.qso_id) ?? null : null;
-        const isSessionLogged = !activeQso && loggedCallSet.has(callNorm);
+        const isWorked = !activeQso && workedCalls.has(callNorm);
         return {
           entry,
           callNorm,
@@ -131,7 +123,7 @@ export function ModernChannelRoster({
           tags,
           activeQso,
           identity,
-          isSessionLogged,
+          isWorked,
         };
       })
       .filter((r) => {
@@ -218,7 +210,7 @@ export function ModernChannelRoster({
     myGrid,
     activeByCall,
     identities,
-    loggedCallSet,
+    workedCalls,
     filter,
     search,
     colSort,
@@ -395,9 +387,10 @@ export function ModernChannelRoster({
                       data-callsign={r.callNorm}
                       data-hz={r.entry.last_af_hz}
                       data-color={r.identity?.color}
+                      data-worked={r.isWorked ? "true" : undefined}
                       class={`${isFresh ? "" : "stale-row"} ${
-                        isHovered ? "mft8-sync-hover" : ""
-                      }`}
+                        r.isWorked ? "worked-row" : ""
+                      } ${isHovered ? "mft8-sync-hover" : ""}`}
                       style={rowStyle}
                     >
                       <td>
@@ -408,12 +401,22 @@ export function ModernChannelRoster({
                           >
                             {r.identity.badge}
                           </span>
-                        ) : r.isSessionLogged ? (
-                          <span class="mft8-q-pill mft8-q-pill-log">LOG</span>
+                        ) : r.isWorked ? (
+                          <span
+                            class="mft8-q-pill mft8-q-pill-log"
+                            title="Previously worked in logbook"
+                          >
+                            LOG
+                          </span>
                         ) : null}
                       </td>
                       <td>
-                        <strong class="mft8-mono" style={{ color: "#fff" }}>
+                        <strong
+                          class="mft8-mono"
+                          style={{
+                            color: r.isWorked ? "var(--mft8-text-muted)" : "#fff",
+                          }}
+                        >
                           {r.callNorm}
                         </strong>{" "}
                         {r.tags.map((t) => (

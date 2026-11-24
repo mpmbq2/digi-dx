@@ -1,4 +1,4 @@
-import type { ActiveQso } from "../../types";
+import type { ActiveQso, CqState } from "../../types";
 import type { DigitalMode, FeedSection, SwimlaneStage } from "./types";
 
 export const WF_MIN_HZ = 200;
@@ -151,27 +151,50 @@ export function formatQsoNextTx(q: ActiveQso): string {
     case "send_rr73":
       return `${q.their_call} ${q.my_call} RR73`;
     case "send_73":
+    case "send73":
       return `${q.their_call} ${q.my_call} 73`;
     default:
       return `${q.their_call} ${q.my_call}`;
   }
 }
 
+export function formatCqMessage(
+  cq: CqState,
+  myCall: string | null | undefined,
+  myGrid: string | null | undefined
+): string {
+  const call = normalizeCall(myCall) || "MYCALL";
+  const grid4 = (myGrid || "").slice(0, 4).toUpperCase();
+  const parts = ["CQ"];
+  if (cq.directed_cq) parts.push(cq.directed_cq);
+  parts.push(call);
+  if (grid4) parts.push(grid4);
+  return parts.join(" ");
+}
+
+export function resolveQsoRole(q: ActiveQso): "caller" | "hunter" {
+  if (q.their_role === "caller" || q.their_role === "hunter") {
+    return q.their_role;
+  }
+  return q.step === "send_grid" ? "caller" : "hunter";
+}
+
 export function mapActiveQsoToStage(q: ActiveQso): SwimlaneStage {
-  if (q.status === "paused") return 0;
-  if (q.step === "calling_cq" || q.step === "send_grid") return 1;
+  const hasConfirmedTx =
+    q.attempts_on_step > 0 ||
+    (q.transcript ?? []).some((t) => t.direction === "tx");
+
+  if (q.step === "send_grid") return 0;
   if (q.step === "send_report") {
-    const hasTx = (q.transcript ?? []).some((t) => t.direction === "tx");
-    return hasTx || q.attempts_on_step > 0 ? 2 : 0;
+    return hasConfirmedTx ? 1 : 0;
   }
-  if (
-    q.step === "send_r_report" ||
-    q.step === "send_rr73" ||
-    q.step === "send_73"
-  ) {
-    return 3;
+  if (q.step === "send_r_report") {
+    return resolveQsoRole(q) === "hunter" && !hasConfirmedTx ? 0 : 1;
   }
-  return 1;
+  if (q.step === "send_rr73" || q.step === "send_73" || q.step === "send73") {
+    return 2;
+  }
+  return 0;
 }
 
 export function clamp(v: number, lo: number, hi: number): number {

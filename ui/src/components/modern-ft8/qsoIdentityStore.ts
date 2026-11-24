@@ -37,6 +37,7 @@ export function resolveQsoIdentities(
 
   const out = new Map<string, QsoIdentity>();
   for (const q of activeQsos) {
+    if (q.is_cq) continue;
     let id = registry.byQsoId.get(q.qso_id);
     if (!id) {
       const idx = registry.nextNumber++;

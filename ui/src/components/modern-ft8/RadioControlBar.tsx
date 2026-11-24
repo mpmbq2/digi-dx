@@ -25,6 +25,7 @@ interface Props {
   onStartDemo: (scale: number) => void;
   onStopSession: () => void;
   onCallCq: () => void;
+  onStopCq: () => void;
 }
 
 const POWER_PRESETS = [10, 25, 50, 100] as const;
@@ -51,6 +52,7 @@ export function RadioControlBar({
   onStartDemo,
   onStopSession,
   onCallCq,
+  onStopCq,
 }: Props) {
   const [demoMenuOpen, setDemoMenuOpen] = useState(false);
   const [demoScale, setDemoScale] = useState("1");
@@ -401,10 +403,13 @@ export function RadioControlBar({
             <button
               type="button"
               data-testid="mft8-call-cq"
-              class="mft8-btn mft8-btn-primary"
-              onClick={onCallCq}
+              class={`mft8-btn ${
+                activeSession.cq ? "mft8-btn-cq-active" : "mft8-btn-primary"
+              }`}
+              title={activeSession.cq ? "Stop Calling CQ" : "Call CQ"}
+              onClick={activeSession.cq ? onStopCq : onCallCq}
             >
-              CQ
+              {activeSession.cq ? "◉ Calling CQ" : "CQ"}
             </button>
             <button
               type="button"

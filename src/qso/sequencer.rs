@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -6,11 +6,15 @@ use uuid::Uuid;
 use crate::domain::adif::QsoRecord;
 use crate::domain::bands::derive_band;
 use crate::domain::clock::{SlotParity, UnixSecs};
-use crate::domain::ft8::{parse_ft8_message, Ft8Payload, ParsedFt8Message};
+use crate::domain::ft8::{
+    infer_station_role, maidenhead_distance_km, parse_ft8_message, Ft8Payload, ParsedFt8Message,
+    StationRole,
+};
 use crate::modem::{Ft8Decode, TxIntent};
 use crate::store::now_utc_str;
 
 const MAX_RECENT_DECODES: usize = 300;
+const MAX_KNOWN_GRIDS: usize = 2000;
 const MAX_CONFIRMED_RETRIES: u8 = 5;
 const OCCUPIED_AF_TOLERANCE_HZ: i32 = 50;
 const OCCUPIED_LOOKBACK_SECS: i64 = 60;
@@ -22,6 +26,13 @@ fn strip_call_brackets(s: &str) -> &str {
     s.trim().trim_matches(|c| c == '<' || c == '>')
 }
 
+fn random_u64() -> u64 {
+    let bytes = *Uuid::new_v4().as_bytes();
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QsoStep {
@@ -29,8 +40,9 @@ pub enum QsoStep {
     SendGrid,
     SendReport,
     SendRReport,
-    #[serde(rename_all = "snake_case")]
+    #[serde(rename = "send_rr73")]
     SendRr73,
+    #[serde(rename = "send_73")]
     Send73,
 }
 
@@ -76,6 +88,51 @@ pub enum QsoStatus {
     Paused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SequencerMode {
+    #[default]
+    AutoSequence,
+    Manual,
+}
+
+impl SequencerMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoSequence => "auto_sequence",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto_sequence" => Ok(Self::AutoSequence),
+            "manual" => Ok(Self::Manual),
+            other => Err(format!(
+                "invalid sequencer mode '{other}' (expected 'auto_sequence' or 'manual')"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CqState {
+    pub qso_id: String,
+    pub tx_slot: SlotParity,
+    pub directed_cq: Option<String>,
+    pub attempts: u8,
+    pub armed: bool,
+    pub started_at_utc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ArmedTarget {
+    #[default]
+    None,
+    Cq,
+    Qso(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptEntry {
     pub at_utc: String,
@@ -97,16 +154,51 @@ pub struct ActiveQso {
     pub my_grid: String,
     pub their_call: String,
     pub their_grid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub their_role: Option<StationRole>,
     pub tx_slot: SlotParity,
     pub step: QsoStep,
     pub status: QsoStatus,
     pub attempts_on_step: u8,
     pub last_their_snr_db: Option<i8>,
+    #[serde(default)]
+    pub last_rx_slot_ts: Option<i64>,
+    #[serde(skip)]
+    pub tie_breaker: u64,
     pub rst_sent: Option<String>,
     pub rst_rcvd: Option<String>,
     pub started_at_utc: String,
     pub updated_at_utc: String,
     pub transcript: Vec<TranscriptEntry>,
+}
+
+impl ActiveQso {
+    pub fn has_confirmed_tx(&self) -> bool {
+        self.attempts_on_step > 0 || self.transcript.iter().any(|t| t.direction == "tx")
+    }
+
+    pub fn advancement_rank(&self) -> u8 {
+        match self.step {
+            QsoStep::CallingCq => 0,
+            QsoStep::SendGrid => 10,
+            QsoStep::SendReport => {
+                if self.has_confirmed_tx() {
+                    30
+                } else {
+                    20
+                }
+            }
+            QsoStep::SendRReport => {
+                if self.their_role == Some(StationRole::Hunter) && !self.has_confirmed_tx() {
+                    25
+                } else {
+                    40
+                }
+            }
+            QsoStep::SendRr73 => 50,
+            QsoStep::Send73 => 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +224,7 @@ pub struct OccupiedAfStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QsoAction {
+    Arm,
     Resume,
     Pause,
     Retry,
@@ -147,6 +240,7 @@ pub enum QsoAction {
 impl QsoAction {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
+            "arm" => Ok(Self::Arm),
             "resume" => Ok(Self::Resume),
             "pause" => Ok(Self::Pause),
             "retry" => Ok(Self::Retry),
@@ -177,7 +271,11 @@ pub struct QsoSequencer {
     pub tx_af_hz: u16,
     pub tx_enabled: bool,
     pub manual_tx: Option<TxIntent>,
+    pub mode: SequencerMode,
+    pub cq: Option<CqState>,
+    pub armed_target: ArmedTarget,
     pub queue: Vec<ActiveQso>,
+    pub known_grids: HashMap<String, String>,
     pub recent_decodes: VecDeque<RecentDecodeEntry>,
     pub survey: Option<AfSurveyState>,
     pub last_cq_tx_slot_ts: Option<i64>,
@@ -194,7 +292,11 @@ impl QsoSequencer {
             tx_af_hz: 1500,
             tx_enabled: true,
             manual_tx: None,
+            mode: SequencerMode::AutoSequence,
+            cq: None,
+            armed_target: ArmedTarget::None,
             queue: Vec::new(),
+            known_grids: HashMap::new(),
             recent_decodes: VecDeque::with_capacity(MAX_RECENT_DECODES),
             survey: None,
             last_cq_tx_slot_ts: None,
@@ -225,7 +327,97 @@ impl QsoSequencer {
         self.manual_tx = None;
     }
 
-    pub fn start_cq(&mut self, slot: SlotParity, directed: Option<String>) -> ActiveQso {
+    fn sync_cq_armed(&mut self) {
+        if let Some(ref mut cq) = self.cq {
+            cq.armed = matches!(self.armed_target, ArmedTarget::Cq);
+        }
+    }
+
+    fn fallback_arm_cq_or_none(&mut self) {
+        if self.cq.is_some() {
+            self.armed_target = ArmedTarget::Cq;
+        } else {
+            self.armed_target = ArmedTarget::None;
+        }
+        self.sync_cq_armed();
+    }
+
+    pub fn armed_qso_id(&self) -> Option<String> {
+        match &self.armed_target {
+            ArmedTarget::Qso(id)
+                if self
+                    .queue
+                    .iter()
+                    .any(|q| q.qso_id == *id && q.status == QsoStatus::Active) =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn format_cq_message(&self, cq: &CqState) -> String {
+        let g4 = self.grid4();
+        match cq.directed_cq {
+            Some(ref dir) => format!("CQ {} {} {}", dir, self.my_call, g4)
+                .trim()
+                .to_string(),
+            None => format!("CQ {} {}", self.my_call, g4).trim().to_string(),
+        }
+    }
+
+    fn cache_known_grid(&mut self, call: &str, grid: &str) {
+        let call_clean = strip_call_brackets(call).to_ascii_uppercase();
+        let grid_clean = grid.trim().to_ascii_uppercase();
+        if call_clean.is_empty() || grid_clean.is_empty() {
+            return;
+        }
+        if self.known_grids.len() >= MAX_KNOWN_GRIDS && !self.known_grids.contains_key(&call_clean)
+        {
+            self.known_grids.clear();
+        }
+        self.known_grids.insert(call_clean, grid_clean);
+    }
+
+    pub fn reselect_armed_auto(&mut self) {
+        let winner_id = self
+            .queue
+            .iter()
+            .filter(|q| !q.is_cq && q.status == QsoStatus::Active)
+            .max_by_key(|q| {
+                let dist = q
+                    .their_grid
+                    .as_deref()
+                    .and_then(|g| maidenhead_distance_km(&self.my_grid, g));
+                (
+                    q.last_rx_slot_ts,
+                    q.advancement_rank(),
+                    dist,
+                    q.last_their_snr_db,
+                    q.tie_breaker,
+                )
+            })
+            .map(|q| q.qso_id.clone());
+
+        if let Some(id) = winner_id {
+            self.armed_target = ArmedTarget::Qso(id);
+        } else if self.cq.is_some() {
+            self.armed_target = ArmedTarget::Cq;
+        } else {
+            self.armed_target = ArmedTarget::None;
+        }
+        self.sync_cq_armed();
+    }
+
+    pub fn set_mode(&mut self, mode: SequencerMode) {
+        self.mode = mode;
+        if mode == SequencerMode::AutoSequence && self.armed_target != ArmedTarget::Cq {
+            self.reselect_armed_auto();
+        }
+        self.sync_cq_armed();
+    }
+
+    pub fn start_cq(&mut self, slot: SlotParity, directed: Option<String>) -> CqState {
         let now = now_utc_str();
         let dir_norm = directed
             .map(|d| d.trim().to_ascii_uppercase())
@@ -236,29 +428,27 @@ impl QsoSequencer {
         self.tx_enabled = true;
         self.last_cq_reply_slot_ts = None;
 
-        let cq = ActiveQso {
+        let cq = CqState {
             qso_id: Uuid::now_v7().to_string(),
-            radio_id: self.radio_id.clone(),
-            is_demo: self.is_demo,
-            is_cq: true,
-            directed_cq: dir_norm,
-            my_call: self.my_call.clone(),
-            my_grid: self.my_grid.clone(),
-            their_call: "CQ".to_string(),
-            their_grid: None,
             tx_slot: slot,
-            step: QsoStep::CallingCq,
-            status: QsoStatus::Active,
-            attempts_on_step: 0,
-            last_their_snr_db: None,
-            rst_sent: None,
-            rst_rcvd: None,
-            started_at_utc: now.clone(),
-            updated_at_utc: now,
-            transcript: Vec::new(),
+            directed_cq: dir_norm,
+            attempts: 0,
+            armed: true,
+            started_at_utc: now,
         };
-        self.queue.push(cq.clone());
+        self.cq = Some(cq.clone());
+        self.armed_target = ArmedTarget::Cq;
         cq
+    }
+
+    pub fn stop_cq(&mut self) {
+        self.cq = None;
+        if self.armed_target == ArmedTarget::Cq {
+            self.armed_target = ArmedTarget::None;
+            if self.mode == SequencerMode::AutoSequence {
+                self.reselect_armed_auto();
+            }
+        }
     }
 
     pub fn start_reply(
@@ -283,9 +473,14 @@ impl QsoSequencer {
         let call = their_call.trim().to_ascii_uppercase();
         let grid = their_grid
             .map(|g| g.trim().to_ascii_uppercase())
-            .filter(|g| !g.is_empty());
+            .filter(|g| !g.is_empty())
+            .or_else(|| self.known_grids.get(&call).cloned());
+        if let Some(ref g) = grid {
+            self.cache_known_grid(&call, g);
+        }
 
-        self.queue.retain(|q| q.is_cq || q.their_call != call);
+        self.queue.retain(|q| !q.is_cq && q.their_call != call);
+        self.cq = None;
         self.manual_tx = None;
         self.tx_enabled = true;
 
@@ -304,17 +499,21 @@ impl QsoSequencer {
             my_grid: self.my_grid.clone(),
             their_call: call,
             their_grid: grid,
+            their_role: Some(StationRole::Caller),
             tx_slot: rx_slot.opposite(),
             step: QsoStep::SendGrid,
             status: QsoStatus::Active,
             attempts_on_step: 0,
             last_their_snr_db: snr_db,
+            last_rx_slot_ts: None,
+            tie_breaker: random_u64(),
             rst_sent: None,
             rst_rcvd: None,
             started_at_utc: now.clone(),
             updated_at_utc: now,
             transcript,
         };
+        self.armed_target = ArmedTarget::Qso(qso.qso_id.clone());
         self.queue.insert(0, qso.clone());
         qso
     }
@@ -325,38 +524,94 @@ impl QsoSequencer {
         action: QsoAction,
         dial_freq_hz: Option<i64>,
     ) -> Result<Option<QsoRecord>, String> {
+        if self.cq.as_ref().is_some_and(|c| c.qso_id == qso_id) {
+            match action {
+                QsoAction::Abandon | QsoAction::Pause => {
+                    self.stop_cq();
+                    return Ok(None);
+                }
+                QsoAction::Arm | QsoAction::Resume | QsoAction::Retry => {
+                    if action == QsoAction::Retry {
+                        if let Some(ref mut cq) = self.cq {
+                            cq.attempts = 0;
+                        }
+                    }
+                    self.armed_target = ArmedTarget::Cq;
+                    self.sync_cq_armed();
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+
         let Some(idx) = self.queue.iter().position(|q| q.qso_id == qso_id) else {
             return Err(format!("QSO '{qso_id}' not found in active queue"));
         };
 
         let now = now_utc_str();
         match action {
+            QsoAction::Arm => {
+                if self.queue[idx].status == QsoStatus::Paused {
+                    return Err("Cannot arm a paused QSO; set it to Active first".to_string());
+                }
+                self.cq = None;
+                self.armed_target = ArmedTarget::Qso(qso_id.to_string());
+                if idx > 0 {
+                    let item = self.queue.remove(idx);
+                    self.queue.insert(0, item);
+                }
+                Ok(None)
+            }
             QsoAction::Resume => {
                 self.queue[idx].status = QsoStatus::Active;
                 self.queue[idx].updated_at_utc = now;
+                if self.mode == SequencerMode::AutoSequence && self.armed_target != ArmedTarget::Cq
+                {
+                    self.reselect_armed_auto();
+                }
                 Ok(None)
             }
             QsoAction::Pause => {
                 self.queue[idx].status = QsoStatus::Paused;
                 self.queue[idx].updated_at_utc = now;
+                if self.armed_target == ArmedTarget::Qso(qso_id.to_string()) {
+                    self.armed_target = ArmedTarget::None;
+                    if self.mode == SequencerMode::AutoSequence {
+                        self.reselect_armed_auto();
+                    } else {
+                        self.fallback_arm_cq_or_none();
+                    }
+                }
                 Ok(None)
             }
             QsoAction::Retry => {
                 self.queue[idx].attempts_on_step = 0;
                 self.queue[idx].status = QsoStatus::Active;
                 self.queue[idx].updated_at_utc = now;
+                if self.mode == SequencerMode::AutoSequence && self.armed_target != ArmedTarget::Cq
+                {
+                    self.reselect_armed_auto();
+                }
                 Ok(None)
             }
             QsoAction::PrevStep => {
                 self.queue[idx].step = self.queue[idx].step.prev();
                 self.queue[idx].attempts_on_step = 0;
                 self.queue[idx].updated_at_utc = now;
+                if self.mode == SequencerMode::AutoSequence && self.armed_target != ArmedTarget::Cq
+                {
+                    self.reselect_armed_auto();
+                }
                 Ok(None)
             }
             QsoAction::NextStep => {
                 self.queue[idx].step = self.queue[idx].step.next();
                 self.queue[idx].attempts_on_step = 0;
                 self.queue[idx].updated_at_utc = now;
+                if self.mode == SequencerMode::AutoSequence && self.armed_target != ArmedTarget::Cq
+                {
+                    self.reselect_armed_auto();
+                }
                 Ok(None)
             }
             QsoAction::MoveUp => {
@@ -379,13 +634,29 @@ impl QsoSequencer {
                 Ok(None)
             }
             QsoAction::Abandon => {
-                self.queue.remove(idx);
+                let removed = self.queue.remove(idx);
+                if self.armed_target == ArmedTarget::Qso(removed.qso_id) {
+                    self.armed_target = ArmedTarget::None;
+                    if self.mode == SequencerMode::AutoSequence {
+                        self.reselect_armed_auto();
+                    } else {
+                        self.fallback_arm_cq_or_none();
+                    }
+                }
                 Ok(None)
             }
             QsoAction::Complete => {
                 let q = self.queue.remove(idx);
                 if q.is_cq {
                     return Err("cannot log a pure CQ call as a completed QSO".to_string());
+                }
+                if self.armed_target == ArmedTarget::Qso(q.qso_id.clone()) {
+                    self.armed_target = ArmedTarget::None;
+                    if self.mode == SequencerMode::AutoSequence {
+                        self.reselect_armed_auto();
+                    } else {
+                        self.fallback_arm_cq_or_none();
+                    }
                 }
                 Ok(Some(self.build_qso_record(
                     q,
@@ -430,16 +701,34 @@ impl QsoSequencer {
                 return Some(manual.clone());
             }
         }
-        let next_qso = self.queue.iter().find(|q| q.status == QsoStatus::Active)?;
-        if next_qso.tx_slot != slot {
-            return None;
+        match &self.armed_target {
+            ArmedTarget::Cq => {
+                let cq = self.cq.as_ref()?;
+                if cq.tx_slot != slot {
+                    return None;
+                }
+                Some(TxIntent {
+                    af_hz: self.tx_af_hz,
+                    slot,
+                    message: self.format_cq_message(cq),
+                })
+            }
+            ArmedTarget::Qso(id) => {
+                let next_qso = self
+                    .queue
+                    .iter()
+                    .find(|q| q.qso_id == *id && q.status == QsoStatus::Active)?;
+                if next_qso.tx_slot != slot {
+                    return None;
+                }
+                Some(TxIntent {
+                    af_hz: self.tx_af_hz,
+                    slot,
+                    message: self.format_step_message(next_qso),
+                })
+            }
+            ArmedTarget::None => None,
         }
-
-        Some(TxIntent {
-            af_hz: self.tx_af_hz,
-            slot,
-            message: self.format_step_message(next_qso),
-        })
     }
 
     pub fn on_rx_decode(
@@ -473,9 +762,25 @@ impl QsoSequencer {
         }
 
         let mut completed = Vec::new();
+        let parsed = parse_ft8_message(&decode.message);
+        match &parsed {
+            ParsedFt8Message::Cq {
+                callsign,
+                grid: Some(grid),
+                ..
+            } => self.cache_known_grid(callsign, grid),
+            ParsedFt8Message::Directed {
+                from,
+                payload: Some(Ft8Payload::Grid(grid)),
+                ..
+            } => self.cache_known_grid(from, grid),
+            _ => {}
+        }
+
+        let inferred_role = infer_station_role(&parsed);
         let ParsedFt8Message::Directed {
             to, from, payload, ..
-        } = parse_ft8_message(&decode.message)
+        } = parsed
         else {
             return completed;
         };
@@ -489,6 +794,7 @@ impl QsoSequencer {
             .iter()
             .position(|q| !q.is_cq && q.their_call == from);
 
+        let mut new_cq_reply = false;
         let target_idx = match existing_idx {
             Some(idx) => idx,
             None => {
@@ -496,10 +802,7 @@ impl QsoSequencer {
                 if matches!(payload, Some(Ft8Payload::Terminal(ref t)) if t == "73") {
                     return completed;
                 }
-                let has_active_cq = self
-                    .queue
-                    .iter()
-                    .any(|q| q.is_cq && q.status == QsoStatus::Active);
+                let has_active_cq = self.cq.is_some();
                 let in_same_reply_slot = self.last_cq_reply_slot_ts == Some(decode.slot_ts.0);
                 let recent_cq_tx = self
                     .last_cq_tx_slot_ts
@@ -507,9 +810,16 @@ impl QsoSequencer {
                 let is_cq_reply = has_active_cq || in_same_reply_slot || recent_cq_tx;
 
                 if is_cq_reply {
-                    self.queue.retain(|q| !q.is_cq);
+                    new_cq_reply = true;
                     self.last_cq_reply_slot_ts = Some(decode.slot_ts.0);
                 }
+
+                let their_role = if is_cq_reply {
+                    Some(StationRole::Hunter)
+                } else {
+                    inferred_role.or(Some(StationRole::Hunter))
+                };
+                let known_grid = self.known_grids.get(&from).cloned();
 
                 let now = now_utc_str();
                 let incoming = ActiveQso {
@@ -521,7 +831,8 @@ impl QsoSequencer {
                     my_call: self.my_call.clone(),
                     my_grid: self.my_grid.clone(),
                     their_call: from,
-                    their_grid: None,
+                    their_grid: known_grid,
+                    their_role,
                     tx_slot: rx_slot.opposite(),
                     step: QsoStep::SendReport,
                     status: if is_cq_reply {
@@ -531,6 +842,8 @@ impl QsoSequencer {
                     },
                     attempts_on_step: 0,
                     last_their_snr_db: Some(decode.snr_db),
+                    last_rx_slot_ts: Some(decode.slot_ts.0),
+                    tie_breaker: random_u64(),
                     rst_sent: None,
                     rst_rcvd: None,
                     started_at_utc: now.clone(),
@@ -544,12 +857,20 @@ impl QsoSequencer {
 
         let now = now_utc_str();
         let mut finished_qso = false;
+        let qso_id_owned: String;
+        let q_is_active: bool;
 
         {
             let q = &mut self.queue[target_idx];
+            qso_id_owned = q.qso_id.clone();
+            q_is_active = q.status == QsoStatus::Active;
             q.last_their_snr_db = Some(decode.snr_db);
             q.tx_slot = rx_slot.opposite();
             q.updated_at_utc = now.clone();
+            if q.last_rx_slot_ts != Some(decode.slot_ts.0) {
+                q.last_rx_slot_ts = Some(decode.slot_ts.0);
+                q.tie_breaker = random_u64();
+            }
             q.transcript.push(TranscriptEntry {
                 at_utc: now,
                 direction: "rx".to_string(),
@@ -595,6 +916,17 @@ impl QsoSequencer {
         if finished_qso {
             let done = self.queue.remove(target_idx);
             completed.push(self.build_qso_record(done, "73_rcvd", dial_freq_hz));
+            if self.armed_target == ArmedTarget::Qso(qso_id_owned) {
+                self.armed_target = ArmedTarget::None;
+                if self.mode == SequencerMode::AutoSequence {
+                    self.reselect_armed_auto();
+                } else {
+                    self.fallback_arm_cq_or_none();
+                }
+            }
+        } else if (new_cq_reply || q_is_active) && self.mode == SequencerMode::AutoSequence {
+            self.cq = None;
+            self.reselect_armed_auto();
         }
 
         completed
@@ -618,6 +950,7 @@ impl QsoSequencer {
         }
 
         let mut qso_changed = false;
+        let mut active_qso_changed = false;
         let now = now_utc_str();
         for q in &mut self.queue {
             if q.is_cq {
@@ -638,8 +971,17 @@ impl QsoSequencer {
                     }
                     q.updated_at_utc = now.clone();
                     qso_changed = true;
+                    if q.status == QsoStatus::Active {
+                        active_qso_changed = true;
+                    }
                 }
             }
+        }
+        if active_qso_changed
+            && self.mode == SequencerMode::AutoSequence
+            && self.armed_target != ArmedTarget::Cq
+        {
+            self.reselect_armed_auto();
         }
         qso_changed
     }
@@ -663,20 +1005,8 @@ impl QsoSequencer {
         match parsed {
             ParsedFt8Message::Cq { .. } => {
                 self.last_cq_tx_slot_ts = Some(slot_ts.0);
-                if let Some(idx) = self.queue.iter().position(|q| q.is_cq) {
-                    let q = &mut self.queue[idx];
-                    q.updated_at_utc = now.clone();
-                    q.transcript.push(TranscriptEntry {
-                        at_utc: now,
-                        direction: "tx".to_string(),
-                        slot_ts: slot_ts.0,
-                        af_hz: intent.af_hz,
-                        snr_db: None,
-                        message: intent.message.clone(),
-                    });
-                    if q.step == QsoStep::CallingCq {
-                        q.attempts_on_step = q.attempts_on_step.saturating_add(1);
-                    }
+                if let Some(ref mut cq) = self.cq {
+                    cq.attempts = cq.attempts.saturating_add(1);
                 }
                 None
             }
@@ -746,11 +1076,27 @@ impl QsoSequencer {
 
                 if complete_now {
                     let done = self.queue.remove(idx);
+                    if self.armed_target == ArmedTarget::Qso(done.qso_id.clone()) {
+                        self.armed_target = ArmedTarget::None;
+                        if self.mode == SequencerMode::AutoSequence {
+                            self.reselect_armed_auto();
+                        } else {
+                            self.fallback_arm_cq_or_none();
+                        }
+                    }
                     return Some(self.build_qso_record(done, "73_sent", dial_freq_hz));
                 }
 
                 if timed_out {
-                    self.queue.remove(idx);
+                    let removed = self.queue.remove(idx);
+                    if self.armed_target == ArmedTarget::Qso(removed.qso_id) {
+                        self.armed_target = ArmedTarget::None;
+                        if self.mode == SequencerMode::AutoSequence {
+                            self.reselect_armed_auto();
+                        } else {
+                            self.fallback_arm_cq_or_none();
+                        }
+                    }
                 }
 
                 None
@@ -1065,19 +1411,17 @@ mod tests {
             .queue
             .iter()
             .all(|q| !q.is_cq && q.status == QsoStatus::Active));
-        let calls: Vec<&str> = seq.queue.iter().map(|q| q.their_call.as_str()).collect();
-        assert_eq!(calls, vec!["K1AAA", "W2BBB", "N3CCC", "JA4DDD", "DL5EEE"]);
+        assert!(seq.cq.is_none());
 
+        // Same slot & step: Decision Engine prioritizes farthest Maidenhead distance from FN33ab:
+        // JA4DDD (PM95) > DL5EEE (JO31) > N3CCC (DN70) > W2BBB (EM10) > K1AAA (FN42)
         let next_tx = seq.compose_tx_for_slot(SlotParity::Even, 30_000).unwrap();
-        assert_eq!(next_tx.message, "K1AAA N1MPM -05");
-        seq.apply_action(
-            &seq.queue[0].qso_id.clone(),
-            QsoAction::Complete,
-            Some(14_074_000),
-        )
-        .unwrap();
+        assert_eq!(next_tx.message, "JA4DDD N1MPM -08");
+        let armed_id = seq.armed_qso_id().unwrap();
+        seq.apply_action(&armed_id, QsoAction::Complete, Some(14_074_000))
+            .unwrap();
         let second_tx = seq.compose_tx_for_slot(SlotParity::Even, 60_000).unwrap();
-        assert_eq!(second_tx.message, "W2BBB N1MPM -06");
+        assert_eq!(second_tx.message, "DL5EEE N1MPM -09");
     }
 
     #[test]
@@ -1113,9 +1457,8 @@ mod tests {
     fn mixed_parity_queue_only_transmits_head_active_qso() {
         let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
         seq.start_reply("K1EVEN", Some("FN42".into()), SlotParity::Odd, Some(-5));
-        // Second station replies in Even slot -> wants Odd TX, appended behind head
+        // Second station replies in Even slot -> wants Odd TX, inserted at head and armed
         seq.start_reply("W2ODD", Some("EM10".into()), SlotParity::Even, Some(-8));
-        // Wait: start_reply inserts at 0, so reverse order check: head is W2ODD (tx_slot Odd) and second is K1EVEN (tx_slot Even).
         assert!(seq.compose_tx_for_slot(SlotParity::Even, 0).is_none());
         let tx = seq.compose_tx_for_slot(SlotParity::Odd, 15_000).unwrap();
         assert!(tx.message.starts_with("W2ODD "));
@@ -1270,5 +1613,196 @@ mod tests {
         assert_eq!(seq.queue[0].transcript.len(), 1);
         assert_eq!(seq.queue[0].transcript[0].snr_db, Some(-11));
         assert_eq!(seq.queue[0].transcript[0].af_hz, 1202);
+    }
+
+    #[test]
+    fn qso_step_serde_roundtrip_matches_as_str_including_send_73() {
+        for step in [
+            QsoStep::CallingCq,
+            QsoStep::SendGrid,
+            QsoStep::SendReport,
+            QsoStep::SendRReport,
+            QsoStep::SendRr73,
+            QsoStep::Send73,
+        ] {
+            let serialized = serde_json::to_string(&step).unwrap();
+            let expected = format!("\"{}\"", step.as_str());
+            assert_eq!(serialized, expected, "QsoStep::{step:?} mismatch");
+            let roundtrip: QsoStep = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(roundtrip, step);
+        }
+    }
+
+    #[test]
+    fn decision_engine_follows_5_level_priority_hierarchy() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_cq(SlotParity::Even, None);
+
+        // Slot 15: K1AAA (FN42, nearby, strong -02) and JA1XYZ (PM95, far DX, weak -18)
+        seq.on_rx_decode(&mk_decode(15, -2, 900, "N1MPM K1AAA FN42"), None);
+        seq.on_rx_decode(&mk_decode(15, -18, 1100, "N1MPM JA1XYZ PM95"), None);
+        // Same slot & rank -> Criterion 3 (distance) picks JA1XYZ
+        assert_eq!(
+            seq.compose_tx_for_slot(SlotParity::Even, 30_000)
+                .unwrap()
+                .message,
+            "JA1XYZ N1MPM -18"
+        );
+
+        // Slot 45: ONLY K1AAA replies with +02 -> Criterion 1 (most recent cycle 45 > 15) picks K1AAA!
+        seq.on_rx_decode(&mk_decode(45, -4, 900, "N1MPM K1AAA +02"), None);
+        assert_eq!(
+            seq.compose_tx_for_slot(SlotParity::Even, 60_000)
+                .unwrap()
+                .message,
+            "K1AAA N1MPM R-04"
+        );
+
+        // Slot 75: Both reply in same cycle 75, JA1XYZ sends +05 (rank 50 SendRr73) while K1AAA repeats +02 (rank 40 SendRReport)
+        // Criterion 2 (advancement_rank) picks JA1XYZ even though K1AAA is stronger (-2 vs -18)!
+        seq.on_rx_decode(&mk_decode(75, -2, 900, "N1MPM K1AAA +02"), None);
+        seq.on_rx_decode(&mk_decode(75, -18, 1100, "N1MPM JA1XYZ R+05"), None);
+        assert_eq!(
+            seq.compose_tx_for_slot(SlotParity::Even, 90_000)
+                .unwrap()
+                .message,
+            "JA1XYZ N1MPM RR73"
+        );
+
+        // Criterion 4 (SNR tie-break): two stations at identical slot 105, identical rank, identical grid EM10
+        let mut seq2 = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq2.start_cq(SlotParity::Even, None);
+        seq2.on_rx_decode(&mk_decode(105, -15, 800, "N1MPM W5WEAK EM10"), None);
+        seq2.on_rx_decode(&mk_decode(105, -3, 1200, "N1MPM W5STRG EM10"), None);
+        assert_eq!(
+            seq2.compose_tx_for_slot(SlotParity::Even, 120_000)
+                .unwrap()
+                .message,
+            "W5STRG N1MPM -03"
+        );
+
+        // Criterion 5 (coin flip): identical slot, rank, grid, AND SNR; deterministic non-panic selection
+        let mut seq3 = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq3.start_cq(SlotParity::Even, None);
+        seq3.on_rx_decode(&mk_decode(135, -10, 800, "N1MPM W5ONE EM10"), None);
+        seq3.on_rx_decode(&mk_decode(135, -10, 1200, "N1MPM W5TWO EM10"), None);
+        let armed = seq3.armed_qso_id().expect("one tied station must be armed");
+        assert!(seq3.queue.iter().any(|q| q.qso_id == armed));
+    }
+
+    #[test]
+    fn cq_supersedes_paused_and_yields_when_active_or_new_reply_advances() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+
+        // Unsolicited Paused QSO does not block CQ
+        seq.on_rx_decode(&mk_decode(15, -9, 1000, "N1MPM K9PAU EM10"), None);
+        assert_eq!(seq.queue[0].status, QsoStatus::Paused);
+        let paused_id = seq.queue[0].qso_id.clone();
+
+        seq.start_cq(SlotParity::Even, None);
+        assert!(seq.cq.as_ref().unwrap().armed);
+        assert_eq!(
+            seq.compose_tx_for_slot(SlotParity::Even, 30_000)
+                .unwrap()
+                .message,
+            "CQ N1MPM FN33"
+        );
+        // Paused QSO advancing on RX must NOT preempt CQ
+        seq.on_rx_decode(&mk_decode(45, -8, 1000, "N1MPM K9PAU +01"), None);
+        assert!(seq.cq.as_ref().unwrap().armed);
+        assert!(seq.apply_action(&paused_id, QsoAction::Arm, None).is_err());
+
+        // User starts an Active QSO while CQ is not running, then calls CQ
+        seq.stop_cq();
+        let active_qso = seq.start_reply("K1ACT", Some("FN42".into()), SlotParity::Odd, Some(-6));
+        assert_eq!(
+            seq.armed_qso_id().as_deref(),
+            Some(active_qso.qso_id.as_str())
+        );
+
+        // Calling CQ while Active QSO exists makes CQ Armed
+        seq.start_cq(SlotParity::Even, None);
+        assert!(seq.cq.as_ref().unwrap().armed);
+        assert!(seq.armed_qso_id().is_none());
+        assert_eq!(
+            seq.compose_tx_for_slot(SlotParity::Even, 60_000)
+                .unwrap()
+                .message,
+            "CQ N1MPM FN33"
+        );
+
+        // When the Active QSO advances via RX reply, CQ clears and that QSO becomes Armed
+        seq.on_rx_decode(&mk_decode(75, -5, 1400, "N1MPM K1ACT -04"), None);
+        assert!(seq.cq.is_none());
+        assert_eq!(
+            seq.armed_qso_id().as_deref(),
+            Some(active_qso.qso_id.as_str())
+        );
+        assert_eq!(
+            seq.compose_tx_for_slot(SlotParity::Even, 90_000)
+                .unwrap()
+                .message,
+            "K1ACT N1MPM R-05"
+        );
+    }
+
+    #[test]
+    fn manual_mode_preserves_target_until_user_changes_it() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.set_mode(SequencerMode::Manual);
+        seq.start_cq(SlotParity::Even, None);
+
+        // CQ replies enqueue as Active, but Manual mode keeps CQ armed until user picks a station
+        seq.on_rx_decode(&mk_decode(15, -10, 900, "N1MPM K1AAA FN42"), None);
+        seq.on_rx_decode(&mk_decode(15, -8, 1200, "N1MPM JA4DDD PM95"), None);
+        assert_eq!(seq.queue.len(), 2);
+        assert!(seq.queue.iter().all(|q| q.status == QsoStatus::Active));
+        assert!(seq.cq.as_ref().unwrap().armed);
+        assert!(seq.armed_qso_id().is_none());
+
+        // User manually arms K1AAA
+        let k1_id = seq.queue[0].qso_id.clone();
+        seq.apply_action(&k1_id, QsoAction::Arm, None).unwrap();
+        assert!(seq.cq.is_none());
+        assert_eq!(seq.armed_qso_id().as_deref(), Some(k1_id.as_str()));
+
+        // JA4DDD advances further (sends R+02 in slot 45), yet Manual mode keeps K1AAA targeted!
+        seq.on_rx_decode(&mk_decode(45, -7, 1200, "N1MPM JA4DDD R+02"), None);
+        assert_eq!(seq.armed_qso_id().as_deref(), Some(k1_id.as_str()));
+        assert_eq!(
+            seq.compose_tx_for_slot(SlotParity::Even, 60_000)
+                .unwrap()
+                .message,
+            "K1AAA N1MPM -10"
+        );
+
+        // Switching back to AutoSequence immediately selects the winning QSO (JA4DDD)
+        seq.set_mode(SequencerMode::AutoSequence);
+        let ja_id = seq
+            .queue
+            .iter()
+            .find(|q| q.their_call == "JA4DDD")
+            .unwrap()
+            .qso_id
+            .clone();
+        assert_eq!(seq.armed_qso_id().as_deref(), Some(ja_id.as_str()));
+    }
+
+    #[test]
+    fn aborted_tx_does_not_promote_hunter_advancement_rank() {
+        let mut seq = QsoSequencer::new("rad_1", false, "N1MPM", "FN33ab");
+        seq.start_cq(SlotParity::Even, None);
+        seq.on_rx_decode(&mk_decode(15, -8, 1200, "N1MPM QQ1AAA EM10"), None);
+        let q = &seq.queue[0];
+        assert_eq!(q.their_role, Some(StationRole::Hunter));
+        assert_eq!(q.step, QsoStep::SendReport);
+        assert!(!q.has_confirmed_tx());
+        assert_eq!(q.advancement_rank(), 20);
+
+        // Confirming report TX moves rank from 20 (Initiating) to 30 (Signal Reports)
+        let tx1 = seq.compose_tx_for_slot(SlotParity::Even, 30_000).unwrap();
+        seq.on_tx_confirmed(UnixSecs(30), &tx1, None);
+        assert!(seq.queue[0].has_confirmed_tx());
+        assert_eq!(seq.queue[0].advancement_rank(), 30);
     }
 }

@@ -40,6 +40,7 @@ function formatQsoStepMessage(q: ActiveQso): string {
     case "send_rr73":
       return `${q.their_call} ${q.my_call} RR73`;
     case "send_73":
+    case "send73":
       return `${q.their_call} ${q.my_call} 73`;
     default:
       return `${q.their_call} ${q.my_call}`;
@@ -257,7 +258,9 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
   const txStateStr = daemon.txState?.state ?? activeSession?.tx_state ?? "idle";
   const hasActiveQueuedQso = Boolean(
     activeSession?.tx_enabled &&
-      activeSession.active_qsos.some((q) => q.status === "active")
+      (Boolean(activeSession?.cq?.armed) ||
+        Boolean(activeSession?.armed_qso_id) ||
+        activeSession.active_qsos.some((q) => q.status === "active"))
   );
   const txBadgeClass =
     txStateStr === "transmitting"
@@ -287,15 +290,29 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
   }, [daemon.recentDecodes, decodeFilter, effectiveCall]);
 
   const workedCalls = useMemo(() => {
-    const log = activeSession?.is_demo ? daemon.demoQsos : daemon.realQsos;
+    const isDemo = Boolean(activeSession?.is_demo);
+    const log = isDemo ? daemon.demoQsos : daemon.realQsos;
+    const worked = isDemo ? daemon.workedDemoCalls : daemon.workedRealCalls;
     const set = new Set<string>();
+    for (const call of worked) {
+      const norm = call.replace(/[<>]/g, "").trim().toUpperCase();
+      if (norm) set.add(norm);
+    }
     for (const item of log) {
       if (!radio.band || !item.band || item.band === radio.band) {
-        set.add(item.their_call);
+        const norm = item.their_call.replace(/[<>]/g, "").trim().toUpperCase();
+        if (norm) set.add(norm);
       }
     }
     return set;
-  }, [activeSession?.is_demo, daemon.demoQsos, daemon.realQsos, radio.band]);
+  }, [
+    activeSession?.is_demo,
+    daemon.demoQsos,
+    daemon.realQsos,
+    daemon.workedDemoCalls,
+    daemon.workedRealCalls,
+    radio.band,
+  ]);
 
   const queuedCalls = useMemo(() => {
     const set = new Set<string>();
@@ -306,11 +323,14 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
   }, [activeSession?.active_qsos]);
 
   const firstActiveId = useMemo(() => {
+    if (activeSession?.armed_qso_id) {
+      return activeSession.armed_qso_id;
+    }
     return (
       activeSession?.active_qsos.find((q) => q.status === "active")?.qso_id ??
       null
     );
-  }, [activeSession?.active_qsos]);
+  }, [activeSession?.armed_qso_id, activeSession?.active_qsos]);
 
   return (
     <div class="console-stack" data-testid="ft8-console">
@@ -622,6 +642,12 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                     const isMine = Boolean(
                       effectiveCall && d.message.includes(effectiveCall)
                     );
+                    const parsed = parseFt8Decode(d.message);
+                    const fromNorm = parsed.from
+                      .replace(/[<>]/g, "")
+                      .trim()
+                      .toUpperCase();
+                    const isWorked = Boolean(fromNorm && workedCalls.has(fromNorm));
                     const showCycleGap =
                       idx > 0 && d.ts_sec !== filteredDecodes[idx - 1].ts_sec;
                     return (
@@ -648,7 +674,11 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                             </td>
                           </tr>
                         )}
-                        <tr class={isMine ? "row-mine" : isCq ? "row-cq" : ""}>
+                        <tr
+                          class={`${isMine ? "row-mine" : isCq ? "row-cq" : ""} ${
+                            isWorked ? "row-worked" : ""
+                          }`.trim()}
+                        >
                           <td>
                             {new Date(d.ts_sec * 1000).toISOString().slice(11, 19)}
                           </td>
@@ -793,6 +823,22 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
             >
               Cancel TX
             </button>
+            {activeSession?.cq && (
+              <>
+                <span class="badge badge-warn mono">
+                  CALLING CQ ({activeSession.cq.tx_slot.toUpperCase()})
+                </span>
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  onClick={() =>
+                    void runSessionCmd("qso.stop_cq", {}, "Stopped CQ")
+                  }
+                >
+                  Stop CQ
+                </button>
+              </>
+            )}
           </div>
 
           <div class="qso-queue">
@@ -964,18 +1010,34 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                           Resume
                         </button>
                       ) : (
-                        <button
-                          type="button"
-                          class="btn btn-secondary btn-xs"
-                          onClick={() =>
-                            void runSessionCmd("qso.action", {
-                              qso_id: q.qso_id,
-                              action: "pause",
-                            })
-                          }
-                        >
-                          Pause
-                        </button>
+                        <>
+                          {!isHeadActive && (
+                            <button
+                              type="button"
+                              class="btn btn-primary btn-xs"
+                              onClick={() =>
+                                void runSessionCmd("qso.action", {
+                                  qso_id: q.qso_id,
+                                  action: "arm",
+                                })
+                              }
+                            >
+                              Arm
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            class="btn btn-secondary btn-xs"
+                            onClick={() =>
+                              void runSessionCmd("qso.action", {
+                                qso_id: q.qso_id,
+                                action: "pause",
+                              })
+                            }
+                          >
+                            Pause
+                          </button>
+                        </>
                       )}
                       {idx > 0 && (
                         <>

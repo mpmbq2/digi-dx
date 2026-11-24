@@ -5,6 +5,7 @@ import type {
   ChannelRosterEntry,
   DecodeItem,
   RadioSummary,
+  SequencerMode,
 } from "../../types";
 import { parseFt8Decode } from "../../utils/maidenhead";
 import { CrossHighlightContext } from "./CrossHighlightContext";
@@ -16,7 +17,12 @@ import { QsoSwimlanes } from "./QsoSwimlanes";
 import { RadioControlBar } from "./RadioControlBar";
 import { resolveQsoIdentities } from "./qsoIdentityStore";
 import type { DigitalMode, HoverState } from "./types";
-import { getSubbandFreq, mapActiveQsoToStage, normalizeCall } from "./utils";
+import {
+  getSubbandFreq,
+  mapActiveQsoToStage,
+  normalizeCall,
+  resolveQsoRole,
+} from "./utils";
 import "./modern-ft8.css";
 
 interface Props {
@@ -256,13 +262,17 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
   );
 
   const activeQsos = activeSession?.active_qsos ?? [];
+  const realQsos = useMemo(
+    () => activeQsos.filter((q) => !q.is_cq),
+    [activeQsos]
+  );
   const sessionKey = activeSession
     ? `${activeSession.radio_id}:${activeSession.is_demo ? "demo" : "live"}:${activeSession.slot_clock.anchor_wall_ms}`
     : "";
 
   const identities = useMemo(
-    () => resolveQsoIdentities(sessionKey, activeQsos),
-    [sessionKey, activeQsos]
+    () => resolveQsoIdentities(sessionKey, realQsos),
+    [sessionKey, realQsos]
   );
 
   // Track stage advances and new inbound QSOs for swimlane / feed animations
@@ -276,12 +286,12 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
     const newlyAdv: string[] = [];
     const newlyInb: string[] = [];
 
-    for (const q of activeQsos) {
+    for (const q of realQsos) {
       const stage = mapActiveQsoToStage(q);
       nextMap.set(q.qso_id, { stage, step: q.step });
       const prev = prevMap.get(q.qso_id);
       if (!prev) {
-        if (stage === 0 && !q.is_cq) {
+        if (resolveQsoRole(q) === "hunter" || stage === 0) {
           newlyInb.push(q.qso_id);
         }
       } else if (stage > prev.stage || q.step !== prev.step) {
@@ -305,7 +315,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
         return next;
       });
     }
-  }, [activeQsos]);
+  }, [realQsos]);
 
   useEffect(() => {
     const hasAny =
@@ -356,28 +366,82 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
     return map;
   }, [daemon.channelRoster]);
 
-  const armedQso = useMemo(
-    () => activeQsos.find((q) => q.status === "active") ?? activeQsos[0] ?? null,
-    [activeQsos]
-  );
+  const workedCalls = useMemo(() => {
+    const isDemo = Boolean(activeSession?.is_demo);
+    const worked = isDemo ? daemon.workedDemoCalls : daemon.workedRealCalls;
+    const log = isDemo ? daemon.demoQsos : daemon.realQsos;
+    const set = new Set<string>();
+    for (const call of worked) {
+      const norm = normalizeCall(call);
+      if (norm) set.add(norm);
+    }
+    for (const item of log) {
+      const norm = normalizeCall(item.their_call);
+      if (norm) set.add(norm);
+    }
+    for (const item of daemon.sessionCompletedQsos) {
+      const norm = normalizeCall(item.qso.their_call);
+      if (norm) set.add(norm);
+    }
+    return set;
+  }, [
+    activeSession?.is_demo,
+    daemon.workedDemoCalls,
+    daemon.workedRealCalls,
+    daemon.demoQsos,
+    daemon.realQsos,
+    daemon.sessionCompletedQsos,
+  ]);
+
+  const armedQso = useMemo(() => {
+    const id = activeSession?.armed_qso_id;
+    if (!id) return null;
+    return realQsos.find((q) => q.qso_id === id && q.status === "active") ?? null;
+  }, [activeSession?.armed_qso_id, realQsos]);
   const armedIdentity = armedQso ? identities.get(armedQso.qso_id) ?? null : null;
+  const cqState = activeSession?.cq ?? null;
+  const sequencerMode: SequencerMode =
+    activeSession?.sequencer_mode ?? "auto_sequence";
 
   const handleArmQso = async (q: ActiveQso, afHz: number | null) => {
+    if (afHz !== null) {
+      setRxHz(afHz);
+    }
+    if (q.status === "paused") return;
+    await runRadioCmd("qso.action", { qso_id: q.qso_id, action: "arm" });
+  };
+
+  const handleSelectExistingQso = async (q: ActiveQso, afHz: number | null) => {
     if (afHz !== null) {
       setRxHz(afHz);
     }
     if (q.status === "paused") {
       await runRadioCmd("qso.action", { qso_id: q.qso_id, action: "resume" });
     }
-    await runRadioCmd("qso.action", { qso_id: q.qso_id, action: "move_to_top" });
+    await runRadioCmd("qso.action", { qso_id: q.qso_id, action: "arm" });
+  };
+
+  const handleTogglePauseQso = async (qsoId: string, pause: boolean) => {
+    await runRadioCmd("qso.action", {
+      qso_id: qsoId,
+      action: pause ? "pause" : "resume",
+    });
+  };
+
+  const handleStopCq = async () => {
+    await runRadioCmd("qso.stop_cq", {});
+  };
+
+  const handleSetSequencerMode = async (mode: SequencerMode) => {
+    await runRadioCmd("qso.set_sequencer_mode", { mode });
   };
 
   const handleCallDecode = async (callsign: string, dec: DecodeItem) => {
-    const existing = activeQsos.find(
-      (q) => !q.is_cq && normalizeCall(q.their_call) === normalizeCall(callsign)
+    const existing = realQsos.find(
+      (q) => normalizeCall(q.their_call) === normalizeCall(callsign)
     );
     if (existing) {
-      await handleArmQso(existing, dec.af_hz);
+      await handleSelectExistingQso(existing, dec.af_hz);
       return;
     }
     setRxHz(dec.af_hz);
@@ -448,9 +512,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
     let hz = Number.isFinite(hzAttr) && hzAttr > 0 ? hzAttr : null;
     let color = target.getAttribute("data-color");
 
-    const q = activeQsos.find(
-      (x) => !x.is_cq && normalizeCall(x.their_call) === norm
-    );
+    const q = realQsos.find((x) => normalizeCall(x.their_call) === norm);
     if (q) {
       color = identities.get(q.qso_id)?.color ?? color;
       if (!hz) hz = rosterFreqMap.get(norm) ?? null;
@@ -550,6 +612,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                     void daemon.sendCommand("session.stop", {}, undefined, rid ?? undefined)
                   }
                   onCallCq={() => void runRadioCmd("qso.call_cq", {})}
+                  onStopCq={() => void handleStopCq()}
                 />
 
                 <CycleProgressBar
@@ -562,6 +625,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                   txHz={txHz}
                   armedQso={armedQso}
                   armedIdentity={armedIdentity}
+                  cqState={cqState}
                 />
               </div>
 
@@ -595,7 +659,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                 txEnabled={Boolean(activeSession?.tx_enabled)}
                 evenOccupiedHz={daemon.evenOccupiedHz}
                 oddOccupiedHz={daemon.oddOccupiedHz}
-                activeQsos={activeQsos}
+                activeQsos={realQsos}
                 identities={identities}
                 rosterFreqMap={rosterFreqMap}
                 onChangeRxHz={setRxHz}
@@ -604,9 +668,11 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
             </section>
 
             <QsoSwimlanes
-              activeQsos={activeQsos}
+              activeQsos={realQsos}
               identities={identities}
               armedQsoId={armedQso?.qso_id ?? null}
+              cqState={cqState}
+              sequencerMode={sequencerMode}
               recentlyAdvancedQsoIds={recentlyAdvancedQsoIds}
               recentlyInboundQsoIds={recentlyInboundQsoIds}
               sessionCompletedQsos={daemon.sessionCompletedQsos}
@@ -615,19 +681,24 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
               rosterFreqMap={rosterFreqMap}
               rosterGridMap={rosterGridMap}
               onArmQso={(q, afHz) => void handleArmQso(q, afHz)}
+              onTogglePauseQso={(qsoId, pause) =>
+                void handleTogglePauseQso(qsoId, pause)
+              }
               onDismissQso={(qsoId) =>
                 void runRadioCmd("qso.action", { qso_id: qsoId, action: "abandon" })
               }
               onCompleteQso={(qsoId) =>
                 void runRadioCmd("qso.action", { qso_id: qsoId, action: "complete" })
               }
+              onStopCq={() => void handleStopCq()}
+              onSetSequencerMode={(mode) => void handleSetSequencerMode(mode)}
             />
 
             <ModernChannelRoster
               entries={daemon.channelRoster}
-              activeQsos={activeQsos}
+              activeQsos={realQsos}
               identities={identities}
-              sessionCompletedQsos={daemon.sessionCompletedQsos}
+              workedCalls={workedCalls}
               myGrid={effectiveMyGrid}
               digitalMode={effectiveMode}
               clockScale={
@@ -635,7 +706,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
               }
               sessionActive={Boolean(activeSession)}
               onCallRoster={(entry) => void handleCallRoster(entry)}
-              onArmQso={(q, afHz) => void handleArmQso(q, afHz)}
+              onArmQso={(q, afHz) => void handleSelectExistingQso(q, afHz)}
             />
           </div>
 
@@ -649,8 +720,9 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
               daemon.slotClock?.slot_ms ??
               (effectiveMode === "FT4" ? 7500 : 15000)
             }
-            activeQsos={activeQsos}
+            activeQsos={realQsos}
             identities={identities}
+            workedCalls={workedCalls}
             recentlyAdvancedQsoIds={recentlyAdvancedQsoIds}
             sessionActive={Boolean(activeSession)}
             onCallStation={(call, dec) => void handleCallDecode(call, dec)}

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
-import type { ActiveQso, SessionSnapshot, SlotClockSpec } from "../../types";
+import type { ActiveQso, CqState, SessionSnapshot, SlotClockSpec } from "../../types";
 import type { DigitalMode, QsoIdentity } from "./types";
-import { formatQsoNextTx } from "./utils";
+import { formatCqMessage, formatQsoNextTx } from "./utils";
 
 interface Props {
   slotClock: SlotClockSpec | null;
@@ -13,6 +13,7 @@ interface Props {
   txHz: number;
   armedQso: ActiveQso | null;
   armedIdentity: QsoIdentity | null;
+  cqState: CqState | null;
 }
 
 export function CycleProgressBar({
@@ -25,6 +26,7 @@ export function CycleProgressBar({
   txHz,
   armedQso,
   armedIdentity,
+  cqState,
 }: Props) {
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
@@ -47,11 +49,19 @@ export function CycleProgressBar({
   const isTxPhase = isTuning || txState === "transmitting";
   const phaseLabel = isTuning ? "TUNE" : isTxPhase ? "TX" : "RX";
 
-  let previewText = "IDLE — Click Call on any station to queue TX";
+  const isCqArmed = Boolean(cqState?.armed);
+  let previewText = "IDLE — Click CQ or Call a station to arm TX";
   if (isTuning) {
     previewText = "TUNE CARRIER ACTIVE";
   } else if (txState === "transmitting" && liveTxMessage) {
     previewText = `TX: ${liveTxMessage}`;
+  } else if (isCqArmed && cqState) {
+    const prefix = activeSession?.tx_enabled ? "TX: " : "QUEUED: ";
+    previewText = `${prefix}${formatCqMessage(
+      cqState,
+      activeSession?.my_call,
+      activeSession?.my_grid
+    )}`;
   } else if (armedQso) {
     const prefix = activeSession?.tx_enabled ? "TX: " : "QUEUED: ";
     previewText = `${prefix}${formatQsoNextTx(armedQso)}`;
@@ -88,17 +98,23 @@ export function CycleProgressBar({
 
       <div
         class={`mft8-tx-preview-box ${
-          isTxPhase || (activeSession?.tx_enabled && armedQso) ? "armed" : ""
+          isTxPhase || (activeSession?.tx_enabled && (armedQso || isCqArmed))
+            ? "armed"
+            : ""
         }`}
         data-testid="mft8-tx-preview"
       >
-        {armedIdentity && (
-          <span
-            class="mft8-q-pill"
-            style={{ background: armedIdentity.color }}
-          >
-            {armedIdentity.badge}
-          </span>
+        {isCqArmed ? (
+          <span class="mft8-q-pill mft8-q-pill-cq">CQ</span>
+        ) : (
+          armedIdentity && (
+            <span
+              class="mft8-q-pill"
+              style={{ background: armedIdentity.color }}
+            >
+              {armedIdentity.badge}
+            </span>
+          )
         )}
         <span class="mft8-tx-preview-msg">{previewText}</span>
         <span class="mft8-tx-preview-hz">{txHz} Hz</span>

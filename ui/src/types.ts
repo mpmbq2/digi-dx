@@ -210,6 +210,17 @@ export interface TranscriptEntry {
   message: string;
 }
 
+export type SequencerMode = "auto_sequence" | "manual";
+
+export interface CqState {
+  qso_id: string;
+  tx_slot: SlotParity;
+  directed_cq: string | null;
+  attempts: number;
+  armed: boolean;
+  started_at_utc: string;
+}
+
 export interface ActiveQso {
   qso_id: string;
   radio_id: string;
@@ -220,11 +231,13 @@ export interface ActiveQso {
   my_grid: string;
   their_call: string;
   their_grid: string | null;
+  their_role?: "caller" | "hunter" | null;
   tx_slot: SlotParity;
   step: string;
   status: "active" | "paused";
   attempts_on_step: number;
   last_their_snr_db: number | null;
+  last_rx_slot_ts?: number | null;
   rst_sent: string | null;
   rst_rcvd: string | null;
   started_at_utc: string;
@@ -280,6 +293,9 @@ export interface SessionSnapshot {
   tx_state: "idle" | "armed" | "transmitting";
   armed_message: string | null;
   survey_active: boolean;
+  sequencer_mode?: SequencerMode;
+  armed_qso_id?: string | null;
+  cq?: CqState | null;
   active_qsos: ActiveQso[];
   recent_decodes: DecodeItem[];
 }

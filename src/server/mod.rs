@@ -171,6 +171,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/radios/{radio_id}", get(routes::radio_detail))
         .route("/api/v1/commands", post(routes::dispatch_command))
         .route("/api/v1/qsos", get(routes::qsos))
+        .route("/api/v1/qsos/worked", get(routes::qsos_worked))
         .route("/api/v1/qsos/export.adi", get(routes::qsos_export_adi))
         .route("/api/v1/qrz/status", get(routes::qrz_status))
         .route("/api/v1/roster", get(routes::roster))
