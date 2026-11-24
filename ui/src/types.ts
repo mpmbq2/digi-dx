@@ -270,6 +270,7 @@ export interface SessionSnapshot {
   radio_id: string | null;
   is_demo: boolean;
   decoder_backend: string | null;
+  digital_mode?: "FT8" | "FT4";
   my_call: string | null;
   my_grid: string | null;
   slot_clock: SlotClockSpec;
@@ -281,6 +282,13 @@ export interface SessionSnapshot {
   survey_active: boolean;
   active_qsos: ActiveQso[];
   recent_decodes: DecodeItem[];
+}
+
+export interface CompletedSessionQso {
+  qso: QsoLogItem;
+  loggedSlotStartMs: number;
+  slotMsAtLog: number;
+  loggedAtWallMs: number;
 }
 
 export interface QsoLogItem {

@@ -221,6 +221,8 @@ pub enum WsBroadcastEvent {
         active: bool,
         is_demo: bool,
         decoder_backend: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digital_mode: Option<String>,
         slot_clock: SlotClockSpec,
     },
     Decode {
@@ -260,6 +262,8 @@ pub enum WsBroadcastEvent {
         radio_id: Option<String>,
         active: bool,
         is_demo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digital_mode: Option<String>,
         my_call: Option<String>,
         my_grid: Option<String>,
         tx_enabled: bool,
@@ -474,6 +478,8 @@ impl CommandBus {
             "tx.halt_emergency" => self.exec_halt_emergency(envelope).await,
             "session.start" => self.exec_session_start(envelope).await,
             "session.stop" => self.exec_session_stop(envelope).await,
+            "session.set_mode" => self.exec_session_set_mode(envelope).await,
+            "tx.tune" => self.exec_tx_tune(envelope).await,
             "tx.arm" => self.exec_tx_arm(envelope).await,
             "tx.cancel" => self.exec_tx_cancel(envelope).await,
             "qso.call_cq" => self.exec_qso_call_cq(envelope).await,
@@ -1155,6 +1161,7 @@ impl CommandBus {
             );
         };
 
+        self.sessions.stop_tune(Some(&radio_id)).await;
         self.sessions.abort_active_tx(&radio_id).await;
         self.watchdog
             .trigger_abort(&radio_id, WatchdogAbortReason::LeaseReleased)
@@ -1308,9 +1315,10 @@ impl CommandBus {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let scale = envelope.payload.get("scale").and_then(Value::as_f64);
+        let mode = envelope.payload.get("mode").and_then(Value::as_str);
         match self
             .sessions
-            .start_session(&radio_id, &envelope.actor, demo, scale)
+            .start_session_with_mode(&radio_id, &envelope.actor, demo, scale, mode)
             .await
         {
             Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
@@ -1326,6 +1334,65 @@ impl CommandBus {
     async fn exec_session_stop(&self, envelope: &CommandEnvelope) -> CommandAck {
         let radio_id = resolve_radio_id(envelope);
         match self.sessions.stop_session(radio_id.as_deref()).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_session_set_mode(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let mode = envelope
+            .payload
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match self.sessions.set_session_mode(&radio_id, mode).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_tx_tune(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let Some(radio_id) = resolve_radio_id(envelope) else {
+            return CommandAck::err(
+                envelope.command_id.clone(),
+                CommandStatus::Rejected,
+                ErrorCode::ValidationFailed,
+                "radio_id is required",
+            );
+        };
+        let enabled = envelope
+            .payload
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let af_hz = envelope
+            .payload
+            .get("af_hz")
+            .and_then(Value::as_u64)
+            .map(|n| n as u16);
+        match self
+            .sessions
+            .set_tune(&radio_id, &envelope.actor, enabled, af_hz)
+            .await
+        {
             Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
             Err((code, msg)) => CommandAck::err(
                 envelope.command_id.clone(),
@@ -1695,6 +1762,8 @@ fn requires_lease(kind: &str) -> bool {
             | "control.heartbeat"
             | "session.start"
             | "session.stop"
+            | "session.set_mode"
+            | "tx.tune"
             | "tx.arm"
             | "tx.cancel"
             | "qso.call_cq"
@@ -1991,6 +2060,65 @@ fn validate_command(envelope: &CommandEnvelope) -> Result<(), (ErrorCode, String
                     return Err((
                         ErrorCode::ValidationFailed,
                         "scale must be a finite value between 0 and 100".to_string(),
+                    ));
+                }
+            }
+            if let Some(mode_val) = envelope.payload.get("mode") {
+                let Some(mode_str) = mode_val.as_str() else {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        "mode must be 'FT8' or 'FT4'".to_string(),
+                    ));
+                };
+                let up = mode_str.trim().to_ascii_uppercase();
+                if up != "FT8" && up != "FT4" {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        format!("unsupported mode '{mode_str}' (expected FT8 or FT4)"),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "session.set_mode" => {
+            let mode = envelope
+                .payload
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
+            if mode != "FT8" && mode != "FT4" {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "mode must be 'FT8' or 'FT4'".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "tx.tune" => {
+            if envelope
+                .payload
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .is_none()
+            {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "enabled boolean is required for tx.tune".to_string(),
+                ));
+            }
+            if let Some(af_val) = envelope.payload.get("af_hz") {
+                let Some(af) = af_val.as_i64() else {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        "af_hz must be an integer between 200 and 3000".to_string(),
+                    ));
+                };
+                if !(200..=3000).contains(&af) {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        format!("af_hz {af} outside valid range 200..=3000"),
                     ));
                 }
             }

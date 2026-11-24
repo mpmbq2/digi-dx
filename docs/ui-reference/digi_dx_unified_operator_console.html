@@ -1,0 +1,3098 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Digi-DX — Unified Operator Console</title>
+  <style>
+    /* =========================================================================
+       DESIGN TOKENS & BASE RESET (ZERO EXTERNAL DEPENDENCIES)
+       ========================================================================= */
+    :root {
+      --bg-canvas: #0b0f17;
+      --bg-panel: #111827;
+      --bg-panel-head: #151e2e;
+      --bg-card: #162032;
+      --bg-inset: #080c13;
+      --bg-hover: #1d2a40;
+      --border: #1f2937;
+      --border-strong: #30415c;
+
+      --text-primary: #e5ecf6;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+
+      --cyan: #38bdf8;
+      --amber: #f59e0b;
+      --magenta: #e879f9;
+      --emerald: #34d399;
+      --violet: #a78bfa;
+      --coral: #fb7185;
+      --red: #ef4444;
+
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background-color: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 12.5px;
+      line-height: 1.38;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .mono {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Crisp dark scrollbars */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0a0e16;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #27354d;
+      border-radius: 99px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #3b4f70;
+    }
+
+    /* =========================================================================
+       ANIMATIONS & CROSS-HIGHLIGHTING
+       ========================================================================= */
+    @keyframes qsoAdvancePulse {
+      0% {
+        box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.85), inset 0 0 24px rgba(52, 211, 153, 0.35);
+        transform: translateX(-8px);
+      }
+      45% {
+        box-shadow: 0 0 0 8px rgba(52, 211, 153, 0), inset 0 0 12px rgba(52, 211, 153, 0.14);
+        transform: translateX(0);
+      }
+      100% {
+        box-shadow: 0 0 0 0 rgba(52, 211, 153, 0), inset 0 0 0 rgba(52, 211, 153, 0);
+        transform: translateX(0);
+      }
+    }
+
+    @keyframes inboundFlash {
+      0% {
+        box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.85), inset 0 0 24px rgba(245, 158, 11, 0.32);
+      }
+      60% {
+        box-shadow: 0 0 0 7px rgba(245, 158, 11, 0), inset 0 0 8px rgba(245, 158, 11, 0.1);
+      }
+      100% {
+        box-shadow: 0 0 0 0 rgba(245, 158, 11, 0), inset 0 0 0 rgba(245, 158, 11, 0);
+      }
+    }
+
+    @keyframes badgePop {
+      0% { opacity: 0; transform: scale(0.82); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    .anim-advanced {
+      animation: qsoAdvancePulse 1.8s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .anim-inbound {
+      animation: inboundFlash 1.8s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .anim-pop {
+      animation: badgePop 0.32s ease-out;
+    }
+
+    /* Bidirectional Hover Sync across Swimlanes, Batch Feed & Roster */
+    .sync-hover {
+      outline: 1.5px solid #38bdf8 !important;
+      outline-offset: -1px;
+      background-color: rgba(56, 189, 248, 0.15) !important;
+      box-shadow: 0 0 14px rgba(56, 189, 248, 0.25) !important;
+      position: relative;
+      z-index: 4;
+    }
+
+    /* =========================================================================
+       OVERALL 2-COLUMN ASYMMETRIC LAYOUT (66% / 34% WITH FLIP SUPPORT)
+       ========================================================================= */
+    .console-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+      gap: 10px;
+      padding: 10px;
+      min-height: 100vh;
+      align-items: start;
+    }
+
+    .console-grid.feed-left {
+      grid-template-columns: minmax(320px, 1fr) minmax(0, 2fr);
+    }
+    .console-grid.feed-left .main-column {
+      order: 2;
+    }
+    .console-grid.feed-left .feed-column {
+      order: 1;
+    }
+
+    .main-column {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .feed-column {
+      position: sticky;
+      top: 10px;
+      height: calc(100vh - 20px);
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    /* Panel Chrome */
+    .panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .panel-header {
+      background: var(--bg-panel-head);
+      border-bottom: 1px solid var(--border);
+      padding: 6px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-secondary);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .count-chip {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      background: var(--bg-inset);
+      border: 1px solid var(--border-strong);
+      color: var(--text-secondary);
+      padding: 0 6px;
+      border-radius: 99px;
+      line-height: 17px;
+    }
+
+    /* =========================================================================
+       BUTTONS, PILLS, TAGS
+       ========================================================================= */
+    .btn {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      padding: 4px 9px;
+      border-radius: 6px;
+      border: 1px solid var(--border-strong);
+      background: #182336;
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.12s ease, border-color 0.12s ease, transform 0.06s ease;
+    }
+    .btn:hover {
+      background: #22314a;
+      border-color: #4b658c;
+    }
+    .btn:active {
+      transform: scale(0.97);
+    }
+
+    .btn-primary {
+      background: #10b981;
+      border-color: #34d399;
+      color: #032116;
+      font-weight: 700;
+    }
+    .btn-primary:hover {
+      background: #23cd94;
+      border-color: #6ee7b7;
+    }
+
+    .btn-tx-armed {
+      background: rgba(239, 68, 68, 0.22);
+      border-color: rgba(239, 68, 68, 0.72);
+      color: #fecaca;
+      font-weight: 700;
+    }
+    .btn-tx-armed:hover {
+      background: rgba(239, 68, 68, 0.32);
+    }
+
+    .btn-rx-only {
+      background: rgba(100, 116, 139, 0.18);
+      border-color: rgba(100, 116, 139, 0.5);
+      color: #cbd5e1;
+    }
+
+    .btn-amber {
+      background: rgba(245, 158, 11, 0.16);
+      border-color: rgba(245, 158, 11, 0.45);
+      color: #fcd34d;
+    }
+    .btn-amber:hover {
+      background: rgba(245, 158, 11, 0.26);
+    }
+
+    .btn-auto.active {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: rgba(56, 189, 248, 0.7);
+      color: #bae6fd;
+    }
+
+    .btn-xs {
+      padding: 2px 6px;
+      font-size: 10.5px;
+      border-radius: 4px;
+    }
+
+    .btn-call {
+      background: rgba(56, 189, 248, 0.14);
+      border-color: rgba(56, 189, 248, 0.42);
+      color: #7dd3fc;
+      font-family: var(--font-mono);
+      font-weight: 700;
+    }
+    .btn-call:hover {
+      background: #38bdf8;
+      border-color: #38bdf8;
+      color: #061826;
+    }
+
+    .btn-qrz {
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      padding: 2px 5px;
+      border-radius: 4px;
+      border: 1px solid #2c3e59;
+      background: #101929;
+      color: #93c5fd;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 600;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    }
+    .btn-qrz:hover {
+      background: #1e3252;
+      border-color: #60a5fa;
+      color: #fff;
+    }
+
+    .btn-arm-chip {
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      font-weight: 700;
+      padding: 2px 5px;
+      border-radius: 4px;
+      border: 1px solid #30415c;
+      background: #0e1624;
+      color: #94a3b8;
+      cursor: pointer;
+    }
+    .btn-arm-chip:hover {
+      border-color: #ef4444;
+      color: #fecaca;
+    }
+    .btn-arm-chip.armed {
+      background: rgba(239, 68, 68, 0.25);
+      border-color: #ef4444;
+      color: #fecaca;
+    }
+
+    .btn-dismiss {
+      appearance: none;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text-muted);
+      font-size: 12px;
+      line-height: 1;
+      padding: 1px 4px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .btn-dismiss:hover {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: #fda4af;
+    }
+
+    .q-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      font-weight: 800;
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: #07101b;
+      line-height: 1.3;
+      flex-shrink: 0;
+    }
+
+    .q-pill-log {
+      background: #334155;
+      color: #cbd5e1;
+      border: 1px solid #475569;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 700;
+      padding: 1px 4px;
+      border-radius: 3px;
+      border: 1px solid transparent;
+      line-height: 1.25;
+      white-space: nowrap;
+    }
+    .tag-sota {
+      background: rgba(245, 158, 11, 0.16);
+      color: #fcd34d;
+      border-color: rgba(245, 158, 11, 0.42);
+    }
+    .tag-pota {
+      background: rgba(52, 211, 153, 0.16);
+      color: #6ee7b7;
+      border-color: rgba(52, 211, 153, 0.42);
+    }
+    .tag-dx {
+      background: rgba(167, 139, 250, 0.16);
+      color: #ddd6fe;
+      border-color: rgba(167, 139, 250, 0.42);
+    }
+    .tag-adv {
+      background: rgba(16, 185, 129, 0.24);
+      color: #6ee7b7;
+      border-color: rgba(52, 211, 153, 0.65);
+    }
+    .tag-stall {
+      background: rgba(245, 158, 11, 0.18);
+      color: #fbbf24;
+      border-color: rgba(245, 158, 11, 0.5);
+    }
+
+    .snr-hi { color: #34d399; font-weight: 700; }
+    .snr-mid { color: #7dd3fc; font-weight: 700; }
+    .snr-lo { color: #fbbf24; font-weight: 700; }
+
+    /* =========================================================================
+       PANEL 1: TOP TELEMETRY BAR + INTERACTIVE WATERFALL
+       ========================================================================= */
+    .telemetry-bar {
+      padding: 7px 10px;
+      background: var(--bg-panel-head);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .telem-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .telem-group {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .brand-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 800;
+      font-size: 13px;
+      color: #fff;
+      letter-spacing: -0.01em;
+    }
+    .brand-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--cyan);
+      box-shadow: 0 0 8px var(--cyan);
+    }
+
+    .rig-pill {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 5px;
+      background: var(--bg-inset);
+      border: 1px solid var(--border-strong);
+      color: #bae6fd;
+    }
+    .rig-pill.dial {
+      color: #fde68a;
+      border-color: rgba(245, 158, 11, 0.35);
+    }
+
+    .mode-switch {
+      display: inline-flex;
+      background: var(--bg-inset);
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
+    }
+    .mode-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .mode-btn.active {
+      background: rgba(56, 189, 248, 0.2);
+      color: #e0f2fe;
+    }
+
+    /* Cycle Timer & Active TX Preview Row */
+    .cycle-timer-box {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg-inset);
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 3px 8px;
+      min-width: 240px;
+      flex: 1 1 250px;
+      max-width: 380px;
+    }
+    .cycle-timer-label {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .slot-badge {
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 800;
+    }
+    .slot-even {
+      background: rgba(56, 189, 248, 0.18);
+      color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.45);
+    }
+    .slot-odd {
+      background: rgba(167, 139, 250, 0.2);
+      color: #ddd6fe;
+      border: 1px solid rgba(167, 139, 250, 0.45);
+    }
+
+    .cycle-bar-track {
+      flex: 1;
+      height: 6px;
+      background: #172133;
+      border-radius: 99px;
+      overflow: hidden;
+      min-width: 60px;
+    }
+    .cycle-bar-fill {
+      height: 100%;
+      width: 35%;
+      background: linear-gradient(90deg, #38bdf8, #34d399);
+      border-radius: 99px;
+      transition: width 0.08s linear;
+    }
+    .cycle-bar-fill.tx-mode {
+      background: linear-gradient(90deg, #f59e0b, #ef4444);
+    }
+
+    .tx-preview-box {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      background: var(--bg-inset);
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 3px 9px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      flex: 1 1 240px;
+      min-width: 0;
+    }
+    .tx-preview-box.armed {
+      border-color: rgba(239, 68, 68, 0.55);
+      background: rgba(239, 68, 68, 0.09);
+    }
+    .tx-preview-msg {
+      color: #fff;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tx-preview-hz {
+      color: #fca5a5;
+      margin-left: auto;
+      white-space: nowrap;
+      font-size: 10.5px;
+    }
+
+    /* Interactive Waterfall Container */
+    .waterfall-wrap {
+      position: relative;
+      background: #050912;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    .wf-ruler {
+      position: relative;
+      height: 28px;
+      background: #0a101d;
+      border-bottom: 1px solid #1e293b;
+      overflow: hidden;
+      cursor: crosshair;
+    }
+
+    .wf-stage {
+      position: relative;
+      height: 130px;
+      width: 100%;
+      overflow: hidden;
+      cursor: crosshair;
+    }
+
+    #waterfall-canvas,
+    #waterfall-overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    #waterfall-overlay {
+      pointer-events: none;
+    }
+
+    .wf-hint {
+      position: absolute;
+      right: 8px;
+      bottom: 5px;
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      color: rgba(148, 163, 184, 0.72);
+      background: rgba(8, 12, 19, 0.72);
+      padding: 1px 6px;
+      border-radius: 4px;
+      pointer-events: none;
+      z-index: 5;
+    }
+
+    /* Draggable TX / RX Bracket Markers on Ruler */
+    .wf-bracket {
+      position: absolute;
+      bottom: 0;
+      height: 13px;
+      transform: translateX(-50%);
+      border-top: 2px solid;
+      border-left: 2px solid;
+      border-right: 2px solid;
+      border-radius: 3px 3px 0 0;
+      cursor: ew-resize;
+      z-index: 6;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+    }
+    .wf-bracket-label {
+      position: absolute;
+      top: -13px;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 800;
+      padding: 0 3px;
+      border-radius: 3px;
+      line-height: 12px;
+      white-space: nowrap;
+      pointer-events: none;
+    }
+    .wf-bracket-tx {
+      border-color: #ef4444;
+      background: rgba(239, 68, 68, 0.25);
+    }
+    .wf-bracket-tx .wf-bracket-label {
+      background: #ef4444;
+      color: #fff;
+    }
+    .wf-bracket-rx {
+      border-color: #22c55e;
+      background: rgba(34, 197, 94, 0.22);
+    }
+    .wf-bracket-rx .wf-bracket-label {
+      background: #22c55e;
+      color: #032110;
+    }
+
+    /* Active QSO color diamonds along top ruler */
+    .wf-qso-diamond {
+      position: absolute;
+      top: 4px;
+      width: 8px;
+      height: 8px;
+      transform: translateX(-50%) rotate(45deg);
+      border: 1px solid #060a12;
+      z-index: 5;
+      pointer-events: auto;
+      cursor: pointer;
+    }
+
+    /* =========================================================================
+       PANEL 2: ACTIVE QSO SEQUENCERS (5-LANE ATC FLIGHT STRIPS + SESSION DRAWER)
+       ========================================================================= */
+    .swimlanes-board {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(88px, 112px);
+      gap: 6px;
+      padding: 8px;
+      background: #0d131f;
+    }
+
+    .lane {
+      background: #0f1726;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      display: flex;
+      flex-direction: column;
+      min-height: 148px;
+      min-width: 0;
+    }
+
+    .lane.lane-logged {
+      background: #0b101a;
+      border-color: #1c2433;
+    }
+
+    .lane-head {
+      padding: 5px 7px;
+      background: #141d2e;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      color: var(--text-secondary);
+      border-radius: 6px 6px 0 0;
+    }
+    .lane.lane-logged .lane-head {
+      background: #111622;
+      color: var(--text-muted);
+      padding: 5px 5px;
+    }
+
+    .lane-body {
+      padding: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex: 1;
+    }
+    .lane.lane-logged .lane-body {
+      padding: 5px 4px;
+      gap: 4px;
+    }
+
+    .lane-empty {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      font-size: 10.5px;
+      color: #475569;
+      border: 1px dashed #1e293b;
+      border-radius: 5px;
+      padding: 10px 4px;
+    }
+
+    /* Flight Strip QSO Card */
+    .qso-strip {
+      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      border-left-width: 4px;
+      border-radius: 6px;
+      padding: 6px 7px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease;
+      min-width: 0;
+    }
+    .qso-strip:hover {
+      background: var(--bg-hover);
+    }
+    .qso-strip.is-armed {
+      border-color: rgba(239, 68, 68, 0.65);
+      background: #192438;
+    }
+
+    .strip-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      min-width: 0;
+    }
+    .strip-id {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-width: 0;
+    }
+    .strip-call {
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      font-weight: 800;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .strip-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-secondary);
+      flex-wrap: wrap;
+    }
+
+    .strip-msgs {
+      background: var(--bg-inset);
+      border: 1px solid #1e293b;
+      border-radius: 4px;
+      padding: 3px 5px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .strip-msg-line {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .strip-msg-rx { color: #94a3b8; }
+    .strip-msg-tx { color: #e2e8f0; font-weight: 700; }
+    .strip-msg-tx.armed { color: #fca5a5; }
+
+    .strip-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      margin-top: 1px;
+    }
+
+    /* Ultra-Minimal Grey Logged Mini-Chip */
+    .logged-chip {
+      background: #161c26;
+      border: 1px solid #2b3445;
+      border-left: 3px solid #64748b;
+      border-radius: 5px;
+      padding: 4px 5px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      color: #94a3b8;
+      filter: grayscale(100%);
+      opacity: 0.88;
+      cursor: default;
+    }
+    .logged-chip-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 3px;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-weight: 700;
+      color: #cbd5e1;
+    }
+    .logged-chip-call {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .logged-chip-cyc {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: #94a3b8;
+      background: #0d121a;
+      border: 1px solid #2c3545;
+      padding: 0 4px;
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+
+    /* Collapsible "Logged This Session (N)" Drawer at bottom of Swimlanes Panel */
+    .session-drawer {
+      border-top: 1px solid var(--border);
+      background: #0d131f;
+    }
+    .session-drawer-toggle {
+      width: 100%;
+      appearance: none;
+      border: none;
+      background: #111827;
+      color: var(--text-secondary);
+      padding: 6px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      transition: background 0.12s ease, color 0.12s ease;
+    }
+    .session-drawer-toggle:hover {
+      background: #172135;
+      color: #e2e8f0;
+    }
+    .session-drawer-body {
+      border-top: 1px solid var(--border);
+      background: #090e17;
+      max-height: 190px;
+      overflow: auto;
+    }
+
+    /* =========================================================================
+       PANEL 3: DENSE CHANNEL ROSTER TABLE
+       ========================================================================= */
+    .roster-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .dark-select, .dark-input {
+      background: var(--bg-inset);
+      color: var(--text-primary);
+      border: 1px solid var(--border-strong);
+      border-radius: 5px;
+      padding: 3px 7px;
+      font-size: 11px;
+      font-family: var(--font-sans);
+      outline: none;
+    }
+    .dark-input {
+      font-family: var(--font-mono);
+      width: 120px;
+    }
+    .dark-select:focus, .dark-input:focus {
+      border-color: var(--cyan);
+    }
+
+    .pill-group {
+      display: inline-flex;
+      gap: 3px;
+      flex-wrap: wrap;
+    }
+    .filter-pill {
+      appearance: none;
+      background: var(--bg-inset);
+      border: 1px solid var(--border-strong);
+      color: var(--text-secondary);
+      font-size: 10.5px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 99px;
+      cursor: pointer;
+    }
+    .filter-pill:hover {
+      color: #fff;
+      border-color: #4b658c;
+    }
+    .filter-pill.active {
+      background: rgba(56, 189, 248, 0.18);
+      border-color: rgba(56, 189, 248, 0.6);
+      color: #bae6fd;
+    }
+
+    .table-scroll {
+      overflow-x: auto;
+      width: 100%;
+    }
+
+    table.dense-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 11.5px;
+    }
+    table.dense-table th {
+      background: #0d1320;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 5px 8px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      user-select: none;
+    }
+    table.dense-table th.sortable {
+      cursor: pointer;
+    }
+    table.dense-table th.sortable:hover {
+      color: #e2e8f0;
+      background: #141e30;
+    }
+    table.dense-table th.sorted {
+      color: var(--cyan);
+    }
+
+    table.dense-table td {
+      padding: 3px 8px;
+      height: 29px;
+      border-bottom: 1px solid rgba(31, 41, 55, 0.72);
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    table.dense-table tbody tr:hover {
+      background: var(--bg-hover);
+    }
+    table.dense-table tr.stale-row td {
+      opacity: 0.62;
+    }
+    table.dense-table tr.bucket-divider td {
+      background: rgba(56, 189, 248, 0.06);
+      color: #7dd3fc;
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      font-weight: 700;
+      height: 20px;
+      padding: 2px 8px;
+      letter-spacing: 0.04em;
+    }
+    table.dense-table tr.bucket-divider.stale td {
+      background: rgba(100, 116, 139, 0.08);
+      color: var(--text-muted);
+    }
+
+    .slot-letter {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 17px;
+      height: 17px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 800;
+    }
+    .slot-E {
+      background: rgba(56, 189, 248, 0.16);
+      color: #7dd3fc;
+    }
+    .slot-O {
+      background: rgba(167, 139, 250, 0.18);
+      color: #ddd6fe;
+    }
+
+    .roster-msg-cell {
+      max-width: 190px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--text-secondary);
+    }
+
+    .actions-cell {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      justify-content: flex-end;
+    }
+
+    /* =========================================================================
+       RIGHT COLUMN: SPLIT-RAIL LIVE BATCH FEED
+       ========================================================================= */
+    .feed-panel {
+      height: 100%;
+    }
+
+    .feed-scroll {
+      flex: 1;
+      overflow-y: auto;
+      background: #0c111b;
+    }
+
+    .cycle-block {
+      border-bottom: 2px solid #1e293b;
+    }
+    .cycle-block.older {
+      opacity: 0.72;
+    }
+
+    .cycle-block-head {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      background: #131c2c;
+      border-bottom: 1px solid #243248;
+      padding: 5px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .feed-section-head {
+      padding: 3px 10px;
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(31, 41, 55, 0.85);
+    }
+    .sec-me {
+      background: rgba(244, 63, 94, 0.12);
+      color: #fda4af;
+    }
+    .sec-cq {
+      background: rgba(52, 211, 153, 0.1);
+      color: #6ee7b7;
+    }
+    .sec-others {
+      background: rgba(100, 116, 139, 0.12);
+      color: #94a3b8;
+    }
+
+    .decode-row {
+      padding: 4px 8px 4px 9px;
+      border-bottom: 1px solid rgba(31, 41, 55, 0.55);
+      border-left: 3px solid transparent;
+      display: grid;
+      grid-template-columns: 36px 46px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      cursor: pointer;
+      transition: background 0.1s ease;
+    }
+    .decode-row:hover {
+      background: var(--bg-hover);
+    }
+    .decode-row.in-qso {
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .dec-snr {
+      text-align: right;
+      font-size: 10.5px;
+    }
+    .dec-hz {
+      color: var(--text-muted);
+      font-size: 10px;
+      text-align: right;
+    }
+    .dec-msg {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--text-primary);
+    }
+    .decode-row.in-qso .dec-msg {
+      color: #fff;
+    }
+    .dec-badges {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      justify-content: flex-end;
+    }
+
+    /* =========================================================================
+       RESPONSIVE ADJUSTMENTS
+       ========================================================================= */
+    @media (max-width: 1220px) {
+      .swimlanes-board {
+        grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(92px, 110px);
+      }
+    }
+
+    @media (max-width: 980px) {
+      .console-grid,
+      .console-grid.feed-left {
+        grid-template-columns: 1fr;
+      }
+      .console-grid.feed-left .main-column,
+      .console-grid.feed-left .feed-column {
+        order: initial;
+      }
+      .feed-column {
+        position: static;
+        height: 460px;
+      }
+      .swimlanes-board {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="console-grid" class="console-grid">
+    <!-- =======================================================================
+         LEFT COLUMN (~66%): WATERFALL/STATE -> SWIMLANES -> ROSTER TABLE
+         ======================================================================= -->
+    <div class="main-column">
+      <!-- PANEL 1: CYCLE TIMER, RIG STATE & INTERACTIVE WATERFALL -->
+      <section class="panel" id="panel-waterfall">
+        <div class="telemetry-bar">
+          <!-- Row 1: Identity, Rig, Mode & Simulator Controls -->
+          <div class="telem-row">
+            <div class="telem-group">
+              <span class="brand-chip"><span class="brand-dot"></span>Digi-DX</span>
+              <span class="rig-pill">K1VT · FN34</span>
+              <span class="rig-pill dial">20m · 14.074 MHz</span>
+              <div class="mode-switch" id="mode-switch" role="group" aria-label="Digital Mode">
+                <button type="button" class="mode-btn active" data-mode="FT8">FT8 15s</button>
+                <button type="button" class="mode-btn" data-mode="FT4">FT4 7.5s</button>
+              </div>
+              <button type="button" id="btn-tx-enable" class="btn btn-tx-armed">● TX ARMED</button>
+            </div>
+
+            <div class="telem-group">
+              <button type="button" id="btn-next-batch" class="btn btn-primary">▶ Next Batch</button>
+              <button type="button" id="btn-auto-cycle" class="btn btn-auto">⟳ Auto-Cycle</button>
+              <button type="button" id="btn-inject-caller" class="btn btn-amber">+ Inject Caller</button>
+              <button type="button" id="btn-flip-feed" class="btn" title="Swap Live Batch Feed between Right and Left">⇄ Flip Feed</button>
+            </div>
+          </div>
+
+          <!-- Row 2: Live Cycle Countdown & Active TX Message Preview -->
+          <div class="telem-row">
+            <div class="cycle-timer-box">
+              <div class="cycle-timer-label">
+                <span id="telem-utc">23:45:15</span>
+                <span id="telem-slot" class="slot-badge slot-odd">ODD</span>
+                <span id="telem-phase" style="color:#6ee7b7">RX</span>
+                <span id="telem-countdown" style="color:#fff">11.4s</span>
+              </div>
+              <div class="cycle-bar-track">
+                <div id="cycle-bar-fill" class="cycle-bar-fill"></div>
+              </div>
+            </div>
+
+            <div id="tx-preview-box" class="tx-preview-box armed">
+              <span id="tx-preview-badge" class="q-pill" style="background:#38bdf8">Q1</span>
+              <span id="tx-preview-msg" class="tx-preview-msg">TX: JA1XMP K1VT RR73</span>
+              <span id="tx-preview-hz" class="tx-preview-hz">1420 Hz</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Interactive RF Waterfall Plot -->
+        <div class="waterfall-wrap" id="waterfall-wrap">
+          <div class="wf-ruler" id="wf-ruler" title="Click to set RX · Shift+Click to set TX · Drag handles"></div>
+          <div class="wf-stage" id="wf-stage" title="Click to tune RX · Shift+Click to set TX">
+            <canvas id="waterfall-canvas"></canvas>
+            <canvas id="waterfall-overlay"></canvas>
+            <div class="wf-hint">Click: RX Hz · Shift+Click: TX Hz · Drag Brackets · Hover any station for Freq Beam</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- PANEL 2: ACTIVE QSO SEQUENCERS (4 ACTIVE LANES + MINIMAL LOGGED LANE + COLLAPSIBLE SESSION DRAWER) -->
+      <section class="panel" id="panel-swimlanes">
+        <div class="panel-header">
+          <h2 class="panel-title">
+            Active QSO Sequencers
+            <span id="active-qso-count" class="count-chip">4</span>
+          </h2>
+          <span style="font-size:11px;color:var(--text-muted)">
+            ATC Flight Strips · Logged contacts turn grey &amp; auto-archive after 2 cycles
+          </span>
+        </div>
+
+        <div id="swimlanes-board" class="swimlanes-board"></div>
+
+        <!-- Collapsible "Logged This Session (N)" Drawer (hidden by default) -->
+        <div class="session-drawer" id="session-drawer">
+          <button type="button" class="session-drawer-toggle" id="btn-toggle-session-log" aria-expanded="false">
+            <span id="session-log-label">▸ Logged This Session (1)</span>
+            <span style="color:var(--text-muted);font-weight:500">Click to expand archived session QSOs</span>
+          </button>
+          <div id="session-drawer-body" class="session-drawer-body" style="display:none"></div>
+        </div>
+      </section>
+
+      <!-- PANEL 3: CHANNEL ROSTER (COMPACT HIGH-DENSITY TABLE) -->
+      <section class="panel" id="panel-roster">
+        <div class="panel-header">
+          <h2 class="panel-title">
+            Channel Roster
+            <span id="roster-count" class="count-chip">14</span>
+          </h2>
+
+          <div class="roster-controls">
+            <select id="roster-sort-preset" class="dark-select" aria-label="Roster Sort Preset">
+              <option value="fresh_dist">Fresh (≤2 cyc) → Distance ↓</option>
+              <option value="strict_dist">Strict Last Seen → Distance ↓</option>
+              <option value="snr_desc">SNR ↓</option>
+              <option value="dist_desc">Distance ↓</option>
+              <option value="freq_asc">Freq ↑</option>
+            </select>
+
+            <div class="pill-group" id="roster-filters" role="group" aria-label="Roster Quick Filter">
+              <button type="button" class="filter-pill active" data-filter="all">All</button>
+              <button type="button" class="filter-pill" data-filter="cq">CQ Only</button>
+              <button type="button" class="filter-pill" data-filter="sotapota">SOTA/POTA</button>
+              <button type="button" class="filter-pill" data-filter="inqso">In QSO</button>
+            </div>
+
+            <input type="text" id="roster-search" class="dark-input" placeholder="Call / Grid..." aria-label="Search callsign or grid" />
+          </div>
+        </div>
+
+        <div class="table-scroll" id="roster-table-wrap"></div>
+      </section>
+    </div>
+
+    <!-- =======================================================================
+         RIGHT COLUMN (~34%): FULL-HEIGHT SPLIT-RAIL LIVE BATCH FEED
+         ======================================================================= -->
+    <aside class="feed-column">
+      <section class="panel feed-panel">
+        <div class="panel-header">
+          <h2 class="panel-title">
+            Live Batch Feed
+            <span id="feed-batch-count" class="count-chip">2 cycles</span>
+          </h2>
+          <span style="font-size:10.5px;color:var(--text-muted)">QSO colors persist across all 3 sections</span>
+        </div>
+        <div id="live-batch-feed" class="feed-scroll"></div>
+      </section>
+    </aside>
+  </div>
+
+  <script>
+    (function () {
+      'use strict';
+
+      /* =======================================================================
+         CONSTANTS & COLOR PALETTE
+         ======================================================================= */
+      const MY_CALL = 'K1VT';
+      const MY_GRID = 'FN34';
+      const WF_MIN_HZ = 200;
+      const WF_MAX_HZ = 3000;
+
+      const QSO_PALETTE = [
+        '#38bdf8', // Q1 Cyan
+        '#f59e0b', // Q2 Amber
+        '#e879f9', // Q3 Magenta
+        '#34d399', // Q4 Emerald
+        '#a78bfa', // Q5 Violet
+        '#fb7185'  // Q6 Coral
+      ];
+
+      const SURPRISE_CALLERS = [
+        { callsign: 'HB9SOTA', grid: 'JN47', distanceKm: 6040,  snr: -6,  freqHz: 1510, tags: ['SOTA', 'DX'] },
+        { callsign: 'VK3POTA', grid: 'QF22', distanceKm: 16480, snr: -15, freqHz: 1860, tags: ['POTA', 'DX'] },
+        { callsign: 'KH6DX',   grid: 'BL11', distanceKm: 7980,  snr: -11, freqHz: 2290, tags: ['DX'] },
+        { callsign: 'W1POTA',  grid: 'FN42', distanceKm: 280,   snr: +5,  freqHz: 960,  tags: ['POTA'] },
+        { callsign: 'TF3DX',   grid: 'HP94', distanceKm: 4160,  snr: -4,  freqHz: 1325, tags: ['DX'] }
+      ];
+
+      /* =======================================================================
+         UTILITY FUNCTIONS
+         ======================================================================= */
+      function esc(str) {
+        return String(str == null ? '' : str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function hexToRgba(hex, alpha) {
+        const clean = hex.replace('#', '');
+        const r = parseInt(clean.substring(0, 2), 16);
+        const g = parseInt(clean.substring(2, 4), 16);
+        const b = parseInt(clean.substring(4, 6), 16);
+        return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+      }
+
+      /**
+       * Extract base callsign for QRZ.com lookups:
+       *  - "W7M/W7I-012" -> "W7M" (strips SOTA summit suffix)
+       *  - "G4KLM/P"     -> "G4KLM" (strips portable suffix)
+       *  - "EA8/DL9XYZ"  -> "DL9XYZ" (strips short DXCC prefix)
+       */
+      function getBaseCall(callsign) {
+        if (!callsign) return '';
+        const raw = callsign.toUpperCase().trim();
+        if (raw.indexOf('/') === -1) return raw;
+        const parts = raw.split('/').filter(Boolean);
+        if (parts.length < 2) return parts[0] || raw;
+        // Strip summit reference or standard operating suffix (/P, /M, /QRP, /MM, /AM, /B, /W7I-012)
+        const suffixes = ['P', 'M', 'QRP', 'MM', 'AM', 'B', 'A', 'LH', 'KT'];
+        if (parts[1].indexOf('-') !== -1 || suffixes.indexOf(parts[1]) !== -1 || parts[1].length <= 2) {
+          return parts[0];
+        }
+        // If first segment is a short regional prefix (e.g. EA8/DL9XYZ or PJ2/K1VT)
+        if (parts[0].length <= 3 && parts[1].length >= 4) {
+          return parts[1];
+        }
+        return parts[0];
+      }
+
+      function qrzUrl(callsign) {
+        return 'https://www.qrz.com/db/' + encodeURIComponent(getBaseCall(callsign));
+      }
+
+      function fmtUtc(sec) {
+        const sTotal = Math.floor(sec);
+        const h = String(Math.floor(sTotal / 3600) % 24).padStart(2, '0');
+        const m = String(Math.floor((sTotal % 3600) / 60)).padStart(2, '0');
+        const s = String(sTotal % 60).padStart(2, '0');
+        return h + ':' + m + ':' + s;
+      }
+
+      function fmtSnr(snr) {
+        const v = Math.round(snr);
+        return (v >= 0 ? '+' : '-') + String(Math.abs(v)).padStart(2, '0');
+      }
+
+      function snrClass(snr) {
+        if (snr >= -4) return 'snr-hi';
+        if (snr >= -12) return 'snr-mid';
+        return 'snr-lo';
+      }
+
+      function randInt(min, max) {
+        return Math.floor(Math.random() * (max - min + 1)) + min;
+      }
+
+      function clamp(v, lo, hi) {
+        return Math.max(lo, Math.min(hi, v));
+      }
+
+      function renderTags(tags) {
+        if (!tags || !tags.length) return '';
+        return tags.map(function (t) {
+          const cls = t === 'SOTA' ? 'tag-sota' : (t === 'POTA' ? 'tag-pota' : 'tag-dx');
+          return '<span class="tag ' + cls + '">' + esc(t) + '</span>';
+        }).join(' ');
+      }
+
+      function computeNextTx(qso) {
+        const rpt = fmtSnr(qso.snr);
+        if (qso.stage === 0) return qso.isInbound ? (qso.callsign + ' ' + MY_CALL + ' ' + rpt) : (qso.callsign + ' ' + MY_CALL + ' ' + MY_GRID);
+        if (qso.stage === 1) return qso.callsign + ' ' + MY_CALL + ' ' + MY_GRID;
+        if (qso.stage === 2) return qso.callsign + ' ' + MY_CALL + ' R' + rpt;
+        if (qso.stage === 3) return qso.callsign + ' ' + MY_CALL + ' RR73';
+        return 'LOGGED';
+      }
+
+      function classifySection(msg) {
+        const trimmed = msg.trim().toUpperCase();
+        if (trimmed.indexOf('CQ ') === 0) return 'CQ';
+        if (trimmed.indexOf(MY_CALL + ' ') === 0) return 'TARGETING_ME';
+        return 'TARGETING_OTHERS';
+      }
+
+      /* =======================================================================
+         INITIAL STATE FACTORY
+         ======================================================================= */
+      function createInitialState() {
+        // 23:45:15 UTC
+        const utcSec = 23 * 3600 + 45 * 60 + 15;
+
+        const stations = [
+          { callsign: 'JA1XMP',      grid: 'PM95', distanceKm: 10640, snr: -14, freqHz: 1185, slot: 'O', ageSec: 0,  tags: ['DX'],         lastMsg: 'K1VT JA1XMP R-12' },
+          { callsign: 'W7M/W7I-012', grid: 'DN13', distanceKm: 3420,  snr: -7,  freqHz: 1640, slot: 'O', ageSec: 0,  tags: ['SOTA', 'DX'], lastMsg: 'K1VT W7M/W7I-012 -07' },
+          { callsign: 'G4KLM',       grid: 'IO91', distanceKm: 5310,  snr: -4,  freqHz: 840,  slot: 'O', ageSec: 0,  tags: ['DX'],         lastMsg: 'W2XYZ G4KLM -04' },
+          { callsign: 'N4POTA',      grid: 'EM73', distanceKm: 1620,  snr: +2,  freqHz: 2110, slot: 'O', ageSec: 0,  tags: ['POTA'],       lastMsg: 'K1VT N4POTA EM73' },
+          { callsign: 'ZL2DX',       grid: 'RE78', distanceKm: 14460, snr: -16, freqHz: 620,  slot: 'E', ageSec: 15, tags: ['DX'],         lastMsg: 'CQ DX ZL2DX RE78' },
+          { callsign: 'PY2ZZ',       grid: 'GG66', distanceKm: 7890,  snr: -11, freqHz: 1920, slot: 'O', ageSec: 0,  tags: ['DX'],         lastMsg: 'CQ DX PY2ZZ GG66' },
+          { callsign: 'OH2B',        grid: 'KP20', distanceKm: 6320,  snr: -13, freqHz: 1045, slot: 'E', ageSec: 15, tags: ['DX'],         lastMsg: 'CQ OH2B KP20' },
+          { callsign: 'DL9XYZ',      grid: 'JO50', distanceKm: 6110,  snr: -5,  freqHz: 1490, slot: 'O', ageSec: 0,  tags: ['DX'],         lastMsg: 'CQ DL9XYZ JO50' },
+          { callsign: 'EA5DX',       grid: 'IM99', distanceKm: 5890,  snr: -9,  freqHz: 1340, slot: 'E', ageSec: 30, tags: ['DX'],         lastMsg: 'K1VT EA5DX 73' },
+          { callsign: 'F5RRS',       grid: 'JN18', distanceKm: 5720,  snr: -8,  freqHz: 2340, slot: 'E', ageSec: 15, tags: ['DX'],         lastMsg: 'OH2B F5RRS R-08' },
+          { callsign: 'YV5AA',       grid: 'FK60', distanceKm: 3910,  snr: -3,  freqHz: 2560, slot: 'O', ageSec: 0,  tags: ['DX'],         lastMsg: 'CQ YV5AA FK60' },
+          { callsign: 'K6SOTA',      grid: 'CM98', distanceKm: 4050,  snr: -10, freqHz: 1765, slot: 'E', ageSec: 15, tags: ['SOTA', 'DX'], lastMsg: 'CQ SOTA K6SOTA CM98' },
+          { callsign: 'W2XYZ',       grid: 'FN20', distanceKm: 410,   snr: +6,  freqHz: 745,  slot: 'E', ageSec: 15, tags: [],             lastMsg: 'G4KLM W2XYZ FN20' },
+          { callsign: 'VE3ABC',      grid: 'EN93', distanceKm: 640,   snr: +4,  freqHz: 2710, slot: 'O', ageSec: 45, tags: ['POTA'],       lastMsg: 'CQ POTA VE3ABC EN93' }
+        ];
+
+        // Active QSO Sequencers (stage: 0=INBOUND/QUEUED, 1=CALLING, 2=SENT RPT, 3=R-RPT/RR73, 4=LOGGED)
+        const qsos = [
+          {
+            id: 'Q1',
+            color: QSO_PALETTE[0], // Cyan
+            callsign: 'JA1XMP',
+            grid: 'PM95',
+            distanceKm: 10640,
+            snr: -14,
+            freqHz: 1185,
+            tags: ['DX'],
+            stage: 3, // R-RPT / RR73 (armed -> completes & turns grey in LOGGED on very next batch!)
+            isArmed: true,
+            isInbound: false,
+            lastRx: 'K1VT JA1XMP R-12',
+            nextTx: 'JA1XMP K1VT RR73',
+            rptSent: '-14',
+            rptRcvd: '-12',
+            loggedCyclesLeft: null,
+            stalledCycles: 0
+          },
+          {
+            id: 'Q2',
+            color: QSO_PALETTE[1], // Amber
+            callsign: 'W7M/W7I-012',
+            grid: 'DN13',
+            distanceKm: 3420,
+            snr: -7,
+            freqHz: 1640,
+            tags: ['SOTA', 'DX'],
+            stage: 2, // SENT RPT
+            isArmed: false,
+            isInbound: false,
+            lastRx: 'K1VT W7M/W7I-012 -07',
+            nextTx: 'W7M/W7I-012 K1VT R-07',
+            rptSent: '-07',
+            rptRcvd: '-07',
+            loggedCyclesLeft: null,
+            stalledCycles: 0
+          },
+          {
+            id: 'Q3',
+            color: QSO_PALETTE[2], // Magenta
+            callsign: 'G4KLM',
+            grid: 'IO91',
+            distanceKm: 5310,
+            snr: -4,
+            freqHz: 840,
+            tags: ['DX'],
+            stage: 1, // CALLING (seen answering W2XYZ in TARGETING OTHERS highlighted in Q3 Magenta!)
+            isArmed: false,
+            isInbound: false,
+            lastRx: 'W2XYZ G4KLM -04',
+            nextTx: 'G4KLM K1VT FN34',
+            rptSent: '-04',
+            rptRcvd: '--',
+            loggedCyclesLeft: null,
+            stalledCycles: 1
+          },
+          {
+            id: 'Q4',
+            color: QSO_PALETTE[3], // Emerald
+            callsign: 'N4POTA',
+            grid: 'EM73',
+            distanceKm: 1620,
+            snr: +2,
+            freqHz: 2110,
+            tags: ['POTA'],
+            stage: 0, // INBOUND / QUEUED
+            isArmed: false,
+            isInbound: true,
+            lastRx: 'K1VT N4POTA EM73',
+            nextTx: 'N4POTA K1VT +02',
+            rptSent: '+02',
+            rptRcvd: '--',
+            loggedCyclesLeft: null,
+            stalledCycles: 0
+          }
+        ];
+
+        // Pre-populated 1 already-logged QSO inside the collapsed "Logged This Session (1)" dropdown
+        const sessionLogged = [
+          {
+            utc: '23:44:30',
+            callsign: 'EA5DX',
+            grid: 'IM99',
+            rptSent: '-09',
+            rptRcvd: '-06',
+            freqHz: 1340,
+            distanceKm: 5890
+          }
+        ];
+
+        // 2 Pre-populated recent decode batches (newest first)
+        const batches = [
+          {
+            id: 202,
+            timeStr: '23:45:15',
+            parity: 'ODD',
+            decodes: [
+              { id: 'b202-1', snr: -14, freqHz: 1185, callsign: 'JA1XMP',      text: 'K1VT JA1XMP R-12',      advancedQsoId: 'Q1' },
+              { id: 'b202-2', snr: -7,  freqHz: 1640, callsign: 'W7M/W7I-012', text: 'K1VT W7M/W7I-012 -07',  advancedQsoId: 'Q2' },
+              { id: 'b202-3', snr: +2,  freqHz: 2110, callsign: 'N4POTA',      text: 'K1VT N4POTA EM73',      advancedQsoId: null },
+              { id: 'b202-4', snr: -5,  freqHz: 1490, callsign: 'DL9XYZ',      text: 'CQ DL9XYZ JO50',        advancedQsoId: null },
+              { id: 'b202-5', snr: -11, freqHz: 1920, callsign: 'PY2ZZ',       text: 'CQ DX PY2ZZ GG66',      advancedQsoId: null },
+              { id: 'b202-6', snr: -3,  freqHz: 2560, callsign: 'YV5AA',       text: 'CQ YV5AA FK60',         advancedQsoId: null },
+              { id: 'b202-7', snr: -4,  freqHz: 840,  callsign: 'G4KLM',       text: 'W2XYZ G4KLM -04',       advancedQsoId: null } // Active Q3 Magenta in TARGETING OTHERS!
+            ]
+          },
+          {
+            id: 201,
+            timeStr: '23:45:00',
+            parity: 'EVEN',
+            decodes: [
+              { id: 'b201-1', snr: -16, freqHz: 620,  callsign: 'ZL2DX',       text: 'CQ DX ZL2DX RE78',      advancedQsoId: null },
+              { id: 'b201-2', snr: -13, freqHz: 1045, callsign: 'OH2B',        text: 'CQ OH2B KP20',          advancedQsoId: null },
+              { id: 'b201-3', snr: -10, freqHz: 1765, callsign: 'K6SOTA',      text: 'CQ SOTA K6SOTA CM98',   advancedQsoId: null },
+              { id: 'b201-4', snr: +6,  freqHz: 745,  callsign: 'W2XYZ',       text: 'G4KLM W2XYZ FN20',      advancedQsoId: null },
+              { id: 'b201-5', snr: -8,  freqHz: 2340, callsign: 'F5RRS',       text: 'OH2B F5RRS R-08',       advancedQsoId: null }
+            ]
+          }
+        ];
+
+        return {
+          mode: 'FT8',          // 'FT8' (15s) or 'FT4' (7.5s)
+          utcSec: utcSec,
+          parity: 'ODD',
+          txEnabled: true,
+          txHz: 1420,
+          rxHz: 1185,
+          feedOnLeft: false,
+          autoCycle: false,
+          lastBatchId: 202,
+          nextQsoNumber: 5,
+          surpriseIdx: 0,
+          sessionDrawerOpen: false,
+          // Roster sort & filter state
+          rosterSortPreset: 'fresh_dist',
+          rosterColSort: null,  // { col: 'dist', dir: 'desc' } overrides preset when user clicks header
+          rosterFilter: 'all',
+          rosterSearch: '',
+          // Core live data
+          stations: stations,
+          qsos: qsos,
+          sessionLogged: sessionLogged,
+          batches: batches,
+          // Highlight tracking for latest batch transitions
+          recentlyAdvanced: { Q1: true, Q2: true },
+          recentlyInbound: { Q4: true },
+          // Cross-hover state (does NOT trigger DOM rebuild)
+          hoveredCallsign: null,
+          hoveredHz: null,
+          hoveredColor: null
+        };
+      }
+
+      const state = createInitialState();
+
+      /* =======================================================================
+         LOOKUP HELPERS
+         ======================================================================= */
+      function getActiveQsoByCall(callsign) {
+        return state.qsos.find(function (q) {
+          return q.callsign === callsign && q.stage < 4;
+        }) || null;
+      }
+
+      function getAnyQsoByCall(callsign) {
+        return state.qsos.find(function (q) {
+          return q.callsign === callsign;
+        }) || null;
+      }
+
+      function isSessionLogged(callsign) {
+        return state.sessionLogged.some(function (l) { return l.callsign === callsign; }) ||
+               state.qsos.some(function (q) { return q.callsign === callsign && q.stage === 4; });
+      }
+
+      function getArmedQso() {
+        return state.qsos.find(function (q) { return q.isArmed && q.stage < 4; }) ||
+               state.qsos.find(function (q) { return q.stage < 4; }) || null;
+      }
+
+      function getStationByCall(callsign) {
+        return state.stations.find(function (s) { return s.callsign === callsign; }) || null;
+      }
+
+      /**
+       * Determine if a decode message involves an active QSO station
+       * (either sent by that station OR mentioning that station's callsign)
+       */
+      function getLinkedActiveQsoForDecode(dec) {
+        const direct = getActiveQsoByCall(dec.callsign);
+        if (direct) return direct;
+        const tokens = dec.text.toUpperCase().split(/\s+/);
+        for (let i = 0; i < state.qsos.length; i++) {
+          const q = state.qsos[i];
+          if (q.stage < 4 && tokens.indexOf(q.callsign.toUpperCase()) !== -1) {
+            return q;
+          }
+        }
+        return null;
+      }
+
+      /* =======================================================================
+         SIMULATION ENGINE: TRIGGER NEXT DECODE BATCH
+         ======================================================================= */
+      let waterfallCycleFlash = false;
+
+      function triggerNextBatch() {
+        const stepSec = state.mode === 'FT8' ? 15 : 7.5;
+        state.utcSec += stepSec;
+        state.parity = state.parity === 'EVEN' ? 'ODD' : 'EVEN';
+        state.lastBatchId += 1;
+        const timeStr = fmtUtc(state.utcSec);
+
+        // 1. Age all roster stations
+        state.stations.forEach(function (st) {
+          st.ageSec += Math.round(stepSec);
+        });
+
+        // 2. Decrement countdown on already-LOGGED grey QSOs & auto-archive after 2 cycles
+        const stillInSwimlanes = [];
+        state.qsos.forEach(function (q) {
+          if (q.stage === 4) {
+            q.loggedCyclesLeft = (q.loggedCyclesLeft == null ? 2 : q.loggedCyclesLeft) - 1;
+            if (q.loggedCyclesLeft <= 0) {
+              // Auto-archive into collapsed "Logged This Session" drawer
+              state.sessionLogged.unshift({
+                utc: timeStr,
+                callsign: q.callsign,
+                grid: q.grid,
+                rptSent: q.rptSent || fmtSnr(q.snr),
+                rptRcvd: q.rptRcvd || fmtSnr(q.snr + randInt(-2, 2)),
+                freqHz: q.freqHz,
+                distanceKm: q.distanceKm
+              });
+            } else {
+              stillInSwimlanes.push(q);
+            }
+          } else {
+            stillInSwimlanes.push(q);
+          }
+        });
+        state.qsos = stillInSwimlanes;
+
+        const newDecodes = [];
+        const newRecentlyAdvanced = {};
+        const newRecentlyInbound = {};
+        const usedCalls = new Set();
+
+        // 3. Advance Armed QSO (if TX Enabled) + 1 secondary QSO realistically
+        const activeQsos = state.qsos.filter(function (q) { return q.stage < 4; });
+        const armed = activeQsos.find(function (q) { return q.isArmed; });
+        const advancingList = [];
+
+        if (armed && state.txEnabled) {
+          advancingList.push(armed);
+        }
+
+        // Also advance one other QSO (prefer stage 2 or 3, or stalled stage 1)
+        const others = activeQsos.filter(function (q) { return !armed || q.id !== armed.id; });
+        if (others.length > 0) {
+          const candidate = others.find(function (q) { return q.stage === 2 || q.stage === 3; }) ||
+                            others.find(function (q) { return q.stage === 1 && q.stalledCycles >= 2; }) ||
+                            others[0];
+          if (candidate) {
+            if (candidate.stage === 1 && candidate.stalledCycles < 2 && !candidate.isArmed) {
+              // Demonstrate active QSO station appearing in CQ or TARGETING OTHERS while highlighted in its QSO color!
+              candidate.stalledCycles += 1;
+              const snr = clamp(candidate.snr + randInt(-2, 2), -22, 12);
+              candidate.snr = snr;
+              const altMsg = Math.random() < 0.5
+                ? ('CQ DX ' + candidate.callsign + ' ' + candidate.grid)
+                : ('W2XYZ ' + candidate.callsign + ' ' + fmtSnr(snr));
+              candidate.lastRx = altMsg;
+              newDecodes.push({
+                id: 'b' + state.lastBatchId + '-alt-' + candidate.id,
+                snr: snr,
+                freqHz: candidate.freqHz,
+                callsign: candidate.callsign,
+                text: altMsg,
+                advancedQsoId: null
+              });
+              usedCalls.add(candidate.callsign);
+            } else if (candidate.stage === 0 && candidate.isInbound && !candidate.isArmed) {
+              // Inbound caller repeats call to K1VT
+              const snr = clamp(candidate.snr + randInt(-1, 2), -22, 12);
+              candidate.snr = snr;
+              const rxMsg = MY_CALL + ' ' + candidate.callsign + ' ' + candidate.grid;
+              candidate.lastRx = rxMsg;
+              newRecentlyInbound[candidate.id] = true;
+              newDecodes.push({
+                id: 'b' + state.lastBatchId + '-inb-' + candidate.id,
+                snr: snr,
+                freqHz: candidate.freqHz,
+                callsign: candidate.callsign,
+                text: rxMsg,
+                advancedQsoId: null
+              });
+              usedCalls.add(candidate.callsign);
+            } else {
+              advancingList.push(candidate);
+            }
+          }
+        }
+
+        // Process advancing QSOs
+        advancingList.forEach(function (q, idx) {
+          const snr = clamp(q.snr + randInt(-2, 2), -22, 12);
+          q.snr = snr;
+          q.stalledCycles = 0;
+
+          let rxMsg = '';
+          if (q.stage === 0) {
+            // INBOUND/QUEUED -> SENT RPT (or CALLING if not inbound)
+            q.stage = q.isInbound ? 2 : 1;
+            q.isInbound = false;
+            q.rptSent = fmtSnr(snr);
+            rxMsg = q.stage === 2
+              ? (MY_CALL + ' ' + q.callsign + ' R' + fmtSnr(snr + randInt(-2, 2)))
+              : (MY_CALL + ' ' + q.callsign + ' ' + fmtSnr(snr));
+          } else if (q.stage === 1) {
+            // CALLING -> SENT RPT
+            q.stage = 2;
+            q.rptRcvd = fmtSnr(snr + randInt(-2, 2));
+            rxMsg = MY_CALL + ' ' + q.callsign + ' ' + q.rptRcvd;
+          } else if (q.stage === 2) {
+            // SENT RPT -> R-RPT / RR73
+            q.stage = 3;
+            q.rptRcvd = fmtSnr(snr + randInt(-2, 2));
+            rxMsg = MY_CALL + ' ' + q.callsign + ' R' + q.rptRcvd;
+          } else if (q.stage === 3) {
+            // R-RPT / RR73 -> LOGGED (turns neutral grey in ultra-minimal LOGGED lane for 2 cycles!)
+            q.stage = 4;
+            q.loggedCyclesLeft = 2;
+            rxMsg = MY_CALL + ' ' + q.callsign + ' 73';
+            if (q.isArmed) {
+              q.isArmed = false;
+              const nextToArm = state.qsos.find(function (x) { return x.stage < 4 && x.id !== q.id; });
+              if (nextToArm) {
+                nextToArm.isArmed = true;
+                state.rxHz = nextToArm.freqHz;
+              }
+            }
+          }
+
+          q.lastRx = rxMsg;
+          q.nextTx = computeNextTx(q);
+          newRecentlyAdvanced[q.id] = true;
+
+          newDecodes.push({
+            id: 'b' + state.lastBatchId + '-adv-' + idx,
+            snr: snr,
+            freqHz: q.freqHz,
+            callsign: q.callsign,
+            text: rxMsg,
+            advancedQsoId: q.id
+          });
+          usedCalls.add(q.callsign);
+        });
+
+        // Occasionally have another non-advancing active QSO show up in CQ or TARGETING OTHERS
+        activeQsos.forEach(function (q) {
+          if (!usedCalls.has(q.callsign) && q.stage < 4 && Math.random() < 0.45) {
+            const snr = clamp(q.snr + randInt(-2, 2), -22, 12);
+            const msg = Math.random() < 0.5
+              ? ('CQ ' + q.callsign + ' ' + q.grid)
+              : ('OH2B ' + q.callsign + ' ' + fmtSnr(snr));
+            newDecodes.push({
+              id: 'b' + state.lastBatchId + '-act-' + q.id,
+              snr: snr,
+              freqHz: q.freqHz,
+              callsign: q.callsign,
+              text: msg,
+              advancedQsoId: null
+            });
+            usedCalls.add(q.callsign);
+          }
+        });
+
+        // 4. Fill remaining decodes (total 7-9 per batch) with band traffic across CQ & TARGETING OTHERS
+        const desiredCount = randInt(7, 9);
+        const slotChar = state.parity === 'EVEN' ? 'E' : 'O';
+        const bandPool = state.stations
+          .filter(function (s) { return !usedCalls.has(s.callsign); })
+          .sort(function (a, b) {
+            const aMatch = a.slot === slotChar ? 0 : 1;
+            const bMatch = b.slot === slotChar ? 0 : 1;
+            if (aMatch !== bMatch) return aMatch - bMatch;
+            return Math.random() - 0.5;
+          });
+
+        const otherPartners = ['W2XYZ', 'OH2B', 'DL9XYZ', 'W1AW', 'VE3ABC', 'F5RRS'];
+        for (let i = 0; i < bandPool.length && newDecodes.length < desiredCount; i++) {
+          const st = bandPool[i];
+          const snr = clamp(st.snr + randInt(-2, 2), -22, 12);
+          let msg = '';
+          const roll = Math.random();
+          if (roll < 0.55) {
+            if (st.tags.indexOf('SOTA') !== -1) msg = 'CQ SOTA ' + st.callsign + ' ' + st.grid;
+            else if (st.tags.indexOf('POTA') !== -1) msg = 'CQ POTA ' + st.callsign + ' ' + st.grid;
+            else if (st.distanceKm > 4000) msg = 'CQ DX ' + st.callsign + ' ' + st.grid;
+            else msg = 'CQ ' + st.callsign + ' ' + st.grid;
+          } else {
+            const partner = otherPartners[randInt(0, otherPartners.length - 1)];
+            const target = partner === st.callsign ? 'W1AW' : partner;
+            msg = roll < 0.78
+              ? (target + ' ' + st.callsign + ' ' + fmtSnr(snr))
+              : (target + ' ' + st.callsign + ' RR73');
+          }
+
+          newDecodes.push({
+            id: 'b' + state.lastBatchId + '-band-' + i,
+            snr: snr,
+            freqHz: st.freqHz,
+            callsign: st.callsign,
+            text: msg,
+            advancedQsoId: null
+          });
+          usedCalls.add(st.callsign);
+        }
+
+        // 5. Update Roster stations from decoded batch
+        newDecodes.forEach(function (d) {
+          const st = getStationByCall(d.callsign);
+          if (st) {
+            st.ageSec = 0;
+            st.snr = d.snr;
+            st.slot = slotChar;
+            st.lastMsg = d.text;
+          }
+        });
+
+        // Sort decodes by frequency within each batch
+        newDecodes.sort(function (a, b) { return a.freqHz - b.freqHz; });
+
+        state.batches.unshift({
+          id: state.lastBatchId,
+          timeStr: timeStr,
+          parity: state.parity,
+          decodes: newDecodes
+        });
+        if (state.batches.length > 8) state.batches.pop();
+
+        state.recentlyAdvanced = newRecentlyAdvanced;
+        state.recentlyInbound = newRecentlyInbound;
+
+        // Trigger crisp horizontal cycle tick line on waterfall
+        waterfallCycleFlash = true;
+        resetCycleClock();
+        renderAll();
+      }
+
+      /* =======================================================================
+         OPERATOR INTERACTIONS: INJECT CALLER, CALL, ARM, DISMISS
+         ======================================================================= */
+      function injectCaller() {
+        const tpl = SURPRISE_CALLERS[state.surpriseIdx % SURPRISE_CALLERS.length];
+        state.surpriseIdx += 1;
+        const msg = MY_CALL + ' ' + tpl.callsign + ' ' + tpl.grid;
+        const slotChar = state.parity === 'EVEN' ? 'E' : 'O';
+
+        // Ensure station exists in roster
+        let st = getStationByCall(tpl.callsign);
+        if (!st) {
+          st = {
+            callsign: tpl.callsign,
+            grid: tpl.grid,
+            distanceKm: tpl.distanceKm,
+            snr: tpl.snr,
+            freqHz: tpl.freqHz,
+            slot: slotChar,
+            ageSec: 0,
+            tags: tpl.tags.slice(),
+            lastMsg: msg
+          };
+          state.stations.unshift(st);
+        } else {
+          st.ageSec = 0;
+          st.snr = clamp(st.snr + randInt(-1, 2), -20, 12);
+          st.lastMsg = msg;
+        }
+
+        // Create QSO in INBOUND / QUEUED if not already active
+        let q = getActiveQsoByCall(st.callsign);
+        if (!q) {
+          const num = state.nextQsoNumber++;
+          const color = QSO_PALETTE[(num - 1) % QSO_PALETTE.length];
+          const hasArmed = state.qsos.some(function (x) { return x.isArmed && x.stage < 4; });
+          q = {
+            id: 'Q' + num,
+            color: color,
+            callsign: st.callsign,
+            grid: st.grid,
+            distanceKm: st.distanceKm,
+            snr: st.snr,
+            freqHz: st.freqHz,
+            tags: st.tags.slice(),
+            stage: 0,
+            isArmed: !hasArmed,
+            isInbound: true,
+            lastRx: msg,
+            nextTx: st.callsign + ' ' + MY_CALL + ' ' + fmtSnr(st.snr),
+            rptSent: fmtSnr(st.snr),
+            rptRcvd: '--',
+            loggedCyclesLeft: null,
+            stalledCycles: 0
+          };
+          state.qsos.unshift(q);
+        } else {
+          q.lastRx = msg;
+        }
+
+        // Push into latest batch
+        if (state.batches.length > 0) {
+          state.batches[0].decodes.unshift({
+            id: 'b-inj-' + Date.now() + '-' + state.surpriseIdx,
+            snr: st.snr,
+            freqHz: st.freqHz,
+            callsign: st.callsign,
+            text: msg,
+            advancedQsoId: null
+          });
+        }
+
+        state.recentlyInbound = {};
+        state.recentlyInbound[q.id] = true;
+        renderAll();
+      }
+
+      function callOrSelectStation(callsign) {
+        const existing = getActiveQsoByCall(callsign);
+        if (existing) {
+          armQso(existing.id);
+          return;
+        }
+
+        const st = getStationByCall(callsign);
+        if (!st) return;
+
+        const num = state.nextQsoNumber++;
+        const color = QSO_PALETTE[(num - 1) % QSO_PALETTE.length];
+        const callingMe = st.lastMsg.toUpperCase().indexOf(MY_CALL + ' ') === 0;
+
+        state.qsos.forEach(function (q) { q.isArmed = false; });
+
+        const newQ = {
+          id: 'Q' + num,
+          color: color,
+          callsign: st.callsign,
+          grid: st.grid,
+          distanceKm: st.distanceKm,
+          snr: st.snr,
+          freqHz: st.freqHz,
+          tags: st.tags.slice(),
+          stage: callingMe ? 0 : 1, // INBOUND or CALLING
+          isArmed: true,
+          isInbound: callingMe,
+          lastRx: st.lastMsg,
+          nextTx: '',
+          rptSent: fmtSnr(st.snr),
+          rptRcvd: '--',
+          loggedCyclesLeft: null,
+          stalledCycles: 0
+        };
+        newQ.nextTx = computeNextTx(newQ);
+        state.qsos.unshift(newQ);
+        state.rxHz = st.freqHz;
+        state.txEnabled = true;
+
+        state.recentlyAdvanced = {};
+        state.recentlyInbound = {};
+        state.recentlyInbound[newQ.id] = true;
+        renderAll();
+      }
+
+      function armQso(qsoId) {
+        const q = state.qsos.find(function (x) { return x.id === qsoId && x.stage < 4; });
+        if (!q) return;
+        state.qsos.forEach(function (x) { x.isArmed = (x.id === qsoId); });
+        state.rxHz = q.freqHz;
+        state.txEnabled = true;
+        renderAll();
+      }
+
+      function dismissQso(qsoId) {
+        const idx = state.qsos.findIndex(function (x) { return x.id === qsoId; });
+        if (idx === -1) return;
+        const wasArmed = state.qsos[idx].isArmed;
+        state.qsos.splice(idx, 1);
+        if (wasArmed) {
+          const next = state.qsos.find(function (x) { return x.stage < 4; });
+          if (next) next.isArmed = true;
+        }
+        renderAll();
+      }
+
+      /* =======================================================================
+         CYCLE COUNTDOWN CLOCK & AUTO-CYCLE ENGINE
+         ======================================================================= */
+      const AUTO_PERIOD_MS = 4000;
+      let cycleElapsedMs = 3600;
+      let lastTickTs = performance.now();
+
+      function resetCycleClock() {
+        cycleElapsedMs = 0;
+        lastTickTs = performance.now();
+      }
+
+      function updateCycleTimerUi() {
+        const now = performance.now();
+        const dt = now - lastTickTs;
+        lastTickTs = now;
+
+        const simDurationMs = state.autoCycle
+          ? AUTO_PERIOD_MS
+          : (state.mode === 'FT8' ? 15000 : 7500);
+
+        cycleElapsedMs += dt;
+
+        if (state.autoCycle && cycleElapsedMs >= AUTO_PERIOD_MS) {
+          cycleElapsedMs = 0;
+          triggerNextBatch();
+          return;
+        }
+
+        const clampedElapsed = Math.min(cycleElapsedMs, simDurationMs);
+        const pct = (clampedElapsed / simDurationMs) * 100;
+
+        // Map display countdown to realistic FT8 (15s) or FT4 (7.5s) seconds
+        const realCycleSec = state.mode === 'FT8' ? 15.0 : 7.5;
+        const remainingSec = Math.max(0, realCycleSec * (1 - clampedElapsed / simDurationMs));
+
+        const armed = getArmedQso();
+        const isTxPhase = state.txEnabled && armed && pct < 85 && state.parity === 'EVEN';
+
+        const cdEl = document.getElementById('telem-countdown');
+        const phaseEl = document.getElementById('telem-phase');
+        const barEl = document.getElementById('cycle-bar-fill');
+
+        if (cdEl) {
+          cdEl.textContent = (!state.autoCycle && remainingSec <= 0.05)
+            ? '0.0s'
+            : remainingSec.toFixed(1) + 's';
+        }
+        if (phaseEl) {
+          phaseEl.textContent = isTxPhase ? 'TX' : 'RX';
+          phaseEl.style.color = isTxPhase ? '#fca5a5' : '#6ee7b7';
+        }
+        if (barEl) {
+          barEl.style.width = pct.toFixed(1) + '%';
+          barEl.classList.toggle('tx-mode', Boolean(isTxPhase));
+        }
+
+        // Loop manual visual bar softly if user hasn't clicked Next Batch yet
+        if (!state.autoCycle && cycleElapsedMs >= simDurationMs) {
+          cycleElapsedMs = 0;
+        }
+      }
+
+      /* =======================================================================
+         RENDER PANEL 1: TOP TELEMETRY & RULER MARKERS
+         ======================================================================= */
+      function renderTelemetry() {
+        const utcEl = document.getElementById('telem-utc');
+        const slotEl = document.getElementById('telem-slot');
+        const txBtn = document.getElementById('btn-tx-enable');
+        const autoBtn = document.getElementById('btn-auto-cycle');
+        const txBox = document.getElementById('tx-preview-box');
+        const txBadge = document.getElementById('tx-preview-badge');
+        const txMsg = document.getElementById('tx-preview-msg');
+        const txHz = document.getElementById('tx-preview-hz');
+
+        if (utcEl) utcEl.textContent = fmtUtc(state.utcSec);
+        if (slotEl) {
+          slotEl.textContent = state.parity;
+          slotEl.className = 'slot-badge ' + (state.parity === 'EVEN' ? 'slot-even' : 'slot-odd');
+        }
+        if (txBtn) {
+          txBtn.textContent = state.txEnabled ? '● TX ARMED' : '○ RX ONLY';
+          txBtn.className = 'btn ' + (state.txEnabled ? 'btn-tx-armed' : 'btn-rx-only');
+        }
+        if (autoBtn) {
+          autoBtn.classList.toggle('active', state.autoCycle);
+          autoBtn.textContent = state.autoCycle ? '⟳ Auto-Cycle: ON' : '⟳ Auto-Cycle';
+        }
+
+        document.querySelectorAll('#mode-switch .mode-btn').forEach(function (b) {
+          b.classList.toggle('active', b.getAttribute('data-mode') === state.mode);
+        });
+
+        const armed = getArmedQso();
+        if (txBox && txBadge && txMsg && txHz) {
+          txBox.classList.toggle('armed', Boolean(state.txEnabled && armed));
+          if (armed) {
+            txBadge.style.display = 'inline-flex';
+            txBadge.style.background = armed.color;
+            txBadge.textContent = armed.id;
+            txMsg.textContent = (state.txEnabled ? 'TX: ' : 'QUEUED: ') + armed.nextTx;
+            txHz.textContent = state.txHz + ' Hz';
+          } else {
+            txBadge.style.display = 'none';
+            txMsg.textContent = 'IDLE — Click Call on any station to queue TX';
+            txHz.textContent = state.txHz + ' Hz';
+          }
+        }
+
+        renderWaterfallRuler();
+      }
+
+      function hzToPct(hz) {
+        return ((clamp(hz, WF_MIN_HZ, WF_MAX_HZ) - WF_MIN_HZ) / (WF_MAX_HZ - WF_MIN_HZ)) * 100;
+      }
+
+      function pctToHz(pct) {
+        return Math.round(WF_MIN_HZ + clamp(pct, 0, 1) * (WF_MAX_HZ - WF_MIN_HZ));
+      }
+
+      function renderWaterfallRuler() {
+        const ruler = document.getElementById('wf-ruler');
+        if (!ruler) return;
+
+        let html = '';
+        // 200 Hz ticks from 200 to 3000 Hz
+        for (let hz = WF_MIN_HZ; hz <= WF_MAX_HZ; hz += 100) {
+          const pct = hzToPct(hz);
+          const major = hz % 200 === 0;
+          html += '<div style="position:absolute;left:' + pct.toFixed(3) + '%;bottom:0;width:1px;height:' + (major ? '8px' : '4px') + ';background:' + (major ? '#475569' : '#253247') + ';pointer-events:none"></div>';
+          if (major && hz > WF_MIN_HZ && hz < WF_MAX_HZ) {
+            html += '<span class="mono" style="position:absolute;left:' + pct.toFixed(3) + '%;top:2px;transform:translateX(-50%);font-size:9px;color:#64748b;pointer-events:none">' + hz + '</span>';
+          }
+        }
+
+        // Color-coded diamonds for active QSOs in Swimlanes
+        state.qsos.forEach(function (q) {
+          if (q.stage >= 4) return;
+          const pct = hzToPct(q.freqHz);
+          html += '<div class="wf-qso-diamond" data-callsign="' + esc(q.callsign) + '" data-hz="' + q.freqHz + '" data-color="' + q.color + '" title="' + q.id + ' ' + esc(q.callsign) + ' (' + q.freqHz + ' Hz)" style="left:' + pct.toFixed(3) + '%;background:' + q.color + ';box-shadow:0 0 6px ' + q.color + '"></div>';
+        });
+
+        // 50 Hz width in %
+        const bwPct = (50 / (WF_MAX_HZ - WF_MIN_HZ)) * 100;
+        const rxPct = hzToPct(state.rxHz);
+        const txPct = hzToPct(state.txHz);
+
+        // RX Green Bracket
+        html += '<div class="wf-bracket wf-bracket-rx" data-drag="rx" style="left:' + rxPct.toFixed(3) + '%;width:' + Math.max(bwPct, 1.8).toFixed(3) + '%">' +
+                  '<span class="wf-bracket-label">RX ' + state.rxHz + '</span>' +
+                '</div>';
+
+        // TX Red Bracket
+        html += '<div class="wf-bracket wf-bracket-tx" data-drag="tx" style="left:' + txPct.toFixed(3) + '%;width:' + Math.max(bwPct, 1.8).toFixed(3) + '%">' +
+                  '<span class="wf-bracket-label">TX ' + state.txHz + '</span>' +
+                '</div>';
+
+        ruler.innerHTML = html;
+      }
+
+      /* =======================================================================
+         RENDER PANEL 2: ATC FLIGHT STRIPS SWIMLANES + SESSION LOGGED DRAWER
+         ======================================================================= */
+      function renderSwimlanes() {
+        const board = document.getElementById('swimlanes-board');
+        const countEl = document.getElementById('active-qso-count');
+        if (!board) return;
+
+        const activeCount = state.qsos.filter(function (q) { return q.stage < 4; }).length;
+        if (countEl) countEl.textContent = String(activeCount);
+
+        const lanes = [
+          { stage: 0, title: '1. INBOUND / QUEUED', minimal: false },
+          { stage: 1, title: '2. CALLING',          minimal: false },
+          { stage: 2, title: '3. SENT RPT',         minimal: false },
+          { stage: 3, title: '4. R-RPT / RR73',     minimal: false },
+          { stage: 4, title: '5. LOGGED',           minimal: true  }
+        ];
+
+        board.innerHTML = lanes.map(function (lane) {
+          const items = state.qsos.filter(function (q) { return q.stage === lane.stage; });
+
+          if (lane.minimal) {
+            // Ultra-minimal narrow LOGGED lane with neutral grey pills + cycle countdown
+            const chips = items.map(function (q) {
+              const cyc = q.loggedCyclesLeft == null ? 2 : q.loggedCyclesLeft;
+              return '<div class="logged-chip" data-callsign="' + esc(q.callsign) + '" data-hz="' + q.freqHz + '" title="Logged · Auto-archives in ' + cyc + ' cycle(s)">' +
+                '<div class="logged-chip-top">' +
+                  '<span class="logged-chip-call">' + esc(q.callsign) + '</span>' +
+                '</div>' +
+                '<div style="display:flex;align-items:center;justify-content:space-between;gap:3px">' +
+                  '<span class="logged-chip-cyc">' + cyc + ' cyc</span>' +
+                  '<a class="btn-qrz" href="' + qrzUrl(q.callsign) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()" style="padding:0 3px;font-size:8.5px">QRZ↗</a>' +
+                '</div>' +
+              '</div>';
+            }).join('');
+
+            return '<div class="lane lane-logged">' +
+              '<div class="lane-head"><span>LOGGED</span><span class="count-chip">' + items.length + '</span></div>' +
+              '<div class="lane-body">' + (chips || '<div class="lane-empty" style="font-size:9.5px">None</div>') + '</div>' +
+            '</div>';
+          }
+
+          const cards = items.map(function (q) {
+            const isAdv = Boolean(state.recentlyAdvanced[q.id]);
+            const isInb = Boolean(state.recentlyInbound[q.id]);
+            const animCls = isAdv ? 'anim-advanced' : (isInb ? 'anim-inbound' : '');
+            const glowStyle = 'border-left-color:' + q.color + ';box-shadow:inset 3px 0 12px ' + hexToRgba(q.color, 0.14) + ';';
+
+            return '<div class="qso-strip ' + (q.isArmed ? 'is-armed ' : '') + animCls + '" style="' + glowStyle + '" data-callsign="' + esc(q.callsign) + '" data-hz="' + q.freqHz + '" data-color="' + q.color + '" data-action="arm" data-qso-id="' + q.id + '">' +
+              '<div class="strip-top">' +
+                '<div class="strip-id">' +
+                  '<span class="q-pill" style="background:' + q.color + '">' + q.id + '</span>' +
+                  '<span class="strip-call">' + esc(q.callsign) + '</span>' +
+                '</div>' +
+                '<button type="button" class="btn-dismiss" data-action="dismiss" data-qso-id="' + q.id + '" title="Dismiss QSO">×</button>' +
+              '</div>' +
+
+              '<div class="strip-meta">' +
+                '<span>' + esc(q.grid) + ' · ' + q.distanceKm.toLocaleString() + 'km</span>' +
+                '<span class="' + snrClass(q.snr) + '">' + fmtSnr(q.snr) + 'dB · ' + q.freqHz + 'Hz</span>' +
+              '</div>' +
+
+              ((q.tags.length || isAdv || q.stalledCycles >= 2)
+                ? '<div style="display:flex;flex-wrap:wrap;gap:3px;align-items:center">' +
+                    renderTags(q.tags) +
+                    (isAdv ? '<span class="tag tag-adv anim-pop">ADVANCED</span>' : '') +
+                    (q.stalledCycles >= 2 ? '<span class="tag tag-stall">WAIT ' + q.stalledCycles + 'c</span>' : '') +
+                  '</div>'
+                : '') +
+
+              '<div class="strip-msgs">' +
+                '<div class="strip-msg-line strip-msg-rx" title="Last RX">RX: ' + esc(q.lastRx) + '</div>' +
+                '<div class="strip-msg-line strip-msg-tx ' + (q.isArmed ? 'armed' : '') + '" title="Queued TX">TX: ' + esc(q.nextTx) + '</div>' +
+              '</div>' +
+
+              '<div class="strip-footer">' +
+                '<button type="button" class="btn-arm-chip ' + (q.isArmed ? 'armed' : '') + '" data-action="arm" data-qso-id="' + q.id + '">' + (q.isArmed ? '● TX ARMED' : 'ARM TX') + '</button>' +
+                '<a class="btn-qrz" href="' + qrzUrl(q.callsign) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">QRZ ↗</a>' +
+              '</div>' +
+            '</div>';
+          }).join('');
+
+          return '<div class="lane">' +
+            '<div class="lane-head"><span>' + lane.title + '</span><span class="count-chip">' + items.length + '</span></div>' +
+            '<div class="lane-body">' + (cards || '<div class="lane-empty">Empty</div>') + '</div>' +
+          '</div>';
+        }).join('');
+
+        renderSessionLoggedDrawer();
+      }
+
+      function renderSessionLoggedDrawer() {
+        const label = document.getElementById('session-log-label');
+        const body = document.getElementById('session-drawer-body');
+        const toggleBtn = document.getElementById('btn-toggle-session-log');
+        if (!label || !body || !toggleBtn) return;
+
+        const arrow = state.sessionDrawerOpen ? '▾' : '▸';
+        label.textContent = arrow + ' Logged This Session (' + state.sessionLogged.length + ')';
+        toggleBtn.setAttribute('aria-expanded', state.sessionDrawerOpen ? 'true' : 'false');
+        body.style.display = state.sessionDrawerOpen ? 'block' : 'none';
+
+        if (!state.sessionDrawerOpen) return;
+
+        if (!state.sessionLogged.length) {
+          body.innerHTML = '<div style="padding:10px;color:var(--text-muted);font-size:11px">No archived QSOs yet this session.</div>';
+          return;
+        }
+
+        const rows = state.sessionLogged.map(function (l) {
+          return '<tr data-callsign="' + esc(l.callsign) + '" data-hz="' + l.freqHz + '">' +
+            '<td class="mono" style="color:var(--text-muted)">' + esc(l.utc) + '</td>' +
+            '<td class="mono" style="font-weight:700;color:#e2e8f0">' + esc(l.callsign) + '</td>' +
+            '<td class="mono" style="color:var(--text-secondary)">' + esc(l.grid) + '</td>' +
+            '<td class="mono" style="color:#6ee7b7">' + esc(l.rptSent) + ' / ' + esc(l.rptRcvd) + '</td>' +
+            '<td class="mono" style="color:var(--text-muted)">' + l.freqHz + ' Hz</td>' +
+            '<td class="mono" style="color:var(--text-secondary)">' + l.distanceKm.toLocaleString() + ' km</td>' +
+            '<td style="text-align:right"><a class="btn-qrz" href="' + qrzUrl(l.callsign) + '" target="_blank" rel="noopener noreferrer">QRZ ↗</a></td>' +
+          '</tr>';
+        }).join('');
+
+        body.innerHTML = '<table class="dense-table">' +
+          '<thead><tr><th>UTC</th><th>Callsign</th><th>Grid</th><th>Sent / Rcvd</th><th>Freq</th><th>Dist</th><th style="text-align:right">QRZ</th></tr></thead>' +
+          '<tbody>' + rows + '</tbody></table>';
+      }
+
+      /* =======================================================================
+         RENDER PANEL 3: COMPACT HIGH-DENSITY CHANNEL ROSTER TABLE
+         ======================================================================= */
+      function getSortedFilteredRoster() {
+        const search = state.rosterSearch.trim().toUpperCase();
+        const freshThreshold = state.mode === 'FT8' ? 30 : 15; // <= 2 cycles
+
+        const filtered = state.stations.filter(function (st) {
+          if (state.rosterFilter === 'cq' && st.lastMsg.toUpperCase().indexOf('CQ ') !== 0) return false;
+          if (state.rosterFilter === 'sotapota' && st.tags.indexOf('SOTA') === -1 && st.tags.indexOf('POTA') === -1) return false;
+          if (state.rosterFilter === 'inqso' && !getActiveQsoByCall(st.callsign)) return false;
+          if (search) {
+            const matchCall = st.callsign.toUpperCase().indexOf(search) !== -1;
+            const matchGrid = st.grid.toUpperCase().indexOf(search) !== -1;
+            if (!matchCall && !matchGrid) return false;
+          }
+          return true;
+        });
+
+        filtered.sort(function (a, b) {
+          if (state.rosterColSort) {
+            const col = state.rosterColSort.col;
+            const mul = state.rosterColSort.dir === 'asc' ? 1 : -1;
+            if (col === 'callsign') return a.callsign.localeCompare(b.callsign) * mul;
+            if (col === 'grid') return a.grid.localeCompare(b.grid) * mul;
+            if (col === 'dist') return (a.distanceKm - b.distanceKm) * mul;
+            if (col === 'snr') return (a.snr - b.snr) * mul;
+            if (col === 'freq') return (a.freqHz - b.freqHz) * mul;
+            if (col === 'slot') return a.slot.localeCompare(b.slot) * mul;
+            if (col === 'age') return (a.ageSec - b.ageSec) * mul;
+          }
+
+          const preset = state.rosterSortPreset;
+          if (preset === 'fresh_dist') {
+            const aF = a.ageSec <= freshThreshold ? 0 : 1;
+            const bF = b.ageSec <= freshThreshold ? 0 : 1;
+            if (aF !== bF) return aF - bF;
+            return b.distanceKm - a.distanceKm;
+          }
+          if (preset === 'strict_dist') {
+            if (a.ageSec !== b.ageSec) return a.ageSec - b.ageSec;
+            return b.distanceKm - a.distanceKm;
+          }
+          if (preset === 'snr_desc') return b.snr - a.snr;
+          if (preset === 'dist_desc') return b.distanceKm - a.distanceKm;
+          if (preset === 'freq_asc') return a.freqHz - b.freqHz;
+          return b.distanceKm - a.distanceKm;
+        });
+
+        return filtered;
+      }
+
+      function renderRosterTable() {
+        const wrap = document.getElementById('roster-table-wrap');
+        const countEl = document.getElementById('roster-count');
+        if (!wrap) return;
+
+        const list = getSortedFilteredRoster();
+        if (countEl) countEl.textContent = String(list.length);
+
+        const freshThreshold = state.mode === 'FT8' ? 30 : 15;
+        const showFreshBuckets = !state.rosterColSort && state.rosterSortPreset === 'fresh_dist';
+        let addedFreshHdr = false;
+        let addedStaleHdr = false;
+
+        const colHead = function (key, label) {
+          const isSorted = state.rosterColSort && state.rosterColSort.col === key;
+          const arrow = isSorted ? (state.rosterColSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+          return '<th class="sortable ' + (isSorted ? 'sorted' : '') + '" data-sort-col="' + key + '">' + label + arrow + '</th>';
+        };
+
+        const rowsHtml = list.map(function (st) {
+          let prefix = '';
+          const isFresh = st.ageSec <= freshThreshold;
+          if (showFreshBuckets) {
+            if (isFresh && !addedFreshHdr) {
+              addedFreshHdr = true;
+              prefix = '<tr class="bucket-divider"><td colspan="10">● FRESH WINDOW (≤' + freshThreshold + 's · 2 cycles) — Even &amp; Odd stable while sorted by Distance ↓</td></tr>';
+            } else if (!isFresh && !addedStaleHdr) {
+              addedStaleHdr = true;
+              prefix = '<tr class="bucket-divider stale"><td colspan="10">○ STALE (&gt;' + freshThreshold + 's ago)</td></tr>';
+            }
+          }
+
+          const activeQ = getActiveQsoByCall(st.callsign);
+          const logged = !activeQ && isSessionLogged(st.callsign);
+
+          let qsoBadge = '';
+          if (activeQ) {
+            qsoBadge = '<span class="q-pill" style="background:' + activeQ.color + '">' + activeQ.id + '</span>';
+          } else if (logged) {
+            qsoBadge = '<span class="q-pill q-pill-log">LOG</span>';
+          }
+
+          const rowColorAttr = activeQ ? ' data-color="' + activeQ.color + '"' : '';
+          const rowTint = activeQ ? ' style="background:' + hexToRgba(activeQ.color, 0.06) + '"' : '';
+
+          return prefix +
+            '<tr class="' + (isFresh ? '' : 'stale-row') + '"' + rowTint + ' data-callsign="' + esc(st.callsign) + '" data-hz="' + st.freqHz + '"' + rowColorAttr + '>' +
+              '<td>' + qsoBadge + '</td>' +
+              '<td><strong class="mono" style="color:#fff">' + esc(st.callsign) + '</strong> ' + renderTags(st.tags) + '</td>' +
+              '<td class="mono" style="color:var(--text-secondary)">' + esc(st.grid) + '</td>' +
+              '<td class="mono" style="color:var(--text-secondary)">' + st.distanceKm.toLocaleString() + '</td>' +
+              '<td class="mono ' + snrClass(st.snr) + '">' + fmtSnr(st.snr) + '</td>' +
+              '<td class="mono" style="color:var(--text-muted)">' + st.freqHz + '</td>' +
+              '<td><span class="slot-letter slot-' + st.slot + '">' + st.slot + '</span></td>' +
+              '<td class="mono" style="color:' + (isFresh ? '#6ee7b7' : '#64748b') + '">' + st.ageSec + 's</td>' +
+              '<td class="mono roster-msg-cell" title="' + esc(st.lastMsg) + '">' + esc(st.lastMsg) + '</td>' +
+              '<td style="text-align:right">' +
+                '<div class="actions-cell">' +
+                  '<button type="button" class="btn btn-xs btn-call" data-action="call" data-callsign="' + esc(st.callsign) + '">' + (activeQ ? 'Arm' : 'Call') + '</button>' +
+                  '<a class="btn-qrz" href="' + qrzUrl(st.callsign) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">QRZ ↗</a>' +
+                '</div>' +
+              '</td>' +
+            '</tr>';
+        }).join('');
+
+        wrap.innerHTML = '<table class="dense-table">' +
+          '<thead><tr>' +
+            '<th>QSO</th>' +
+            colHead('callsign', 'Callsign') +
+            colHead('grid', 'Grid') +
+            colHead('dist', 'Dist (km)') +
+            colHead('snr', 'SNR') +
+            colHead('freq', 'Freq') +
+            colHead('slot', 'Slot') +
+            colHead('age', 'Age') +
+            '<th>Last Message</th>' +
+            '<th style="text-align:right">Actions</th>' +
+          '</tr></thead>' +
+          '<tbody>' + (rowsHtml || '<tr><td colspan="10" style="text-align:center;color:var(--text-muted);padding:16px">No stations match filter.</td></tr>') + '</tbody>' +
+        '</table>';
+      }
+
+      /* =======================================================================
+         RENDER RIGHT COLUMN: SPLIT-RAIL LIVE BATCH FEED (3 STRICT SECTIONS)
+         ======================================================================= */
+      function renderLiveBatchFeed() {
+        const container = document.getElementById('live-batch-feed');
+        const countEl = document.getElementById('feed-batch-count');
+        if (!container) return;
+
+        if (countEl) countEl.textContent = state.batches.length + ' cycles';
+
+        container.innerHTML = state.batches.map(function (batch, bIdx) {
+          const isLatest = bIdx === 0;
+          const targetingMe = [];
+          const cqList = [];
+          const targetingOthers = [];
+
+          batch.decodes.forEach(function (dec) {
+            const sec = classifySection(dec.text);
+            if (sec === 'TARGETING_ME') targetingMe.push(dec);
+            else if (sec === 'CQ') cqList.push(dec);
+            else targetingOthers.push(dec);
+          });
+
+          const renderSection = function (title, secClass, items) {
+            if (!items.length) return '';
+            const rows = items.map(function (dec) {
+              // Highlight with sequencer color across ALL 3 sections if station is in Active QSO Swimlanes!
+              const linkedQ = getLinkedActiveQsoForDecode(dec);
+              const isAdvancedHere = isLatest && dec.advancedQsoId && linkedQ && dec.advancedQsoId === linkedQ.id;
+              const styleStr = linkedQ
+                ? ('border-left-color:' + linkedQ.color + ';background:' + hexToRgba(linkedQ.color, 0.13) + ';')
+                : '';
+              const colorAttr = linkedQ ? ' data-color="' + linkedQ.color + '"' : '';
+
+              return '<div class="decode-row ' + (linkedQ ? 'in-qso' : '') + '" style="' + styleStr + '" data-callsign="' + esc(dec.callsign) + '" data-hz="' + dec.freqHz + '"' + colorAttr + ' data-action="call" data-callsign-click="' + esc(dec.callsign) + '" title="Click to Call / Arm ' + esc(dec.callsign) + '">' +
+                '<span class="dec-snr ' + snrClass(dec.snr) + '">' + fmtSnr(dec.snr) + '</span>' +
+                '<span class="dec-hz">' + dec.freqHz + 'Hz</span>' +
+                '<span class="dec-msg">' + esc(dec.text) + '</span>' +
+                '<span class="dec-badges">' +
+                  (isAdvancedHere ? '<span class="tag tag-adv anim-pop">↳ ADV</span>' : '') +
+                  (linkedQ ? '<span class="q-pill" style="background:' + linkedQ.color + '">' + linkedQ.id + '</span>' : '') +
+                '</span>' +
+              '</div>';
+            }).join('');
+
+            return '<div class="feed-section-head ' + secClass + '"><span>' + title + '</span><span>' + items.length + '</span></div>' + rows;
+          };
+
+          return '<div class="cycle-block ' + (isLatest ? '' : 'older') + '">' +
+            '<div class="cycle-block-head">' +
+              '<span style="display:inline-flex;align-items:center;gap:6px">' +
+                '<span style="color:#fff">' + esc(batch.timeStr) + '</span>' +
+                '<span class="slot-badge ' + (batch.parity === 'EVEN' ? 'slot-even' : 'slot-odd') + '">' + batch.parity + '</span>' +
+                (isLatest ? '<span style="color:#34d399;font-size:9.5px">LATEST</span>' : '') +
+              '</span>' +
+              '<span style="color:var(--text-muted);font-size:10px">' + batch.decodes.length + ' decodes</span>' +
+            '</div>' +
+            renderSection('Targeting Me', 'sec-me', targetingMe) +
+            renderSection('CQ', 'sec-cq', cqList) +
+            renderSection('Targeting Others', 'sec-others', targetingOthers) +
+          '</div>';
+        }).join('');
+      }
+
+      /* =======================================================================
+         MASTER RENDER
+         ======================================================================= */
+      function renderAll() {
+        const grid = document.getElementById('console-grid');
+        if (grid) grid.classList.toggle('feed-left', state.feedOnLeft);
+
+        renderTelemetry();
+        renderSwimlanes();
+        renderRosterTable();
+        renderLiveBatchFeed();
+
+        // Re-apply hover class if pointer is currently hovering a callsign
+        if (state.hoveredCallsign) {
+          applySyncHoverClasses(state.hoveredCallsign);
+        }
+      }
+
+      /* =======================================================================
+         BIDIRECTIONAL HOVER SYNC (ZERO DOM REBUILD — INSTANT 60FPS)
+         ======================================================================= */
+      function clearSyncHoverClasses() {
+        document.querySelectorAll('.sync-hover').forEach(function (el) {
+          el.classList.remove('sync-hover');
+        });
+      }
+
+      function applySyncHoverClasses(callsign) {
+        clearSyncHoverClasses();
+        if (!callsign) return;
+        const safe = callsign.replace(/"/g, '\\"');
+        document.querySelectorAll('[data-callsign="' + safe + '"]').forEach(function (el) {
+          if (!el.classList.contains('wf-qso-diamond')) {
+            el.classList.add('sync-hover');
+          }
+        });
+      }
+
+      function setHoveredStation(callsign, hz, color) {
+        if (state.hoveredCallsign === callsign) return;
+        state.hoveredCallsign = callsign;
+        state.hoveredHz = hz || null;
+        state.hoveredColor = color || null;
+        applySyncHoverClasses(callsign);
+      }
+
+      /* =======================================================================
+         LIVE SCROLLING RF WATERFALL CANVAS + HOVER BEAM OVERLAY
+         ======================================================================= */
+      const wfCanvas = document.getElementById('waterfall-canvas');
+      const wfOverlay = document.getElementById('waterfall-overlay');
+      const wfCtx = wfCanvas.getContext('2d', { willReadFrequently: true });
+      const ovCtx = wfOverlay.getContext('2d');
+
+      // Precompute 256-entry SDR thermal RF colormap (deep navy -> blue -> cyan -> yellow -> orange -> red)
+      const COLOR_LUT = new Uint8ClampedArray(256 * 3);
+      (function buildColorLut() {
+        for (let i = 0; i < 256; i++) {
+          const t = i / 255;
+          let r = 0, g = 0, b = 0;
+          if (t < 0.25) {
+            const k = t / 0.25;
+            r = 4 + k * 8;
+            g = 10 + k * 24;
+            b = 24 + k * 56;
+          } else if (t < 0.52) {
+            const k = (t - 0.25) / 0.27;
+            r = 12 + k * 14;
+            g = 34 + k * 136;
+            b = 80 + k * 125;
+          } else if (t < 0.78) {
+            const k = (t - 0.52) / 0.26;
+            r = 26 + k * 224;
+            g = 170 + k * 65;
+            b = 205 - k * 165;
+          } else {
+            const k = (t - 0.78) / 0.22;
+            r = 250;
+            g = 235 - k * 185;
+            b = 40 - k * 25;
+          }
+          COLOR_LUT[i * 3] = Math.round(r);
+          COLOR_LUT[i * 3 + 1] = Math.round(g);
+          COLOR_LUT[i * 3 + 2] = Math.round(b);
+        }
+      })();
+
+      let wfWidth = 600;
+      let wfHeight = 130;
+      let wfFrameCount = 0;
+      let wfLastScrollTs = 0;
+
+      function resizeWaterfall() {
+        const stage = document.getElementById('wf-stage');
+        if (!stage) return;
+        const rect = stage.getBoundingClientRect();
+        const newW = Math.max(240, Math.floor(rect.width));
+        const newH = Math.max(100, Math.floor(rect.height));
+
+        if (wfCanvas.width === newW && wfCanvas.height === newH) return;
+
+        // Preserve existing waterfall image across resize if already initialized
+        let prevImg = null;
+        if (wfCanvas.width > 0 && wfCanvas.height > 0 && wfFrameCount > 0) {
+          prevImg = document.createElement('canvas');
+          prevImg.width = wfCanvas.width;
+          prevImg.height = wfCanvas.height;
+          prevImg.getContext('2d').drawImage(wfCanvas, 0, 0);
+        }
+
+        wfWidth = newW;
+        wfHeight = newH;
+        wfCanvas.width = wfWidth;
+        wfCanvas.height = wfHeight;
+        wfOverlay.width = wfWidth;
+        wfOverlay.height = wfHeight;
+
+        if (prevImg) {
+          wfCtx.drawImage(prevImg, 0, 0, wfWidth, wfHeight);
+        } else {
+          seedInitialWaterfallHistory();
+        }
+      }
+
+      /**
+       * Generate one 1px-tall scanline of realistic FT8 RF spectrum + 50 Hz multi-tone traces
+       */
+      function renderWaterfallRow(imgData, rowOffset, activeSignals, isDividerRow, tickPhase) {
+        const data = imgData.data;
+        const w = imgData.width;
+
+        // 1. Base thermal noise floor with realistic passband roll-off
+        for (let x = 0; x < w; x++) {
+          const norm = x / w;
+          const passband = norm < 0.03 ? (norm / 0.03) : (norm > 0.97 ? ((1 - norm) / 0.03) : 1);
+          const n = (Math.random() * 22 + Math.random() * 16 + 10) * passband;
+          let idx = clamp(Math.floor(n), 0, 255);
+          if (isDividerRow) idx = clamp(idx + 52, 0, 255);
+          const p = (rowOffset + x) * 4;
+          data[p]     = COLOR_LUT[idx * 3];
+          data[p + 1] = COLOR_LUT[idx * 3 + 1];
+          data[p + 2] = COLOR_LUT[idx * 3 + 2];
+          data[p + 3] = 255;
+        }
+
+        // 2. Superimpose 50 Hz-wide 8-FSK FT8 signal traces at each active station's exact Hz
+        const hzSpan = WF_MAX_HZ - WF_MIN_HZ;
+        for (let i = 0; i < activeSignals.length; i++) {
+          const sig = activeSignals[i];
+          const centerX = ((sig.freqHz - WF_MIN_HZ) / hzSpan) * w;
+          const widthPx = Math.max(4, (50 / hzSpan) * w);
+          const xStart = Math.max(0, Math.floor(centerX - widthPx * 0.5));
+          const xEnd = Math.min(w - 1, Math.ceil(centerX + widthPx * 0.5));
+
+          // Map SNR (-20..+10 dB) into intensity (95..252)
+          const snrNorm = clamp((sig.snr + 20) / 28, 0.15, 1.0);
+          const basePeak = 85 + snrNorm * 165;
+
+          // Subtle 8-FSK active tone hopper inside the 50 Hz passband
+          const activeTone = Math.floor(Math.abs(Math.sin(tickPhase * 0.45 + sig.freqHz * 0.13)) * 8);
+          const toneCenterX = xStart + ((activeTone + 0.5) / 8) * (xEnd - xStart);
+
+          for (let x = xStart; x <= xEnd; x++) {
+            const distFromEdge = Math.min(x - xStart, xEnd - x) / Math.max(1, widthPx * 0.25);
+            const env = Math.min(1, distFromEdge + 0.35);
+            const toneBoost = Math.max(0, 1 - Math.abs(x - toneCenterX) / 2.2) * 55;
+            const energy = clamp(Math.floor((basePeak * 0.72 + toneBoost) * env + (Math.random() * 24 - 12)), 0, 255);
+
+            const p = (rowOffset + x) * 4;
+            // Additive-max blend against noise floor
+            const r = COLOR_LUT[energy * 3];
+            const g = COLOR_LUT[energy * 3 + 1];
+            const b = COLOR_LUT[energy * 3 + 2];
+            if (r > data[p]) data[p] = r;
+            if (g > data[p + 1]) data[p + 1] = g;
+            if (b > data[p + 2]) data[p + 2] = b;
+          }
+        }
+      }
+
+      function getCurrentWaterfallSignals() {
+        const latest = state.batches[0];
+        if (!latest) return [];
+        return latest.decodes.map(function (d) {
+          return { freqHz: d.freqHz, snr: d.snr };
+        });
+      }
+
+      function seedInitialWaterfallHistory() {
+        const img = wfCtx.createImageData(wfWidth, wfHeight);
+        const batch0 = state.batches[0] ? state.batches[0].decodes : [];
+        const batch1 = state.batches[1] ? state.batches[1].decodes : [];
+        const dividerRow = Math.floor(wfHeight * 0.52);
+
+        for (let y = 0; y < wfHeight; y++) {
+          const sigs = y < dividerRow ? batch0 : batch1;
+          renderWaterfallRow(img, y * wfWidth, sigs, y === dividerRow, y);
+        }
+        wfCtx.putImageData(img, 0, 0);
+      }
+
+      function stepWaterfall(now) {
+        // Scroll 1px down every ~38ms (~26px/s smooth SDR motion)
+        if (now - wfLastScrollTs >= 38) {
+          wfLastScrollTs = now;
+          wfFrameCount += 1;
+
+          // Shift image down by 1 pixel
+          wfCtx.drawImage(wfCanvas, 0, 0, wfWidth, wfHeight - 1, 0, 1, wfWidth, wfHeight - 1);
+
+          // Draw new top scanline
+          const rowImg = wfCtx.createImageData(wfWidth, 1);
+          const isDivider = waterfallCycleFlash;
+          waterfallCycleFlash = false;
+          renderWaterfallRow(rowImg, 0, getCurrentWaterfallSignals(), isDivider, wfFrameCount);
+          wfCtx.putImageData(rowImg, 0, 0);
+        }
+
+        // Draw crisp overlay (TX/RX vertical guide tracks + glowing Hover Beam!)
+        drawWaterfallOverlay();
+        updateCycleTimerUi();
+        requestAnimationFrame(stepWaterfall);
+      }
+
+      function drawWaterfallOverlay() {
+        ovCtx.clearRect(0, 0, wfWidth, wfHeight);
+        const hzSpan = WF_MAX_HZ - WF_MIN_HZ;
+        const bwPx = Math.max(6, (50 / hzSpan) * wfWidth);
+
+        // Subtle RX green track
+        const rxX = ((state.rxHz - WF_MIN_HZ) / hzSpan) * wfWidth;
+        ovCtx.fillStyle = 'rgba(34, 197, 94, 0.08)';
+        ovCtx.fillRect(rxX - bwPx / 2, 0, bwPx, wfHeight);
+        ovCtx.strokeStyle = 'rgba(34, 197, 94, 0.55)';
+        ovCtx.lineWidth = 1;
+        ovCtx.beginPath();
+        ovCtx.moveTo(rxX - bwPx / 2, 0);
+        ovCtx.lineTo(rxX - bwPx / 2, wfHeight);
+        ovCtx.moveTo(rxX + bwPx / 2, 0);
+        ovCtx.lineTo(rxX + bwPx / 2, wfHeight);
+        ovCtx.stroke();
+
+        // Subtle TX red track
+        const txX = ((state.txHz - WF_MIN_HZ) / hzSpan) * wfWidth;
+        ovCtx.fillStyle = state.txEnabled ? 'rgba(239, 68, 68, 0.11)' : 'rgba(239, 68, 68, 0.04)';
+        ovCtx.fillRect(txX - bwPx / 2, 0, bwPx, wfHeight);
+        ovCtx.strokeStyle = state.txEnabled ? 'rgba(239, 68, 68, 0.7)' : 'rgba(239, 68, 68, 0.35)';
+        ovCtx.setLineDash([3, 3]);
+        ovCtx.beginPath();
+        ovCtx.moveTo(txX - bwPx / 2, 0);
+        ovCtx.lineTo(txX - bwPx / 2, wfHeight);
+        ovCtx.moveTo(txX + bwPx / 2, 0);
+        ovCtx.lineTo(txX + bwPx / 2, wfHeight);
+        ovCtx.stroke();
+        ovCtx.setLineDash([]);
+
+        // HOVER BEAM: glowing vertical translucent band + floating callsign+Hz label
+        if (state.hoveredCallsign && state.hoveredHz) {
+          const hx = ((state.hoveredHz - WF_MIN_HZ) / hzSpan) * wfWidth;
+          const beamColor = state.hoveredColor || '#38bdf8';
+          const beamW = Math.max(bwPx + 8, 18);
+
+          // Soft outer glow gradient
+          const grad = ovCtx.createLinearGradient(hx - beamW, 0, hx + beamW, 0);
+          grad.addColorStop(0, 'rgba(0,0,0,0)');
+          grad.addColorStop(0.5, hexToRgba(beamColor, 0.36));
+          grad.addColorStop(1, 'rgba(0,0,0,0)');
+          ovCtx.fillStyle = grad;
+          ovCtx.fillRect(hx - beamW, 0, beamW * 2, wfHeight);
+
+          // Crisp center laser line
+          ovCtx.strokeStyle = beamColor;
+          ovCtx.lineWidth = 1.6;
+          ovCtx.beginPath();
+          ovCtx.moveTo(hx, 0);
+          ovCtx.lineTo(hx, wfHeight);
+          ovCtx.stroke();
+
+          // Floating Callsign + Hz Pill
+          const label = state.hoveredCallsign + ' · ' + state.hoveredHz + ' Hz';
+          ovCtx.font = 'bold 11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+          const tw = ovCtx.measureText(label).width;
+          const padX = 7;
+          const boxW = tw + padX * 2;
+          const boxH = 20;
+          const boxX = clamp(hx - boxW / 2, 6, wfWidth - boxW - 6);
+          const boxY = 8;
+
+          ovCtx.fillStyle = 'rgba(8, 12, 19, 0.92)';
+          ovCtx.strokeStyle = beamColor;
+          ovCtx.lineWidth = 1.4;
+          ovCtx.beginPath();
+          ovCtx.roundRect ? ovCtx.roundRect(boxX, boxY, boxW, boxH, 5) : ovCtx.rect(boxX, boxY, boxW, boxH);
+          ovCtx.fill();
+          ovCtx.stroke();
+
+          ovCtx.fillStyle = '#ffffff';
+          ovCtx.textBaseline = 'middle';
+          ovCtx.fillText(label, boxX + padX, boxY + boxH / 2 + 0.5);
+        }
+      }
+
+      /* =======================================================================
+         WATERFALL CLICK & DRAG INTERACTION (RX / TX BRACKETS)
+         ======================================================================= */
+      let activeDragMode = null; // 'rx' | 'tx' | null
+
+      function setFrequencyFromPointer(clientX, mode) {
+        const stage = document.getElementById('wf-stage');
+        if (!stage) return;
+        const rect = stage.getBoundingClientRect();
+        const pct = (clientX - rect.left) / rect.width;
+        const hz = clamp(Math.round(pctToHz(pct) / 5) * 5, WF_MIN_HZ + 25, WF_MAX_HZ - 25);
+        if (mode === 'tx') state.txHz = hz;
+        else state.rxHz = hz;
+        renderTelemetry();
+      }
+
+      function bindWaterfallInteractions() {
+        const ruler = document.getElementById('wf-ruler');
+        const stage = document.getElementById('wf-stage');
+
+        if (ruler) {
+          ruler.addEventListener('mousedown', function (e) {
+            const handle = e.target.closest('[data-drag]');
+            if (handle) {
+              activeDragMode = handle.getAttribute('data-drag');
+              e.preventDefault();
+              return;
+            }
+            const mode = e.shiftKey ? 'tx' : 'rx';
+            activeDragMode = mode;
+            setFrequencyFromPointer(e.clientX, mode);
+          });
+        }
+
+        if (stage) {
+          stage.addEventListener('mousedown', function (e) {
+            const mode = e.shiftKey ? 'tx' : 'rx';
+            activeDragMode = mode;
+            setFrequencyFromPointer(e.clientX, mode);
+          });
+        }
+
+        window.addEventListener('mousemove', function (e) {
+          if (!activeDragMode) return;
+          setFrequencyFromPointer(e.clientX, activeDragMode);
+        });
+
+        window.addEventListener('mouseup', function () {
+          activeDragMode = null;
+        });
+      }
+
+      /* =======================================================================
+         GLOBAL EVENT BINDINGS
+         ======================================================================= */
+      function bindEvents() {
+        // Mode switcher (FT8 / FT4)
+        const modeSwitch = document.getElementById('mode-switch');
+        if (modeSwitch) {
+          modeSwitch.addEventListener('click', function (e) {
+            const btn = e.target.closest('.mode-btn');
+            if (!btn) return;
+            state.mode = btn.getAttribute('data-mode') || 'FT8';
+            resetCycleClock();
+            renderAll();
+          });
+        }
+
+        // Top Control Buttons
+        document.getElementById('btn-tx-enable').addEventListener('click', function () {
+          state.txEnabled = !state.txEnabled;
+          renderTelemetry();
+        });
+
+        document.getElementById('btn-next-batch').addEventListener('click', triggerNextBatch);
+
+        document.getElementById('btn-auto-cycle').addEventListener('click', function () {
+          state.autoCycle = !state.autoCycle;
+          resetCycleClock();
+          renderTelemetry();
+        });
+
+        document.getElementById('btn-inject-caller').addEventListener('click', injectCaller);
+
+        document.getElementById('btn-flip-feed').addEventListener('click', function () {
+          state.feedOnLeft = !state.feedOnLeft;
+          renderAll();
+          setTimeout(resizeWaterfall, 30);
+        });
+
+        // Session Logged Collapsible Drawer Toggle
+        document.getElementById('btn-toggle-session-log').addEventListener('click', function () {
+          state.sessionDrawerOpen = !state.sessionDrawerOpen;
+          renderSessionLoggedDrawer();
+        });
+
+        // Roster Sort Preset
+        document.getElementById('roster-sort-preset').addEventListener('change', function (e) {
+          state.rosterSortPreset = e.target.value;
+          state.rosterColSort = null;
+          renderRosterTable();
+        });
+
+        // Roster Filter Pills
+        document.getElementById('roster-filters').addEventListener('click', function (e) {
+          const btn = e.target.closest('.filter-pill');
+          if (!btn) return;
+          state.rosterFilter = btn.getAttribute('data-filter') || 'all';
+          document.querySelectorAll('#roster-filters .filter-pill').forEach(function (b) {
+            b.classList.toggle('active', b === btn);
+          });
+          renderRosterTable();
+        });
+
+        // Roster Search Input
+        document.getElementById('roster-search').addEventListener('input', function (e) {
+          state.rosterSearch = e.target.value;
+          renderRosterTable();
+        });
+
+        // Delegated Click Handling across Console (Swimlanes, Roster, Live Batch Feed)
+        const consoleGrid = document.getElementById('console-grid');
+        consoleGrid.addEventListener('click', function (e) {
+          // Allow external QRZ links to behave natively
+          if (e.target.closest('a.btn-qrz')) return;
+
+          // Column header sort in Roster table
+          const th = e.target.closest('th[data-sort-col]');
+          if (th) {
+            const col = th.getAttribute('data-sort-col');
+            if (state.rosterColSort && state.rosterColSort.col === col) {
+              state.rosterColSort.dir = state.rosterColSort.dir === 'asc' ? 'desc' : 'asc';
+            } else {
+              const defaultAsc = (col === 'callsign' || col === 'grid' || col === 'freq' || col === 'age');
+              state.rosterColSort = { col: col, dir: defaultAsc ? 'asc' : 'desc' };
+            }
+            renderRosterTable();
+            return;
+          }
+
+          // Action buttons / interactive rows
+          const actionEl = e.target.closest('[data-action]');
+          if (!actionEl) return;
+          const action = actionEl.getAttribute('data-action');
+          const qsoId = actionEl.getAttribute('data-qso-id');
+          const callsign = actionEl.getAttribute('data-callsign') || actionEl.getAttribute('data-callsign-click');
+
+          if (action === 'dismiss' && qsoId) {
+            e.stopPropagation();
+            dismissQso(qsoId);
+          } else if (action === 'arm' && qsoId) {
+            e.stopPropagation();
+            armQso(qsoId);
+          } else if (action === 'call' && callsign) {
+            e.stopPropagation();
+            callOrSelectStation(callsign);
+          }
+        });
+
+        // Bidirectional Hover Sync across Swimlanes, Live Batch Feed, Roster Table & Waterfall Ruler
+        consoleGrid.addEventListener('mouseover', function (e) {
+          const target = e.target.closest('[data-callsign]');
+          if (!target) {
+            setHoveredStation(null, null, null);
+            return;
+          }
+          const call = target.getAttribute('data-callsign');
+          let hz = parseInt(target.getAttribute('data-hz'), 10);
+          let color = target.getAttribute('data-color');
+
+          const activeQ = getActiveQsoByCall(call);
+          if (activeQ) {
+            color = activeQ.color;
+            if (!hz) hz = activeQ.freqHz;
+          }
+          if (!hz) {
+            const st = getStationByCall(call);
+            if (st) hz = st.freqHz;
+          }
+          setHoveredStation(call, hz, color || '#38bdf8');
+        });
+
+        consoleGrid.addEventListener('mouseleave', function () {
+          setHoveredStation(null, null, null);
+        });
+
+        bindWaterfallInteractions();
+
+        // Responsive canvas resize
+        window.addEventListener('resize', resizeWaterfall);
+        if (typeof ResizeObserver !== 'undefined') {
+          const ro = new ResizeObserver(resizeWaterfall);
+          ro.observe(document.getElementById('wf-stage'));
+        }
+      }
+
+      /* =======================================================================
+         BOOT APPLICATION
+         ======================================================================= */
+      bindEvents();
+      renderAll();
+      resizeWaterfall();
+      requestAnimationFrame(stepWaterfall);
+    })();
+  </script>
+</body>
+</html>
