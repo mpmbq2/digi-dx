@@ -150,6 +150,8 @@ export interface RadioLiveSettings {
   xit_hz: number | null;
   strength_db: number | null;
   rf_power_watts: number | null;
+  tx_swr?: number | null;
+  tx_swr_live?: boolean;
   levels: Record<string, number>;
   funcs: Record<string, boolean>;
 }

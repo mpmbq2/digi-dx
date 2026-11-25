@@ -150,6 +150,8 @@ impl AppState {
 pub fn fast_test_worker_timing() -> WorkerTiming {
     WorkerTiming {
         poll_interval: Duration::from_millis(150),
+        tx_swr_initial_delay: Duration::from_millis(100),
+        tx_swr_poll_interval: Duration::from_millis(200),
         recovery_backoffs: vec![
             Duration::from_millis(100),
             Duration::from_millis(200),

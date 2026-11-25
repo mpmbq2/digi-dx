@@ -58,6 +58,10 @@ pub struct RadioLiveSettings {
     pub xit_hz: Option<i32>,
     pub strength_db: Option<i32>,
     pub rf_power_watts: Option<f64>,
+    #[serde(default)]
+    pub tx_swr: Option<f64>,
+    #[serde(default)]
+    pub tx_swr_live: bool,
     pub levels: BTreeMap<String, f64>,
     pub funcs: BTreeMap<String, bool>,
 }
@@ -114,6 +118,8 @@ impl RadioRuntimeSnapshot {
 #[derive(Debug, Clone)]
 pub struct WorkerTiming {
     pub poll_interval: Duration,
+    pub tx_swr_initial_delay: Duration,
+    pub tx_swr_poll_interval: Duration,
     pub recovery_backoffs: Vec<Duration>,
     pub standby_poll_interval: Duration,
 }
@@ -121,7 +127,9 @@ pub struct WorkerTiming {
 impl Default for WorkerTiming {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(1500),
+            tx_swr_initial_delay: Duration::from_secs(1),
+            tx_swr_poll_interval: Duration::from_secs(3),
             recovery_backoffs: vec![
                 Duration::from_secs(1),
                 Duration::from_secs(2),
@@ -236,6 +244,7 @@ pub struct RadioWorker {
     halted_by_operator: bool,
     app_ptt_active: bool,
     atu_refresh_polls_remaining: u8,
+    pending_tx_swr_at: Option<Instant>,
     pending_recovery_at: Option<Instant>,
     pending_standby_probe_at: Option<Instant>,
     poll_counter: u32,
@@ -276,6 +285,7 @@ impl RadioWorker {
             halted_by_operator: false,
             app_ptt_active: false,
             atu_refresh_polls_remaining: 0,
+            pending_tx_swr_at: None,
             pending_recovery_at: None,
             pending_standby_probe_at: None,
             poll_counter: 0,
@@ -315,6 +325,12 @@ impl RadioWorker {
                     None => std::future::pending::<()>().await,
                 }
             };
+            let tx_swr_fut = async {
+                match self.pending_tx_swr_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
 
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
@@ -334,6 +350,13 @@ impl RadioWorker {
                         && self.running.is_none()
                     {
                         self.start_rigctld(true).await;
+                    }
+                }
+                _ = tx_swr_fut, if self.running.is_some() && self.app_ptt_active => {
+                    self.pending_tx_swr_at = None;
+                    self.poll_tx_swr().await;
+                    if self.running.is_some() && self.app_ptt_active {
+                        self.pending_tx_swr_at = Some(Instant::now() + self.timing.tx_swr_poll_interval);
                     }
                 }
                 _ = poll_timer.tick(), if self.running.is_some() && !self.app_ptt_active => {
@@ -808,8 +831,13 @@ impl RadioWorker {
 
         let mut changed = false;
         if self.snapshot.freq_hz != Some(freq) {
+            let next_band = derive_band(freq).map(str::to_string);
+            if self.snapshot.band != next_band {
+                next_settings.tx_swr = None;
+                next_settings.tx_swr_live = false;
+            }
             self.snapshot.freq_hz = Some(freq);
-            self.snapshot.band = derive_band(freq).map(str::to_string);
+            self.snapshot.band = next_band;
             let _ = self
                 .store
                 .update_radio_last_freq(&self.profile.radio_id, freq as i64);
@@ -968,6 +996,8 @@ impl RadioWorker {
 
         self.snapshot.freq_hz = Some(confirmed);
         self.snapshot.band = band.clone();
+        self.snapshot.settings.tx_swr = None;
+        self.snapshot.settings.tx_swr_live = false;
         if let Some(enabled) = tuner_enabled {
             self.snapshot
                 .settings
@@ -1097,6 +1127,21 @@ impl RadioWorker {
             .map_err(|e| map_rigctld_err(e, ErrorCode::CatCommandFailed))?;
         self.app_ptt_active = active;
         self.snapshot.ptt = active;
+        if active {
+            let supports_swr = self
+                .snapshot
+                .capabilities
+                .as_ref()
+                .is_none_or(|c| c.get_levels.iter().any(|l| l == "SWR"));
+            self.pending_tx_swr_at = if supports_swr {
+                Some(Instant::now() + self.timing.tx_swr_initial_delay)
+            } else {
+                None
+            };
+        } else {
+            self.pending_tx_swr_at = None;
+            self.snapshot.settings.tx_swr_live = false;
+        }
         self.publish_snapshot(Some(if active {
             format!("PTT asserted (+T {ptt_val})")
         } else {
@@ -1107,6 +1152,29 @@ impl RadioWorker {
             "radio_id": self.profile.radio_id,
             "ptt": active,
         }))
+    }
+
+    async fn poll_tx_swr(&mut self) {
+        let supports_swr = self
+            .snapshot
+            .capabilities
+            .as_ref()
+            .is_none_or(|c| c.get_levels.iter().any(|l| l == "SWR"));
+        if !supports_swr {
+            return;
+        }
+        let Some(ref mut rig) = self.running else {
+            return;
+        };
+        if let Ok(Some(val)) = rig.client.get_level("SWR").await {
+            if val.is_finite() && val >= 1.0 {
+                let rounded = (val * 100.0).round() / 100.0;
+                self.snapshot.settings.tx_swr = Some(rounded);
+                self.snapshot.settings.tx_swr_live = true;
+                self.snapshot.last_poll_utc = Some(now_utc_str());
+                self.publish_snapshot(None);
+            }
+        }
     }
 
     async fn read_all_settings(
@@ -1150,6 +1218,9 @@ impl RadioWorker {
             ],
         };
         for name in level_names {
+            if name == "SWR" {
+                continue;
+            }
             if let Ok(Some(val)) = client.get_level(&name).await {
                 if name == "STRENGTH" {
                     out.strength_db = Some(val.round() as i32);
@@ -1549,7 +1620,9 @@ impl RadioWorker {
             );
         } else {
             self.app_ptt_active = false;
+            self.pending_tx_swr_at = None;
             self.snapshot.ptt = false;
+            self.snapshot.settings.tx_swr_live = false;
             self.publish_snapshot(Some(confirmed_detail));
         }
     }
@@ -1561,7 +1634,9 @@ impl RadioWorker {
         }
         self.snapshot.rigctld_pid = None;
         self.snapshot.ptt = false;
+        self.snapshot.settings.tx_swr_live = false;
         self.app_ptt_active = false;
+        self.pending_tx_swr_at = None;
         self.atu_refresh_polls_remaining = 0;
     }
 

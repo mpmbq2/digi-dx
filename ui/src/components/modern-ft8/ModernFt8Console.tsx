@@ -245,6 +245,10 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
     await runRadioCmd("radio.set_level", { name: "RFPOWER", value: level0to1 });
   };
 
+  const handleSetRfGain = async (level0to1: number) => {
+    await runRadioCmd("radio.set_level", { name: "RF", value: level0to1 });
+  };
+
   const handleToggleTune = async () => {
     const next = !isTuning;
     await runRadioCmd("tx.tune", {
@@ -619,6 +623,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                   onSelectBand={(b) => void handleSelectBand(b)}
                   onSelectMode={(m) => void handleSelectMode(m)}
                   onSetRfPower={handleSetRfPower}
+                  onSetRfGain={handleSetRfGain}
                   onToggleTxEnabled={() =>
                     void runRadioCmd("qso.set_tx_enabled", {
                       enabled: !(activeSession?.tx_enabled ?? false),
