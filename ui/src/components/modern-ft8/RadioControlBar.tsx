@@ -19,6 +19,7 @@ interface Props {
   onSelectBand: (band: string) => void;
   onSelectMode: (mode: DigitalMode) => void;
   onSetRfPower: (level0to1: number) => Promise<void>;
+  onSetRfGain: (level0to1: number) => Promise<void>;
   onToggleTxEnabled: () => void;
   onHaltTx: () => void;
   onToggleTune: () => void;
@@ -32,6 +33,37 @@ interface Props {
 }
 
 const POWER_PRESETS = [10, 25, 50, 100] as const;
+
+function strengthToSUnits(db: number | null | undefined): {
+  shortLabel: string;
+  fullLabel: string;
+  pct: number;
+} {
+  if (db === null || db === undefined) {
+    return { shortLabel: "—", fullLabel: "—", pct: 0 };
+  }
+  // Hamlib STRENGTH: 0 dB = S9, -6 dB per S-unit down to -54 (S0)
+  if (db <= 0) {
+    const s = Math.max(0, Math.min(9, Math.round(9 + db / 6)));
+    return {
+      shortLabel: `S${s}`,
+      fullLabel: `S${s} (${db} dB)`,
+      pct: Math.max(4, Math.min(65, ((db + 54) / 54) * 65)),
+    };
+  }
+  const over = Math.min(60, db);
+  return {
+    shortLabel: `S9+${over}`,
+    fullLabel: `S9+${over} (+${db} dB)`,
+    pct: 65 + (over / 60) * 35,
+  };
+}
+
+function swrToMeterPct(swr: number | null): number {
+  if (swr === null) return 0;
+  // Map 1.0:1 -> 8% (visible baseline) up to 3.0:1+ -> 100%
+  return Math.max(8, Math.min(100, 8 + ((swr - 1.0) / 2.0) * 92));
+}
 
 export function RadioControlBar({
   radio,
@@ -49,6 +81,7 @@ export function RadioControlBar({
   onSelectBand,
   onSelectMode,
   onSetRfPower,
+  onSetRfGain,
   onToggleTxEnabled,
   onHaltTx,
   onToggleTune,
@@ -149,6 +182,91 @@ export function RadioControlBar({
     };
   };
 
+  const backendRfGain = radio?.settings?.levels?.RF;
+  const supportsRfGain = Boolean(
+    radio && (radio.capabilities?.set_levels?.includes("RF") ?? false)
+  );
+
+  const [localRfGainPct, setLocalRfGainPct] = useState<number>(() =>
+    typeof backendRfGain === "number"
+      ? Math.max(0, Math.min(100, Math.round(backendRfGain * 100)))
+      : 100
+  );
+
+  const rfGainDraggingRef = useRef(false);
+  const rfGainCommittedOnUpRef = useRef(false);
+  const latestRfGainPctRef = useRef(localRfGainPct);
+  const rfGainDebounceRef = useRef<number | null>(null);
+  const rfGainGlobalUpCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    if (
+      typeof backendRfGain === "number" &&
+      !rfGainDraggingRef.current &&
+      rfGainDebounceRef.current === null
+    ) {
+      const pct = Math.max(0, Math.min(100, Math.round(backendRfGain * 100)));
+      setLocalRfGainPct(pct);
+      latestRfGainPctRef.current = pct;
+    }
+  }, [backendRfGain]);
+
+  useEffect(() => {
+    return () => {
+      if (rfGainDebounceRef.current !== null) {
+        window.clearTimeout(rfGainDebounceRef.current);
+      }
+      if (rfGainGlobalUpCleanupRef.current) {
+        rfGainGlobalUpCleanupRef.current();
+      }
+    };
+  }, []);
+
+  const commitRfGain = (pct: number) => {
+    if (rfGainDebounceRef.current !== null) {
+      window.clearTimeout(rfGainDebounceRef.current);
+      rfGainDebounceRef.current = null;
+    }
+    const clamped = Math.max(0, Math.min(100, Math.round(pct)));
+    void onSetRfGain(Number((clamped / 100).toFixed(2)));
+  };
+
+  const scheduleDebouncedRfGain = (pct: number) => {
+    if (rfGainDebounceRef.current !== null) {
+      window.clearTimeout(rfGainDebounceRef.current);
+    }
+    rfGainDebounceRef.current = window.setTimeout(() => {
+      rfGainDebounceRef.current = null;
+      commitRfGain(pct);
+    }, 300);
+  };
+
+  const handleRfGainPointerDown = () => {
+    rfGainDraggingRef.current = true;
+    rfGainCommittedOnUpRef.current = false;
+    if (rfGainDebounceRef.current !== null) {
+      window.clearTimeout(rfGainDebounceRef.current);
+      rfGainDebounceRef.current = null;
+    }
+    if (rfGainGlobalUpCleanupRef.current) {
+      rfGainGlobalUpCleanupRef.current();
+      rfGainGlobalUpCleanupRef.current = null;
+    }
+    const onGlobalUp = () => {
+      rfGainGlobalUpCleanupRef.current = null;
+      if (!rfGainDraggingRef.current) return;
+      rfGainDraggingRef.current = false;
+      rfGainCommittedOnUpRef.current = true;
+      commitRfGain(latestRfGainPctRef.current);
+    };
+    window.addEventListener("pointerup", onGlobalUp, { once: true });
+    window.addEventListener("pointercancel", onGlobalUp, { once: true });
+    rfGainGlobalUpCleanupRef.current = () => {
+      window.removeEventListener("pointerup", onGlobalUp);
+      window.removeEventListener("pointercancel", onGlobalUp);
+    };
+  };
+
   const canControlCat = Boolean(
     radio &&
       (radio.lifecycle_state === "READY" ||
@@ -191,9 +309,32 @@ export function RadioControlBar({
   const rawTunerFunc = radio?.settings?.funcs?.TUNER;
   const atuEnabled: boolean | null =
     typeof rawTunerFunc === "boolean" ? rawTunerFunc : null;
+  const supportsStrength = Boolean(
+    caps && (caps.get_levels ?? []).includes("STRENGTH")
+  );
+  const supportsSwr = Boolean(
+    caps && (caps.get_levels ?? []).includes("SWR")
+  );
+  const sMeter = strengthToSUnits(radio?.settings?.strength_db);
+  const rawTxSwr = radio?.settings?.tx_swr;
+  const txSwr: number | null =
+    typeof rawTxSwr === "number" && Number.isFinite(rawTxSwr) && rawTxSwr >= 1
+      ? rawTxSwr
+      : null;
+  const txSwrLive = Boolean(radio?.settings?.tx_swr_live);
+  const swrToneClass =
+    txSwr === null
+      ? "unknown"
+      : txSwr <= 1.5
+      ? "good"
+      : txSwr <= 2.5
+      ? "warn"
+      : "high";
   const isTransmitting = Boolean(
     radio?.ptt || txState === "transmitting" || isTuning
   );
+  const showSwrMeter = isTransmitting && supportsSwr;
+  const showRfMeter = supportsStrength || supportsSwr;
 
   return (
     <div class="mft8-telem-row" data-testid="mft8-radio-bar">
@@ -325,6 +466,54 @@ export function RadioControlBar({
             ))}
           </div>
         </div>
+
+        {supportsRfGain && (
+          <div
+            class="mft8-pwr-box"
+            title="Receiver RF Gain (emits CAT command on release)"
+          >
+            <span class="mft8-mono" style={{ fontSize: "9.5px", color: "#94a3b8" }}>
+              RF
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              class="mft8-pwr-slider"
+              data-testid="mft8-rf-gain-slider"
+              aria-label="RF Gain"
+              disabled={!canControlCat}
+              value={localRfGainPct}
+              onPointerDown={handleRfGainPointerDown}
+              onInput={(e) => {
+                const pct = Math.max(
+                  0,
+                  Math.min(
+                    100,
+                    Math.round(Number((e.currentTarget as HTMLInputElement).value))
+                  )
+                );
+                latestRfGainPctRef.current = pct;
+                setLocalRfGainPct(pct);
+                if (!rfGainDraggingRef.current) {
+                  scheduleDebouncedRfGain(pct);
+                }
+              }}
+              onChange={() => {
+                if (rfGainCommittedOnUpRef.current) {
+                  rfGainCommittedOnUpRef.current = false;
+                  return;
+                }
+                if (rfGainDraggingRef.current) return;
+                scheduleDebouncedRfGain(latestRfGainPctRef.current);
+              }}
+            />
+            <span class="mft8-pwr-readout" data-testid="mft8-rf-gain-readout">
+              {localRfGainPct}%
+            </span>
+          </div>
+        )}
       </div>
 
       <div class="mft8-telem-group">
@@ -404,6 +593,47 @@ export function RadioControlBar({
                 </span>
               </button>
             )}
+          </div>
+        )}
+
+        {showRfMeter && (
+          <div
+            data-testid="mft8-rf-meter"
+            class={`mft8-rf-meter ${
+              showSwrMeter ? `tx ${swrToneClass}` : "rx"
+            }`}
+            title={
+              showSwrMeter
+                ? txSwr !== null
+                  ? `TX SWR: ${txSwr.toFixed(1)}:1${txSwrLive ? " (live)" : ""}`
+                  : "TX SWR (measuring 1s after TX start)"
+                : `RX S-Meter: ${sMeter.fullLabel}${
+                    txSwr !== null ? ` · Last TX SWR: ${txSwr.toFixed(1)}:1` : ""
+                  }`
+            }
+          >
+            <span class="mft8-rf-meter-tag">
+              {showSwrMeter ? "SWR" : "S"}
+            </span>
+            <div class="mft8-rf-meter-track">
+              <div
+                class={`mft8-rf-meter-fill ${
+                  showSwrMeter ? `swr ${swrToneClass}` : "smeter"
+                }`}
+                style={{
+                  width: `${
+                    showSwrMeter ? swrToMeterPct(txSwr) : sMeter.pct
+                  }%`,
+                }}
+              />
+            </div>
+            <span class="mft8-rf-meter-val" data-testid="mft8-rf-meter-val">
+              {showSwrMeter
+                ? txSwr !== null
+                  ? `${txSwr.toFixed(1)}:1`
+                  : "…"
+                : sMeter.shortLabel}
+            </span>
           </div>
         )}
 

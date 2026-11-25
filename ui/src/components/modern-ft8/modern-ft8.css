@@ -447,6 +447,82 @@
   background: #64748b;
 }
 
+.modern-ft8-root .mft8-rf-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--mft8-bg-inset);
+  border: 1px solid var(--mft8-border-strong);
+  font-family: var(--mft8-font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  color: #cbd5e1;
+}
+.modern-ft8-root .mft8-rf-meter.tx {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.08);
+}
+.modern-ft8-root .mft8-rf-meter.tx.good {
+  border-color: rgba(52, 211, 153, 0.55);
+  background: rgba(16, 185, 129, 0.1);
+}
+.modern-ft8-root .mft8-rf-meter.tx.high {
+  border-color: rgba(239, 68, 68, 0.65);
+  background: rgba(239, 68, 68, 0.14);
+}
+.modern-ft8-root .mft8-rf-meter-tag {
+  color: #94a3b8;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  min-width: 12px;
+}
+.modern-ft8-root .mft8-rf-meter.tx .mft8-rf-meter-tag {
+  color: #fcd34d;
+}
+.modern-ft8-root .mft8-rf-meter-track {
+  width: 82px;
+  height: 7px;
+  background: #0b1220;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  flex-shrink: 0;
+}
+.modern-ft8-root .mft8-rf-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 180ms ease;
+}
+.modern-ft8-root .mft8-rf-meter-fill.smeter {
+  background: linear-gradient(90deg, #22c55e 0%, #38bdf8 65%, #f59e0b 85%, #ef4444 100%);
+}
+.modern-ft8-root .mft8-rf-meter-fill.swr.good {
+  background: #34d399;
+}
+.modern-ft8-root .mft8-rf-meter-fill.swr.warn {
+  background: linear-gradient(90deg, #34d399 0%, #f59e0b 100%);
+}
+.modern-ft8-root .mft8-rf-meter-fill.swr.high {
+  background: linear-gradient(90deg, #f59e0b 0%, #ef4444 100%);
+}
+.modern-ft8-root .mft8-rf-meter-val {
+  min-width: 34px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.modern-ft8-root .mft8-rf-meter.tx.good .mft8-rf-meter-val {
+  color: #6ee7b7;
+}
+.modern-ft8-root .mft8-rf-meter.tx.warn .mft8-rf-meter-val {
+  color: #fcd34d;
+}
+.modern-ft8-root .mft8-rf-meter.tx.high .mft8-rf-meter-val {
+  color: #fca5a5;
+}
+
 .modern-ft8-root .mft8-btn-xs {
   padding: 2px 6px;
   font-size: 10px;
