@@ -81,7 +81,7 @@ pub fn default_data_dir() -> PathBuf {
                 .join("Application Support")
                 .join("digi-dx");
         }
-        return PathBuf::from("/tmp/digi-dx");
+        PathBuf::from("/tmp/digi-dx")
     }
 
     #[cfg(not(target_os = "macos"))]
