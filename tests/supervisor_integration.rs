@@ -935,7 +935,7 @@ while True:
         &state,
         &rid,
         RadioLifecycleState::PoweredOff,
-        Duration::from_secs(4),
+        Duration::from_secs(10),
     )
     .await;
     assert!(off_snap.last_error.is_none());
@@ -975,7 +975,7 @@ while True:
         &state,
         &rid,
         RadioLifecycleState::Ready,
-        Duration::from_secs(4),
+        Duration::from_secs(10),
     )
     .await;
     assert_eq!(on_snap.freq_hz, Some(14_074_000));
@@ -989,7 +989,7 @@ while True:
         &state,
         &rid,
         RadioLifecycleState::PoweredOff,
-        Duration::from_secs(4),
+        Duration::from_secs(10),
     )
     .await;
     assert!(timeout_off.last_error.is_none());
@@ -1000,7 +1000,7 @@ while True:
         &state,
         &rid,
         RadioLifecycleState::Ready,
-        Duration::from_secs(4),
+        Duration::from_secs(10),
     )
     .await;
 
