@@ -109,13 +109,27 @@ pub fn run_preflight(cfg: &DaemonConfig, probe_audio: bool) -> PreflightReport {
 
     checks.push(check_audio_backend(probe_audio));
 
-    let jt9_check = check_jt9_decoder(cfg.jt9_path.as_deref());
-    let active_ft8_decoder = if jt9_check.status == CheckStatus::Pass {
-        "jt9".to_string()
+    let ftxr_check = check_ftxr_decoder(cfg.ftxr_path.as_deref());
+    let active_ft8_decoder = if ftxr_check.status == CheckStatus::Pass {
+        checks.push(ftxr_check);
+        "ftxr".to_string()
     } else {
-        "ft8_lib_fallback".to_string()
+        let jt9_check = check_jt9_decoder(cfg.jt9_path.as_deref());
+        if jt9_check.status == CheckStatus::Pass {
+            checks.push(PreflightCheck {
+                id: ftxr_check.id,
+                status: CheckStatus::Info,
+                severity: CheckSeverity::Info,
+                detail: format!("{} (using legacy jt9 fallback)", ftxr_check.detail),
+                remediation: ftxr_check.remediation,
+            });
+            checks.push(jt9_check);
+            "jt9".to_string()
+        } else {
+            checks.push(ftxr_check);
+            "ft8_lib_fallback".to_string()
+        }
     };
-    checks.push(jt9_check);
 
     checks.push(check_sqlite_storage(&cfg.data_dir));
     checks.push(check_system_clock_sync());
@@ -596,6 +610,47 @@ fn check_audio_backend(probe_audio: bool) -> PreflightCheck {
             ),
             remediation: None,
         }
+    }
+}
+
+fn check_ftxr_decoder(override_path: Option<&Path>) -> PreflightCheck {
+    let Some(ftxr_path) = crate::modem::ftxr::find_ftxr_candidate(override_path) else {
+        return PreflightCheck {
+            id: "ft8_decoder_ftxr".to_string(),
+            status: CheckStatus::Warn,
+            severity: CheckSeverity::Warn,
+            detail: "ftxr-modem binary not found; built-in MIT ft8_lib fallback decoder will be used"
+                .to_string(),
+            remediation: Some(
+                "Install ftxr-modem from https://github.com/mpmbq2/ftxr-modem/releases (or re-run scripts/install.sh) for full weak-signal FT8/FT4 decoding."
+                    .to_string(),
+            ),
+        };
+    };
+
+    match crate::modem::ftxr::verify_ftxr_binary(&ftxr_path) {
+        Ok(info) => PreflightCheck {
+            id: "ft8_decoder_ftxr".to_string(),
+            status: CheckStatus::Pass,
+            severity: CheckSeverity::Warn,
+            detail: format!(
+                "ftxr-modem {} (ipc-v{}) verified at {}",
+                info.version,
+                info.ipc_protocol_version,
+                info.path.display()
+            ),
+            remediation: None,
+        },
+        Err(reason) => PreflightCheck {
+            id: "ft8_decoder_ftxr".to_string(),
+            status: CheckStatus::Warn,
+            severity: CheckSeverity::Warn,
+            detail: format!("ftxr-modem probe failed: {reason}"),
+            remediation: Some(
+                "Install a matching ftxr-modem release binary (IPC v1) or verify DIGI_DX_FTXR_PATH."
+                    .to_string(),
+            ),
+        },
     }
 }
 

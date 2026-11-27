@@ -105,6 +105,7 @@ impl AppState {
             Arc::clone(&supervisor),
             Arc::clone(&watchdog),
             ws_tx.clone(),
+            config.ftxr_path.as_deref(),
             config.jt9_path.as_deref(),
             Some(jt9_data_dir.as_path()),
         );
@@ -278,6 +279,7 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
         Arc::clone(&supervisor),
         Arc::clone(&watchdog),
         ws_tx.clone(),
+        config.ftxr_path.as_deref(),
         config.jt9_path.as_deref(),
         Some(jt9_data_dir.as_path()),
     );
@@ -332,6 +334,7 @@ pub async fn serve_daemon(config: DaemonConfig) -> Result<(), Box<dyn std::error
 
     shutdown.cancel();
     sessions.stop_if_active().await;
+    sessions.shutdown_decoder().await;
     watchdog.disarm_all().await;
     supervisor.shutdown_all().await;
     let _ = worker_handle.await;

@@ -259,9 +259,9 @@ jobs:
                 Then open the web console in your browser:
                   http://127.0.0.1:8788
 
-                Optional: install WSJT-X for full weak-signal jt9 decoding
-                (otherwise Digi-Dx uses its built-in ft8_lib decoder):
-                  brew install --cask wsjtx
+                Default weak-signal FT8/FT4 decoder: install ftxr-modem
+                (otherwise Digi-Dx falls back to jt9 or its built-in ft8_lib decoder):
+                  https://github.com/mpmbq2/ftxr-modem/releases
 
                 Note: on first run, macOS may ask for Microphone permission so
                 Digi-Dx can read RX audio from your radio's USB soundcard.

@@ -41,7 +41,9 @@ export function SystemHealthGrid({
 }: Props) {
   const decoder =
     preflight?.active_ft8_decoder ?? health?.active_ft8_decoder ?? "unknown";
-  const isFallback = decoder !== "jt9";
+  const isFtxr = decoder === "ftxr";
+  const isJt9 = decoder === "jt9";
+  const isFallback = !isFtxr && !isJt9;
 
   return (
     <section class="health-grid" aria-label="Daemon System Health">
@@ -77,16 +79,22 @@ export function SystemHealthGrid({
       </div>
 
       <div class="metric-card">
-        <div class="metric-label">FT8 Decoder Engine</div>
+        <div class="metric-label">FT8 / FT4 Decoder Engine</div>
         <div class="metric-value">
           <span class={`badge ${isFallback ? "badge-warn" : "badge-ok"}`}>
-            {isFallback ? "Fallback (ft8_lib)" : "WSJT-X jt9"}
+            {isFtxr
+              ? "ftxr-modem (FT8/FT4)"
+              : isJt9
+              ? "WSJT-X jt9"
+              : "Fallback (ft8_lib)"}
           </span>
         </div>
         <div class="metric-sub">
-          {isFallback
-            ? "Install wsjtx for ~-24 dB jt9 sensitivity"
-            : "High-sensitivity jt9 active"}
+          {isFtxr
+            ? "Pure-Rust weak-signal ftxr engine active"
+            : isJt9
+            ? "High-sensitivity jt9 active (legacy fallback)"
+            : "Install ftxr-modem for ~-24 dB FT8/FT4 sensitivity"}
         </div>
       </div>
 

@@ -325,6 +325,7 @@ impl Ft8Decoder for Jt9SubprocessDecoder {
             timeout: self.timeout,
             generate_wisdom_if_missing: true,
             fallback_on_empty_timeout: true,
+            ..DecodePassOptions::default()
         };
         self.decode_slot_streaming(slot_ts, samples_12k, opts, tx, CancellationToken::new())
             .await

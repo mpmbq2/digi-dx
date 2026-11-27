@@ -1,14 +1,20 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use digi_dx::audio::dsp::{
-    resample_48k_to_12k, DSP_SAMPLE_RATE, FT8_SAMPLE_RATE, FT8_SLOT_SAMPLES_12K,
+    resample_48k_to_12k, DSP_SAMPLE_RATE, FT4_SLOT_SAMPLES_12K, FT8_SAMPLE_RATE,
+    FT8_SLOT_SAMPLES_12K,
 };
 use digi_dx::audio::wav::read_wav_mono_f32;
+use digi_dx::cli::ServeArgs;
+use digi_dx::config::DaemonConfig;
 use digi_dx::domain::clock::UnixSecs;
 use digi_dx::modem::ft8_lib::{Ft8LibEmbeddedDecoder, Ft8LibTxModulator};
 use digi_dx::modem::jt9::{parse_jt9_stdout, Jt9SubprocessDecoder};
-use digi_dx::modem::{DecodePassOptions, Ft8Decode, Ft8Decoder, HybridFt8Decoder};
+use digi_dx::modem::{
+    DecodePassOptions, Ft8Decode, Ft8Decoder, HybridFt8Decoder, ModemMode, QsoDecodeContext,
+};
+use digi_dx::preflight::{run_preflight, CheckStatus};
 use digi_dx::qso::reconciler::{ReconcileOutcome, SlotDecodeReconciler};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -121,7 +127,11 @@ async fn hybrid_decoder_falls_back_to_ft8_lib_when_jt9_missing() {
         .join("191111_110200.wav");
     let (_, samples_12k) = read_wav_mono_f32(&wav_path).unwrap();
 
-    let hybrid = HybridFt8Decoder::new(Some(Path::new("/nonexistent/digi-dx/jt9")));
+    let hybrid = HybridFt8Decoder::with_backends(
+        Some(Path::new("/nonexistent/digi-dx/ftxr-modem")),
+        Some(Path::new("/nonexistent/digi-dx/jt9")),
+        None,
+    );
     assert_eq!(hybrid.active_backend_name(), "ft8_lib_fallback");
     assert_eq!(hybrid.backend_name(), "ft8_lib_fallback");
 
@@ -242,6 +252,7 @@ async fn streaming_jt9_emits_decodes_before_exit_and_reconciles_three_passes() {
                 timeout: Duration::from_millis(2_000),
                 generate_wisdom_if_missing: false,
                 fallback_on_empty_timeout: false,
+                ..DecodePassOptions::default()
             },
             tx1,
             CancellationToken::new(),
@@ -271,6 +282,7 @@ async fn streaming_jt9_emits_decodes_before_exit_and_reconciles_three_passes() {
                 timeout: Duration::from_millis(2_000),
                 generate_wisdom_if_missing: false,
                 fallback_on_empty_timeout: false,
+                ..DecodePassOptions::default()
             },
             tx2,
             CancellationToken::new(),
@@ -297,6 +309,7 @@ async fn streaming_jt9_emits_decodes_before_exit_and_reconciles_three_passes() {
                     timeout: Duration::from_millis(4_000),
                     generate_wisdom_if_missing: true,
                     fallback_on_empty_timeout: true,
+                    ..DecodePassOptions::default()
                 },
                 tx3,
                 cancel3,
@@ -438,4 +451,320 @@ async fn mid_slot_hotswap_tx_waveform_decodes_replacement_message_in_jt9() {
             "jt9 unexpectedly decoded cancelled stale prefix: {jt9_decodes:?}"
         );
     }
+}
+
+fn locate_test_ftxr_bin() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DIGI_DX_FTXR_PATH") {
+        let pb = PathBuf::from(p);
+        if let Some(found) = HybridFt8Decoder::resolve_ftxr_path(Some(&pb)) {
+            return Some(found);
+        }
+    }
+    if let Some(found) = HybridFt8Decoder::resolve_ftxr_path(None) {
+        return Some(found);
+    }
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        "../ftxr-modem/target/release/ftxr-modem",
+        "../ftxr-modem/target/debug/ftxr-modem",
+    ] {
+        let candidate = manifest_dir.join(rel);
+        if let Some(found) = HybridFt8Decoder::resolve_ftxr_path(Some(&candidate)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn ftxr_is_default_primary_decoder_and_decodes_offline_wav_fixture() {
+    let Some(ftxr_bin) = locate_test_ftxr_bin() else {
+        return;
+    };
+
+    let wav_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("191111_110200.wav");
+    let (_, samples_12k) = read_wav_mono_f32(&wav_path).unwrap();
+    let slot_ts = UnixSecs(1_573_470_120);
+
+    // Even if jt9 were present on PATH, ftxr-modem MUST take precedence as the default decoder.
+    let hybrid = HybridFt8Decoder::with_backends(Some(&ftxr_bin), None, None);
+    assert_eq!(hybrid.active_backend_name(), "ftxr");
+    assert_eq!(hybrid.backend_name(), "ftxr");
+
+    let decodes = hybrid.decode_slot(slot_ts, &samples_12k).await.unwrap();
+    let expected = [
+        ("CQ TA6CQ KN70", 678..=688),
+        ("CQ LZ1JZ KN22", 1026..=1036),
+        ("CQ R7IW LN35", 1287..=1297),
+        ("CQ DX R6WA LN32", 2092..=2102),
+        ("OH3NIV ZS6S RR73", 985..=995),
+    ];
+    for (msg, af_range) in &expected {
+        let hit = decodes
+            .iter()
+            .find(|d| d.message == *msg)
+            .unwrap_or_else(|| panic!("ftxr missed expected message '{msg}': {decodes:?}"));
+        assert_eq!(hit.decoder_backend, "ftxr");
+        assert!(
+            af_range.contains(&hit.af_hz),
+            "ftxr AF {} out of {:?} for '{}'",
+            hit.af_hz,
+            af_range,
+            msg
+        );
+    }
+
+    hybrid.shutdown().await;
+}
+
+#[tokio::test]
+async fn ftxr_streams_three_passes_and_reconciles_ft8_decodes() {
+    let Some(ftxr_bin) = locate_test_ftxr_bin() else {
+        return;
+    };
+
+    let wav_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("191111_110200.wav");
+    let (_, raw_12k) = read_wav_mono_f32(&wav_path).unwrap();
+    let slot_ts = UnixSecs(1_573_470_120);
+
+    let hybrid = HybridFt8Decoder::with_backends(Some(&ftxr_bin), None, None);
+    hybrid.warm_up().await;
+    let mut reconciler = SlotDecodeReconciler::new(slot_ts);
+
+    let pad_to_slot = |secs: f64| -> Vec<f32> {
+        let take = ((secs * FT8_SAMPLE_RATE as f64).round() as usize).min(raw_12k.len());
+        let mut buf = raw_12k[..take].to_vec();
+        buf.resize(FT8_SLOT_SAMPLES_12K, 0.0);
+        buf
+    };
+
+    let qso_ctx = Some(QsoDecodeContext {
+        my_call: Some("N1MPM".to_string()),
+        dx_call: None,
+        dx_grid: None,
+        rx_freq_hz: Some(1500.0),
+        tx_freq_hz: Some(1500.0),
+        qso_progress: Some(0),
+        enable_ap: true,
+    });
+
+    // Pass 1 (11.8s, depth 1, early_pass = true)
+    let (tx1, mut rx1) = mpsc::unbounded_channel::<Ft8Decode>();
+    let p1 = hybrid
+        .decode_slot_streaming(
+            slot_ts,
+            &pad_to_slot(11.8),
+            DecodePassOptions {
+                mode: ModemMode::Ft8,
+                depth: 1,
+                timeout: Duration::from_millis(2_000),
+                early_pass: true,
+                qso_context: qso_ctx.clone(),
+                generate_wisdom_if_missing: false,
+                fallback_on_empty_timeout: false,
+            },
+            tx1,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let mut pass1_new = 0_usize;
+    while let Ok(dec) = rx1.try_recv() {
+        assert_eq!(dec.decoder_backend, "ftxr");
+        if matches!(reconciler.ingest(1, dec), ReconcileOutcome::New(_)) {
+            pass1_new += 1;
+        }
+    }
+    assert!(
+        pass1_new >= 4 && p1.len() >= 4,
+        "expected ftxr Pass 1 at 11.8s to decode most fixture signals (got {pass1_new})"
+    );
+
+    // Pass 2 (13.5s, depth 2, early_pass = true)
+    let (tx2, mut rx2) = mpsc::unbounded_channel::<Ft8Decode>();
+    let _p2 = hybrid
+        .decode_slot_streaming(
+            slot_ts,
+            &pad_to_slot(13.5),
+            DecodePassOptions {
+                mode: ModemMode::Ft8,
+                depth: 2,
+                timeout: Duration::from_millis(2_000),
+                early_pass: true,
+                qso_context: qso_ctx.clone(),
+                generate_wisdom_if_missing: false,
+                fallback_on_empty_timeout: false,
+            },
+            tx2,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    while let Ok(dec) = rx2.try_recv() {
+        reconciler.ingest(2, dec);
+    }
+
+    // Pass 3 (14.8s, depth 3, final pass)
+    let (tx3, mut rx3) = mpsc::unbounded_channel::<Ft8Decode>();
+    let _p3 = hybrid
+        .decode_slot_streaming(
+            slot_ts,
+            &pad_to_slot(14.8),
+            DecodePassOptions {
+                mode: ModemMode::Ft8,
+                depth: 3,
+                timeout: Duration::from_millis(3_500),
+                early_pass: false,
+                qso_context: qso_ctx,
+                generate_wisdom_if_missing: false,
+                fallback_on_empty_timeout: true,
+            },
+            tx3,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    while let Ok(dec) = rx3.try_recv() {
+        reconciler.ingest(3, dec);
+    }
+
+    let final_decodes = reconciler.take_final_for_telemetry();
+    assert_eq!(
+        final_decodes.len(),
+        5,
+        "expected 5 deduplicated ftxr decodes across 3 passes: {final_decodes:?}"
+    );
+    for expected_msg in [
+        "CQ TA6CQ KN70",
+        "CQ LZ1JZ KN22",
+        "CQ R7IW LN35",
+        "CQ DX R6WA LN32",
+        "OH3NIV ZS6S RR73",
+    ] {
+        assert!(
+            final_decodes.iter().any(|d| d.message == expected_msg),
+            "missing ftxr reconciled message '{expected_msg}': {final_decodes:?}"
+        );
+    }
+
+    hybrid.reset_session().await;
+    hybrid.shutdown().await;
+}
+
+#[tokio::test]
+async fn ftxr_loopback_ft8_late_start_and_ft4_encode_decode() {
+    let Some(ftxr_bin) = locate_test_ftxr_bin() else {
+        return;
+    };
+
+    let hybrid = HybridFt8Decoder::with_backends(Some(&ftxr_bin), None, None);
+
+    // 1. FT8 5.0s late-start offset modulation via ftxr -> resample 48k->12k -> decode via ftxr
+    let slot_ts = UnixSecs(1_795_212_960);
+    let tail_48k = hybrid
+        .modulate_tx_from_offset(
+            ModemMode::Ft8,
+            "K1ABC N1MPM RR73",
+            1500.0,
+            DSP_SAMPLE_RATE,
+            5_000,
+        )
+        .await
+        .unwrap();
+    let total_48k = 15 * (DSP_SAMPLE_RATE as usize);
+    let start_48k = 5 * (DSP_SAMPLE_RATE as usize);
+    let mut slot_48k = vec![0.0_f32; total_48k];
+    let copy_len = tail_48k.len().min(total_48k - start_48k);
+    slot_48k[start_48k..start_48k + copy_len].copy_from_slice(&tail_48k[..copy_len]);
+    let slot_12k = resample_48k_to_12k(&slot_48k).unwrap();
+
+    let ft8_decodes = hybrid.decode_slot(slot_ts, &slot_12k).await.unwrap();
+    let hit = ft8_decodes
+        .iter()
+        .find(|d| d.message == "K1ABC N1MPM RR73")
+        .unwrap_or_else(|| panic!("ftxr missed 5s late-start FT8 TX: {ft8_decodes:?}"));
+    assert_eq!(hit.decoder_backend, "ftxr");
+    assert!((1495..=1505).contains(&hit.af_hz));
+
+    // 2. FT4 modulation via ftxr -> resample 48k->12k -> FT4 streaming decode via ftxr
+    let ft4_48k = hybrid
+        .modulate_tx_from_offset(ModemMode::Ft4, "CQ N1MPM FN33", 1420.0, DSP_SAMPLE_RATE, 0)
+        .await
+        .unwrap();
+    let ft4_total_48k = (75 * (DSP_SAMPLE_RATE as usize)) / 10;
+    let mut ft4_slot_48k = vec![0.0_f32; ft4_total_48k];
+    let ft4_copy = ft4_48k.len().min(ft4_total_48k);
+    ft4_slot_48k[..ft4_copy].copy_from_slice(&ft4_48k[..ft4_copy]);
+    let mut ft4_slot_12k = resample_48k_to_12k(&ft4_slot_48k).unwrap();
+    ft4_slot_12k.resize(FT4_SLOT_SAMPLES_12K, 0.0);
+
+    let (ft4_tx, mut ft4_rx) = mpsc::unbounded_channel::<Ft8Decode>();
+    let ft4_decodes = hybrid
+        .decode_slot_streaming(
+            slot_ts,
+            &ft4_slot_12k,
+            DecodePassOptions {
+                mode: ModemMode::Ft4,
+                depth: 3,
+                timeout: Duration::from_millis(2_500),
+                early_pass: false,
+                qso_context: None,
+                generate_wisdom_if_missing: false,
+                fallback_on_empty_timeout: false,
+            },
+            ft4_tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let streamed_ft4: Vec<_> = std::iter::from_fn(|| ft4_rx.try_recv().ok()).collect();
+    assert_eq!(streamed_ft4.len(), ft4_decodes.len());
+    let ft4_hit = ft4_decodes
+        .iter()
+        .find(|d| d.message == "CQ N1MPM FN33")
+        .unwrap_or_else(|| panic!("ftxr missed FT4 loopback decode: {ft4_decodes:?}"));
+    assert_eq!(ft4_hit.decoder_backend, "ftxr");
+    assert!(
+        (1410..=1430).contains(&ft4_hit.af_hz),
+        "ftxr FT4 AF {} out of range",
+        ft4_hit.af_hz
+    );
+
+    hybrid.shutdown().await;
+}
+
+#[test]
+fn preflight_selects_ftxr_by_default_without_jt9_warning() {
+    let Some(ftxr_bin) = locate_test_ftxr_bin() else {
+        return;
+    };
+
+    let tmp = tempdir().unwrap();
+    let mut cfg = DaemonConfig::from_serve_args(&ServeArgs {
+        bind: "127.0.0.1".to_string(),
+        port: 8788,
+        data_dir: Some(tmp.path().to_path_buf()),
+        auth_token: None,
+    });
+    cfg.ftxr_path = Some(ftxr_bin);
+    cfg.jt9_path = Some(PathBuf::from("/nonexistent/digi-dx/jt9"));
+
+    let report = run_preflight(&cfg, false);
+    assert_eq!(report.active_ft8_decoder, "ftxr");
+    let ftxr_check = report
+        .checks
+        .iter()
+        .find(|c| c.id == "ft8_decoder_ftxr")
+        .expect("missing ft8_decoder_ftxr check");
+    assert_eq!(ftxr_check.status, CheckStatus::Pass);
+    assert!(
+        !report.checks.iter().any(|c| c.id == "ft8_decoder_jt9"),
+        "should not emit jt9 warning when ftxr-modem is active"
+    );
 }

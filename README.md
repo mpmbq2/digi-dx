@@ -17,10 +17,7 @@ brew services start digi-dx
 
 Then open **<http://127.0.0.1:8788>** in Safari, Chrome, or Firefox.
 
-- **Optional (full weak-signal sensitivity):** install WSJT-X so Digi-Dx can use `jt9` (without it, Digi-Dx uses its built-in `ft8_lib` decoder):
-  ```bash
-  brew install --cask wsjtx
-  ```
+- **Default weak-signal FT8/FT4 decoder (`ftxr-modem`):** the one-line installer installs the standalone pure-Rust [`ftxr-modem`](https://github.com/mpmbq2/ftxr-modem/releases) binary automatically (no Qt/WSJT-X needed). Without `ftxr-modem`, Digi-Dx falls back to legacy `jt9` (if installed) or its built-in MIT `ft8_lib` decoder.
 - **Microphone permission:** macOS treats USB radio soundcards as microphones. If RX audio looks silent on first run, run `digi-dx preflight --probe-audio` and approve access under **System Settings → Privacy & Security → Microphone**.
 - **Upgrade later:**
   ```bash
@@ -45,13 +42,13 @@ Supports 64-bit Raspberry Pi OS (Pi 4 / Pi 5), Ubuntu, Debian, Fedora, and Arch 
 curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash
 ```
 
-This downloads the prebuilt binary, installs Hamlib (`rigctld`) and `wsjtx` (`jt9`), sets up USB serial/audio permissions (`udev`), and starts the `digi-dx` `systemd` service automatically.
+This downloads the prebuilt `digi-dx` and `ftxr-modem` binaries, installs Hamlib (`rigctld`), sets up USB serial/audio permissions (`udev`), and starts the `digi-dx` `systemd` service automatically.
 
 > **Tip:** You don't need to use a browser on the Raspberry Pi. Open **`http://<pi-hostname>.local:8788`** (or `http://<pi-ip>:8788`) from your Mac, PC, tablet, or phone on the same network.
 
-- **Skip `wsjtx` (~150 MB Qt packages) on a headless Pi** (uses the built-in `ft8_lib` decoder):
+- **Skip `ftxr-modem`** (use legacy `jt9` if present or the built-in `ft8_lib` fallback decoder):
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash -s -- --no-jt9
+  curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash -s -- --no-ftxr
   ```
 - **Check status / logs:**
   ```bash
@@ -76,7 +73,7 @@ Only needed if you are hacking on Digi-Dx itself.
   sudo apt update
   sudo apt install -y \
     build-essential pkg-config libasound2-dev \
-    libhamlib-utils wsjtx curl git
+    libhamlib-utils curl git
   ```
 - **macOS (Homebrew):**
   ```bash

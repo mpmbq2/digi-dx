@@ -10,6 +10,7 @@ use crate::audio::AudioError;
 pub const DSP_SAMPLE_RATE: u32 = 48_000;
 pub const FT8_SAMPLE_RATE: u32 = 12_000;
 pub const FT8_SLOT_SAMPLES_12K: usize = 180_000;
+pub const FT4_SLOT_SAMPLES_12K: usize = 90_000;
 pub const WATERFALL_MIN_HZ: f32 = 200.0;
 pub const WATERFALL_MAX_HZ: f32 = 3000.0;
 

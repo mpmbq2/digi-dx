@@ -55,7 +55,7 @@ jobs:
         run: make lint
 
       - name: Verify installer dry-run
-        run: ./scripts/install.sh --dry-run --from-source --no-jt9
+        run: ./scripts/install.sh --dry-run --from-source --no-ftxr
 
       - name: Run Rust unit and integration tests
         run: cargo test
@@ -108,7 +108,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Verify installer dry-run on macOS
-        run: ./scripts/install.sh --dry-run --no-jt9
+        run: ./scripts/install.sh --dry-run --no-ftxr
 
       - name: Run Rust unit and integration tests
         run: cargo test

@@ -5,7 +5,10 @@ set -euo pipefail
 # Supports Linux (apt, dnf, pacman + systemd) and macOS (Homebrew + launchd).
 
 REPO="${DIGI_DX_REPO:-mpmbq2/digi-dx}"
+FTXR_REPO="${DIGI_DX_FTXR_REPO:-mpmbq2/ftxr-modem}"
+FTXR_VERSION="${DIGI_DX_FTXR_VERSION:-v0.1.0}"
 BINARY_PATH="/usr/local/bin/digi-dx"
+FTXR_BINARY_PATH="/usr/local/bin/ftxr-modem"
 UDEV_RULES_PATH="/etc/udev/rules.d/99-digi-dx.rules"
 SYSTEMD_UNIT_PATH="/etc/systemd/system/digi-dx.service"
 ENV_DIR="/etc/digi-dx"
@@ -15,7 +18,7 @@ LINUX_DATA_DIR="/var/lib/digi-dx"
 AUTO_YES=0
 TARGET_VERSION="latest"
 FROM_SOURCE=0
-NO_JT9=0
+NO_FTXR=0
 NO_SERVICE=0
 CUSTOM_USER=""
 DRY_RUN=0
@@ -53,15 +56,17 @@ Usage:
   scripts/install.sh [options]
 
 Options:
-  -y, --yes              Non-interactive mode; accept package manager prompts
-      --version <tag>    Pin a specific release tag (default: latest)
-      --from-source      Build UI (npm) and Rust binary locally via cargo
-      --no-jt9           Skip installing wsjtx/jt9 (use built-in ft8_lib fallback)
-      --no-service       Install binary/deps/udev without systemd or launchd service
-      --user <name>      Service user on Linux (default: digi-dx, or current user with --no-service)
-      --dry-run          Print planned actions without modifying the system
-      --uninstall        Stop/disable service, remove binary & udev rules (preserves QSO DBs)
-  -h, --help             Show this help message
+  -y, --yes                 Non-interactive mode; accept package manager prompts
+      --version <tag>       Pin a specific digi-dx release tag (default: latest)
+      --ftxr-version <tag>  Pin a specific ftxr-modem release tag (default: v0.1.0)
+      --from-source         Build UI (npm) and Rust binary locally via cargo
+      --no-ftxr             Skip installing ftxr-modem (use legacy jt9 or built-in ft8_lib fallback)
+      --no-jt9              Deprecated alias (wsjtx/jt9 is no longer installed by default)
+      --no-service          Install binary/deps/udev without systemd or launchd service
+      --user <name>         Service user on Linux (default: digi-dx, or current user with --no-service)
+      --dry-run             Print planned actions without modifying the system
+      --uninstall           Stop/disable service, remove binary & udev rules (preserves QSO DBs)
+  -h, --help                Show this help message
 EOF
 }
 
@@ -77,12 +82,20 @@ parse_args() {
         TARGET_VERSION="$2"
         shift 2
         ;;
+      --ftxr-version)
+        [[ $# -ge 2 ]] || die "--ftxr-version requires an argument"
+        FTXR_VERSION="$2"
+        shift 2
+        ;;
       --from-source)
         FROM_SOURCE=1
         shift
         ;;
+      --no-ftxr)
+        NO_FTXR=1
+        shift
+        ;;
       --no-jt9)
-        NO_JT9=1
         shift
         ;;
       --no-service)
@@ -253,6 +266,7 @@ detect_platform() {
     PKG_MGR="brew"
     if [[ -d /opt/homebrew/bin && -w /opt/homebrew/bin ]]; then
       BINARY_PATH="/opt/homebrew/bin/digi-dx"
+      FTXR_BINARY_PATH="/opt/homebrew/bin/ftxr-modem"
     fi
   fi
 
@@ -274,9 +288,6 @@ install_dependencies() {
   case "$PKG_MGR" in
     apt)
       local -a pkgs=(libhamlib-utils usbutils alsa-utils curl ca-certificates)
-      if [[ $NO_JT9 -eq 0 ]]; then
-        pkgs+=(wsjtx)
-      fi
       if [[ $AUTO_YES -eq 1 ]]; then
         run_sudo env DEBIAN_FRONTEND=noninteractive apt-get update
         run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
@@ -287,9 +298,6 @@ install_dependencies() {
       ;;
     dnf)
       local -a pkgs=(hamlib usbutils alsa-utils curl)
-      if [[ $NO_JT9 -eq 0 ]]; then
-        pkgs+=(wsjtx)
-      fi
       local -a flags=()
       if [[ $AUTO_YES -eq 1 ]]; then
         flags=(-y)
@@ -303,26 +311,15 @@ install_dependencies() {
         flags+=(--noconfirm)
       fi
       run_sudo pacman -S "${flags[@]}" "${pkgs[@]}"
-      if [[ $NO_JT9 -eq 0 ]]; then
-        if pacman -Si wsjtx >/dev/null 2>&1; then
-          run_sudo pacman -S "${flags[@]}" wsjtx
-        else
-          log_warn "wsjtx not found in enabled pacman repos; install from AUR or rely on built-in ft8_lib fallback"
-        fi
-      fi
       ;;
     brew)
       run_cmd brew install hamlib
-      if [[ $NO_JT9 -eq 0 ]]; then
-        if ! brew list --cask wsjtx >/dev/null 2>&1; then
-          run_cmd brew install --cask wsjtx || log_warn "wsjtx cask install failed; Digi-Dx will use built-in ft8_lib fallback"
-        fi
-      fi
       ;;
   esac
 
   verify_hamlib
-  verify_jt9_if_present
+  provision_ftxr_modem
+  verify_ftxr_if_present
 }
 
 verify_hamlib() {
@@ -352,17 +349,21 @@ verify_hamlib() {
   fi
 }
 
-find_jt9_path() {
-  if [[ -n "${DIGI_DX_JT9_PATH:-}" && -x "${DIGI_DX_JT9_PATH}" ]]; then
-    printf '%s\n' "${DIGI_DX_JT9_PATH}"
+find_ftxr_path() {
+  if [[ -n "${DIGI_DX_FTXR_PATH:-}" && -x "${DIGI_DX_FTXR_PATH}" ]]; then
+    printf '%s\n' "${DIGI_DX_FTXR_PATH}"
     return 0
   fi
-  if command -v jt9 >/dev/null 2>&1; then
-    command -v jt9
+  if [[ -x "$FTXR_BINARY_PATH" ]]; then
+    printf '%s\n' "$FTXR_BINARY_PATH"
+    return 0
+  fi
+  if command -v ftxr-modem >/dev/null 2>&1; then
+    command -v ftxr-modem
     return 0
   fi
   local candidate
-  for candidate in /usr/local/lib/digi-dx/jt9 /Applications/wsjtx.app/Contents/MacOS/jt9; do
+  for candidate in /opt/homebrew/bin/ftxr-modem /usr/local/bin/ftxr-modem /usr/local/lib/digi-dx/ftxr-modem; do
     if [[ -x "$candidate" ]]; then
       printf '%s\n' "$candidate"
       return 0
@@ -371,27 +372,85 @@ find_jt9_path() {
   return 1
 }
 
-verify_jt9_if_present() {
-  if [[ $NO_JT9 -eq 1 ]]; then
-    log_info "Skipping jt9 check (--no-jt9); built-in ft8_lib fallback will be used."
+provision_ftxr_modem() {
+  if [[ $NO_FTXR -eq 1 ]]; then
+    log_info "Skipping ftxr-modem installation (--no-ftxr); Digi-Dx will use jt9 or built-in ft8_lib fallback."
     return 0
   fi
-  local jt9_bin=""
-  if jt9_bin="$(find_jt9_path)"; then
-    if command -v file >/dev/null 2>&1; then
-      local file_desc
-      file_desc="$(file -b "$jt9_bin" || true)"
-      log_info "Found jt9 at $jt9_bin ($file_desc)"
-    else
-      log_info "Found jt9 at $jt9_bin"
+
+  local ftxr_tag="$FTXR_VERSION"
+  local tarball="ftxr-modem-${ftxr_tag}-${OS_NAME}-${ARCH_NORM}.tar.gz"
+  local base_url="https://github.com/${FTXR_REPO}/releases/download/${ftxr_tag}"
+  local tarball_url="${base_url}/${tarball}"
+  local sums_url="${base_url}/SHA256SUMS"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log_info "[dry-run] Would download $tarball_url and $sums_url"
+    log_info "[dry-run] Would verify SHA-256 checksum and install ftxr-modem to $FTXR_BINARY_PATH (0755)"
+    return 0
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+
+  if ! curl -fsSL "$tarball_url" -o "$tmp_dir/$tarball" || ! curl -fsSL "$sums_url" -o "$tmp_dir/SHA256SUMS"; then
+    rm -rf "$tmp_dir"
+    log_warn "Failed to download ftxr-modem from ${tarball_url}; Digi-Dx will fall back to jt9 or built-in ft8_lib"
+    return 0
+  fi
+
+  local checksum_ok=0
+  if command -v sha256sum >/dev/null 2>&1; then
+    if (cd "$tmp_dir" && grep "  ${tarball}\$" SHA256SUMS | sha256sum -c -); then
+      checksum_ok=1
     fi
-    if "$jt9_bin" -h >/dev/null 2>&1; then
-      log_info "jt9 execution probe passed"
-    else
-      log_warn "jt9 at $jt9_bin failed execution probe (wrong arch or missing shared libs); built-in ft8_lib fallback will activate"
+  elif command -v shasum >/dev/null 2>&1; then
+    if (cd "$tmp_dir" && grep "  ${tarball}\$" SHA256SUMS | shasum -a 256 -c -); then
+      checksum_ok=1
     fi
   else
-    log_warn "jt9 binary not found; Digi-Dx will use built-in ft8_lib fallback decoder"
+    rm -rf "$tmp_dir"
+    log_warn "Neither sha256sum nor shasum found; skipping ftxr-modem download"
+    return 0
+  fi
+
+  if [[ $checksum_ok -ne 1 ]]; then
+    rm -rf "$tmp_dir"
+    log_warn "SHA-256 verification failed for ${tarball}; skipping ftxr-modem installation"
+    return 0
+  fi
+
+  tar -xzf "$tmp_dir/$tarball" -C "$tmp_dir"
+  local extracted_bin=""
+  extracted_bin="$(find "$tmp_dir" -type f -name ftxr-modem | head -n 1 || true)"
+  if [[ -z "$extracted_bin" || ! -f "$extracted_bin" ]]; then
+    rm -rf "$tmp_dir"
+    log_warn "Archive ${tarball} did not contain ftxr-modem executable"
+    return 0
+  fi
+
+  install_binary_file "$extracted_bin" "$FTXR_BINARY_PATH"
+  rm -rf "$tmp_dir"
+}
+
+verify_ftxr_if_present() {
+  if [[ $NO_FTXR -eq 1 ]]; then
+    return 0
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log_info "[dry-run] Would verify ftxr-modem --version --json"
+    return 0
+  fi
+  local ftxr_bin=""
+  if ftxr_bin="$(find_ftxr_path)"; then
+    local ftxr_ver=""
+    if ftxr_ver="$("$ftxr_bin" --version 2>&1 | head -n 1)"; then
+      log_info "Verified: $ftxr_ver at $ftxr_bin"
+    else
+      log_warn "ftxr-modem at $ftxr_bin failed execution probe; Digi-Dx will use fallback decoder"
+    fi
+  else
+    log_warn "ftxr-modem binary not found; Digi-Dx will use jt9 or built-in ft8_lib fallback decoder"
   fi
 }
 

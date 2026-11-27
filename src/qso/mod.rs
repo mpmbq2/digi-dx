@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::audio::devices::AudioMatchOutcome;
-use crate::audio::dsp::{WaterfallFrame, DSP_SAMPLE_RATE, FT8_SAMPLE_RATE, FT8_SLOT_SAMPLES_12K};
+use crate::audio::dsp::{WaterfallFrame, DSP_SAMPLE_RATE, FT8_SAMPLE_RATE};
 use crate::audio::manager::{AudioCaptureHandle, AudioManager, AudioPlaybackHandle};
 use crate::command_bus::{ErrorCode, WsBroadcastEvent};
 use crate::domain::adif::QsoRecord;
@@ -30,9 +30,10 @@ use crate::domain::ft8::{
     infer_station_role, parse_ft8_message, validate_station_callsign, validate_station_grid,
     Ft8Payload, ParsedFt8Message,
 };
-use crate::modem::ft8_lib::Ft8LibTxModulator;
 use crate::modem::simulator::SimulatedModem;
-use crate::modem::{DecodePassOptions, Ft8Decode, HybridFt8Decoder, TxIntent};
+use crate::modem::{
+    DecodePassOptions, Ft8Decode, HybridFt8Decoder, ModemMode, QsoDecodeContext, TxIntent,
+};
 use crate::store::{channel_key_for_freq, now_utc_str, StateStore, UpsertChannelRosterInput};
 use crate::supervisor::radio_worker::{CmdResult, RadioLifecycleState};
 use crate::supervisor::DeviceSupervisor;
@@ -41,18 +42,25 @@ use crate::watchdog::PttWatchdog;
 
 use self::reconciler::{ReconcileOutcome, SlotDecodeReconciler};
 use self::sequencer::{
-    ActiveQso, CqState, QsoAction, QsoSequencer, RecentDecodeEntry, SequencerMode, TranscriptEntry,
+    ActiveQso, CqState, QsoAction, QsoSequencer, QsoStep, RecentDecodeEntry, SequencerMode,
+    TranscriptEntry,
 };
 
-const MIN_LIVE_SLOT_SAMPLES_12K: usize = 72_000; // >= 6 seconds captured before running decoder
-const MIN_LIVE_SLOT_REAL_AUDIO_MS: i64 = 6_000; // >= 6 seconds real captured audio in slot
+const MIN_LIVE_SLOT_SAMPLES_12K: usize = 72_000; // >= 6 seconds captured before running FT8 decoder
+const MIN_LIVE_SLOT_REAL_AUDIO_MS: i64 = 6_000; // >= 6 seconds real captured audio in FT8 slot
 const PASS_1_LEAD_MS: i64 = 3_200; // t = 11.8s (3.2s left): fast early pass (-d 1)
 const PASS_2_LEAD_MS: i64 = 1_500; // t = 13.5s (1.5s left): normal pre-close pass (-d 2)
 const PASS_3_LEAD_MS: i64 = 200; // t = 14.8s (0.2s left): deep final pass (-d 3)
-const LIVE_DECODE_GRACE_MS: i64 = 300; // Wait up to +300ms past slot boundary for Pass 3 before TX
+const FT4_MIN_LIVE_SLOT_SAMPLES_12K: usize = 36_000; // >= 3 seconds captured before FT4 decoder
+const FT4_MIN_LIVE_SLOT_REAL_AUDIO_MS: i64 = 3_000; // >= 3 seconds real captured audio in FT4 slot
+const FT4_PASS_1_LEAD_MS: i64 = 1_900; // t = 5.6s (1.9s left): fast early pass (-d 1)
+const FT4_PASS_2_LEAD_MS: i64 = 500; // t = 7.0s (0.5s left): deep final pass (-d 3)
+const LIVE_DECODE_GRACE_MS: i64 = 300; // Wait up to +300ms past slot boundary for final pass before TX
 const ROSTER_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(150);
-pub const MAX_LATE_TX_START_MS: i64 = 6_000; // Late TX initiation / mid-slot hot-swap cutoff
-const FT8_TX_END_OFFSET_MS: i64 = 12_700; // End TX at slot_start + 12.70 s (60 ms drain past 12.64 s)
+pub const MAX_LATE_TX_START_MS: i64 = 6_000; // Late TX initiation / mid-slot hot-swap cutoff (FT8)
+const FT4_MAX_LATE_TX_START_MS: i64 = 2_000; // Late TX initiation / mid-slot hot-swap cutoff (FT4)
+const FT8_TX_END_OFFSET_MS: i64 = 12_700; // End FT8 TX at slot_start + 12.70 s (60 ms drain past 12.64 s)
+const FT4_TX_END_OFFSET_MS: i64 = 5_450; // End FT4 TX at slot_start + 5.45 s (300ms delay + 5.04s active + 110ms drain)
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxReconcileDecision {
@@ -298,12 +306,15 @@ impl SessionManager {
         supervisor: Arc<DeviceSupervisor>,
         watchdog: Arc<PttWatchdog>,
         ws_tx: broadcast::Sender<WsBroadcastEvent>,
+        ftxr_override: Option<&Path>,
         jt9_override: Option<&Path>,
         jt9_data_dir: Option<&Path>,
     ) -> Arc<Self> {
-        let override_buf: Option<PathBuf> = jt9_override.map(Path::to_path_buf);
-        let hybrid_decoder = Arc::new(HybridFt8Decoder::with_data_dir(
-            override_buf.as_deref(),
+        let ftxr_buf: Option<PathBuf> = ftxr_override.map(Path::to_path_buf);
+        let jt9_buf: Option<PathBuf> = jt9_override.map(Path::to_path_buf);
+        let hybrid_decoder = Arc::new(HybridFt8Decoder::with_backends(
+            ftxr_buf.as_deref(),
+            jt9_buf.as_deref(),
             jt9_data_dir.map(Path::to_path_buf),
         ));
         Arc::new(Self {
@@ -316,6 +327,10 @@ impl SessionManager {
             active_tunes: AsyncMutex::new(HashMap::new()),
             snapshot_cache: RwLock::new(SessionSnapshot::idle()),
         })
+    }
+
+    pub async fn shutdown_decoder(&self) {
+        self.hybrid_decoder.shutdown().await;
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
@@ -531,6 +546,8 @@ impl SessionManager {
             });
             wf_task = Some(wf_handle);
             self.supervisor.set_session_active(radio_id, true).await;
+            self.hybrid_decoder.warm_up().await;
+            self.hybrid_decoder.reset_session().await;
             self.hybrid_decoder.active_backend_name().to_string()
         };
 
@@ -677,6 +694,7 @@ impl SessionManager {
             self.supervisor
                 .set_session_active(&stopped.radio_id, false)
                 .await;
+            self.hybrid_decoder.reset_session().await;
         }
 
         let idle = SessionSnapshot::idle();
@@ -775,6 +793,9 @@ impl SessionManager {
                 rt.sequencer.is_demo,
             )
         };
+        if !is_demo {
+            self.hybrid_decoder.reset_session().await;
+        }
         self.update_snapshot_cache(snap.clone());
         let _ = self.ws_tx.send(WsBroadcastEvent::SlotClockUpdated {
             radio_id: Some(radio_id.to_string()),
@@ -1724,10 +1745,15 @@ impl SessionManager {
         let rt_arc = Arc::clone(&session.runtime);
         let cancel = session.cancel.clone();
         let radio_id = session.radio_id.clone();
-        let (slot_ms, epoch_ms) = {
+        let (mut slot_ms, epoch_ms, mut cur_mode, mut last_dial_freq_hz) = {
             let rt = rt_arc.lock().await;
             let spec = rt.clock.spec();
-            (spec.slot_ms, spec.epoch_ms)
+            (
+                spec.slot_ms,
+                spec.epoch_ms,
+                ModemMode::from_mode_str(&rt.digital_mode),
+                rt.dial_freq_hz,
+            )
         };
 
         let session_start_ms = epoch_ms;
@@ -1742,9 +1768,30 @@ impl SessionManager {
             }
         }
 
-        let mut active_pass3: Option<JoinHandle<()>> = None;
+        let mut active_final_pass: Option<JoinHandle<()>> = None;
 
         loop {
+            let (latest_slot_ms, latest_mode) = {
+                let rt = rt_arc.lock().await;
+                (
+                    rt.clock.spec().slot_ms,
+                    ModemMode::from_mode_str(&rt.digital_mode),
+                )
+            };
+            if latest_slot_ms != slot_ms || latest_mode != cur_mode {
+                slot_ms = latest_slot_ms;
+                cur_mode = latest_mode;
+                let now_ms = Utc::now().timestamp_millis();
+                next_slot_ms = (now_ms.div_euclid(slot_ms) + 1) * slot_ms;
+            }
+
+            if let Some(live_freq) = self.live_dial_freq_hz(&radio_id, None) {
+                if last_dial_freq_hz.is_some() && last_dial_freq_hz != Some(live_freq) {
+                    self.hybrid_decoder.reset_session().await;
+                }
+                last_dial_freq_hz = Some(live_freq);
+            }
+
             let slot_start_ms = next_slot_ms - slot_ms;
             let finished_slot_ts = UnixSecs(slot_start_ms.div_euclid(1000));
             let real_audio_start_ms = slot_start_ms.max(session_start_ms);
@@ -1758,129 +1805,286 @@ impl SessionManager {
                 let reconciler =
                     Arc::new(AsyncMutex::new(SlotDecodeReconciler::new(finished_slot_ts)));
 
-                // Pass 1 (~11.8s): fast early decode (-d 1)
-                let pass1_at_ms = next_slot_ms - PASS_1_LEAD_MS;
-                if !sleep_until_wall_ms_or_cancel(pass1_at_ms, &cancel).await {
-                    break;
-                }
-                if let Some(bg) = active_pass3.take() {
-                    let _ = bg.await;
-                }
-                if self
-                    .should_decode_slot(&rt_arc, finished_slot_ts, real_audio_start_ms)
-                    .await
-                {
-                    if let Some(pcm_12k) = self.snapshot_prepared_slot_pcm(&rt_arc).await {
-                        self.run_streaming_pass(
-                            1,
-                            finished_slot_ts,
-                            pcm_12k,
-                            DecodePassOptions {
-                                depth: 1,
-                                timeout: Duration::from_millis(1_500),
-                                generate_wisdom_if_missing: false,
-                                fallback_on_empty_timeout: false,
-                            },
-                            &session,
-                            &reconciler,
-                        )
-                        .await;
-                    }
-                }
-
-                // Pass 2 (~13.5s): normal pre-close decode (-d 2)
-                let pass2_at_ms = next_slot_ms - PASS_2_LEAD_MS;
-                if !sleep_until_wall_ms_or_cancel(pass2_at_ms, &cancel).await {
-                    self.flush_slot_telemetry(&radio_id, None, &reconciler)
-                        .await;
-                    break;
-                }
-                if self
-                    .should_decode_slot(&rt_arc, finished_slot_ts, real_audio_start_ms)
-                    .await
-                {
-                    if let Some(pcm_12k) = self.snapshot_prepared_slot_pcm(&rt_arc).await {
-                        self.run_streaming_pass(
-                            2,
-                            finished_slot_ts,
-                            pcm_12k,
-                            DecodePassOptions {
-                                depth: 2,
-                                timeout: Duration::from_millis(1_200),
-                                generate_wisdom_if_missing: false,
-                                fallback_on_empty_timeout: false,
-                            },
-                            &session,
-                            &reconciler,
-                        )
-                        .await;
-                    }
-                }
-
-                // Pass 3 (~14.8s): deep final pass (-d 3), spawned so TX can never be stalled
-                let pass3_at_ms = next_slot_ms - PASS_3_LEAD_MS;
-                if !sleep_until_wall_ms_or_cancel(pass3_at_ms, &cancel).await {
-                    self.flush_slot_telemetry(&radio_id, None, &reconciler)
-                        .await;
-                    break;
-                }
-                let mut pass3_handle = if self
-                    .should_decode_slot(&rt_arc, finished_slot_ts, real_audio_start_ms)
-                    .await
-                {
-                    self.snapshot_prepared_slot_pcm(&rt_arc)
-                        .await
-                        .map(|pcm_12k| {
-                            let mgr_p3 = Arc::clone(&self);
-                            let sess_p3 = session.clone();
-                            let rec_p3 = Arc::clone(&reconciler);
-                            let rid_p3 = radio_id.clone();
-                            tokio::spawn(async move {
-                                mgr_p3
-                                    .run_streaming_pass(
-                                        3,
-                                        finished_slot_ts,
-                                        pcm_12k,
-                                        DecodePassOptions {
-                                            depth: 3,
-                                            timeout: Duration::from_millis(3_500),
-                                            generate_wisdom_if_missing: true,
-                                            fallback_on_empty_timeout: true,
-                                        },
-                                        &sess_p3,
-                                        &rec_p3,
-                                    )
-                                    .await;
-                                let dial_freq = mgr_p3.live_dial_freq_hz(&rid_p3, None);
-                                mgr_p3
-                                    .flush_slot_telemetry(&rid_p3, dial_freq, &rec_p3)
-                                    .await;
-                            })
-                        })
-                } else {
-                    None
-                };
-
-                if let Some(ref mut handle) = pass3_handle {
-                    let deadline_ms = next_slot_ms + LIVE_DECODE_GRACE_MS;
-                    let grace_ms = (deadline_ms - Utc::now().timestamp_millis()).max(1) as u64;
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            let _ = handle.await;
+                match cur_mode {
+                    ModemMode::Ft8 => {
+                        // Pass 1 (~11.8s): fast early decode (-d 1)
+                        let pass1_at_ms = next_slot_ms - PASS_1_LEAD_MS;
+                        if !sleep_until_wall_ms_or_cancel(pass1_at_ms, &cancel).await {
                             break;
                         }
-                        _ = &mut *handle => {
-                            pass3_handle = None;
+                        if let Some(bg) = active_final_pass.take() {
+                            let _ = bg.await;
                         }
-                        _ = sleep(Duration::from_millis(grace_ms)) => {
-                            debug!(radio_id = %radio_id, "live FT8 deep pass continuing asynchronously past TX grace window");
+                        if self
+                            .should_decode_slot(
+                                &rt_arc,
+                                cur_mode,
+                                finished_slot_ts,
+                                real_audio_start_ms,
+                            )
+                            .await
+                        {
+                            if let Some(pcm_12k) =
+                                self.snapshot_prepared_slot_pcm(&rt_arc, cur_mode).await
+                            {
+                                let qso_context =
+                                    Some(self.build_qso_decode_context(&rt_arc).await);
+                                self.run_streaming_pass(
+                                    1,
+                                    finished_slot_ts,
+                                    pcm_12k,
+                                    DecodePassOptions {
+                                        mode: cur_mode,
+                                        depth: 1,
+                                        timeout: Duration::from_millis(1_500),
+                                        early_pass: true,
+                                        qso_context,
+                                        generate_wisdom_if_missing: false,
+                                        fallback_on_empty_timeout: false,
+                                    },
+                                    &session,
+                                    &reconciler,
+                                )
+                                .await;
+                            }
+                        }
+
+                        // Pass 2 (~13.5s): normal pre-close decode (-d 2)
+                        let pass2_at_ms = next_slot_ms - PASS_2_LEAD_MS;
+                        if !sleep_until_wall_ms_or_cancel(pass2_at_ms, &cancel).await {
+                            self.flush_slot_telemetry(&radio_id, None, &reconciler)
+                                .await;
+                            break;
+                        }
+                        if self
+                            .should_decode_slot(
+                                &rt_arc,
+                                cur_mode,
+                                finished_slot_ts,
+                                real_audio_start_ms,
+                            )
+                            .await
+                        {
+                            if let Some(pcm_12k) =
+                                self.snapshot_prepared_slot_pcm(&rt_arc, cur_mode).await
+                            {
+                                let qso_context =
+                                    Some(self.build_qso_decode_context(&rt_arc).await);
+                                self.run_streaming_pass(
+                                    2,
+                                    finished_slot_ts,
+                                    pcm_12k,
+                                    DecodePassOptions {
+                                        mode: cur_mode,
+                                        depth: 2,
+                                        timeout: Duration::from_millis(1_200),
+                                        early_pass: true,
+                                        qso_context,
+                                        generate_wisdom_if_missing: false,
+                                        fallback_on_empty_timeout: false,
+                                    },
+                                    &session,
+                                    &reconciler,
+                                )
+                                .await;
+                            }
+                        }
+
+                        // Pass 3 (~14.8s): deep final pass (-d 3), spawned so TX can never be stalled
+                        let pass3_at_ms = next_slot_ms - PASS_3_LEAD_MS;
+                        if !sleep_until_wall_ms_or_cancel(pass3_at_ms, &cancel).await {
+                            self.flush_slot_telemetry(&radio_id, None, &reconciler)
+                                .await;
+                            break;
+                        }
+                        let mut pass3_handle = if self
+                            .should_decode_slot(
+                                &rt_arc,
+                                cur_mode,
+                                finished_slot_ts,
+                                real_audio_start_ms,
+                            )
+                            .await
+                        {
+                            let qso_context = Some(self.build_qso_decode_context(&rt_arc).await);
+                            self.snapshot_prepared_slot_pcm(&rt_arc, cur_mode)
+                                .await
+                                .map(|pcm_12k| {
+                                    let mgr_p3 = Arc::clone(&self);
+                                    let sess_p3 = session.clone();
+                                    let rec_p3 = Arc::clone(&reconciler);
+                                    let rid_p3 = radio_id.clone();
+                                    tokio::spawn(async move {
+                                        mgr_p3
+                                            .run_streaming_pass(
+                                                3,
+                                                finished_slot_ts,
+                                                pcm_12k,
+                                                DecodePassOptions {
+                                                    mode: cur_mode,
+                                                    depth: 3,
+                                                    timeout: Duration::from_millis(3_500),
+                                                    early_pass: false,
+                                                    qso_context,
+                                                    generate_wisdom_if_missing: true,
+                                                    fallback_on_empty_timeout: true,
+                                                },
+                                                &sess_p3,
+                                                &rec_p3,
+                                            )
+                                            .await;
+                                        let dial_freq = mgr_p3.live_dial_freq_hz(&rid_p3, None);
+                                        mgr_p3
+                                            .flush_slot_telemetry(&rid_p3, dial_freq, &rec_p3)
+                                            .await;
+                                    })
+                                })
+                        } else {
+                            None
+                        };
+
+                        if let Some(ref mut handle) = pass3_handle {
+                            let deadline_ms = next_slot_ms + LIVE_DECODE_GRACE_MS;
+                            let grace_ms =
+                                (deadline_ms - Utc::now().timestamp_millis()).max(1) as u64;
+                            tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    let _ = handle.await;
+                                    break;
+                                }
+                                _ = &mut *handle => {
+                                    pass3_handle = None;
+                                }
+                                _ = sleep(Duration::from_millis(grace_ms)) => {
+                                    debug!(radio_id = %radio_id, "live FT8 deep pass continuing asynchronously past TX grace window");
+                                }
+                            }
+                            active_final_pass = pass3_handle;
+                        } else {
+                            let dial_freq = self.live_dial_freq_hz(&radio_id, None);
+                            self.flush_slot_telemetry(&radio_id, dial_freq, &reconciler)
+                                .await;
                         }
                     }
-                    active_pass3 = pass3_handle;
-                } else {
-                    let dial_freq = self.live_dial_freq_hz(&radio_id, None);
-                    self.flush_slot_telemetry(&radio_id, dial_freq, &reconciler)
-                        .await;
+                    ModemMode::Ft4 => {
+                        // FT4 Pass 1 (~5.6s): fast early decode (-d 1)
+                        let pass1_at_ms = next_slot_ms - FT4_PASS_1_LEAD_MS;
+                        if !sleep_until_wall_ms_or_cancel(pass1_at_ms, &cancel).await {
+                            break;
+                        }
+                        if let Some(bg) = active_final_pass.take() {
+                            let _ = bg.await;
+                        }
+                        if self
+                            .should_decode_slot(
+                                &rt_arc,
+                                cur_mode,
+                                finished_slot_ts,
+                                real_audio_start_ms,
+                            )
+                            .await
+                        {
+                            if let Some(pcm_12k) =
+                                self.snapshot_prepared_slot_pcm(&rt_arc, cur_mode).await
+                            {
+                                let qso_context =
+                                    Some(self.build_qso_decode_context(&rt_arc).await);
+                                self.run_streaming_pass(
+                                    1,
+                                    finished_slot_ts,
+                                    pcm_12k,
+                                    DecodePassOptions {
+                                        mode: cur_mode,
+                                        depth: 1,
+                                        timeout: Duration::from_millis(900),
+                                        early_pass: true,
+                                        qso_context,
+                                        generate_wisdom_if_missing: false,
+                                        fallback_on_empty_timeout: false,
+                                    },
+                                    &session,
+                                    &reconciler,
+                                )
+                                .await;
+                            }
+                        }
+
+                        // FT4 Pass 2 (~7.0s): deep final pass (-d 3)
+                        let pass2_at_ms = next_slot_ms - FT4_PASS_2_LEAD_MS;
+                        if !sleep_until_wall_ms_or_cancel(pass2_at_ms, &cancel).await {
+                            self.flush_slot_telemetry(&radio_id, None, &reconciler)
+                                .await;
+                            break;
+                        }
+                        let mut pass2_handle = if self
+                            .should_decode_slot(
+                                &rt_arc,
+                                cur_mode,
+                                finished_slot_ts,
+                                real_audio_start_ms,
+                            )
+                            .await
+                        {
+                            let qso_context = Some(self.build_qso_decode_context(&rt_arc).await);
+                            self.snapshot_prepared_slot_pcm(&rt_arc, cur_mode)
+                                .await
+                                .map(|pcm_12k| {
+                                    let mgr_p2 = Arc::clone(&self);
+                                    let sess_p2 = session.clone();
+                                    let rec_p2 = Arc::clone(&reconciler);
+                                    let rid_p2 = radio_id.clone();
+                                    tokio::spawn(async move {
+                                        mgr_p2
+                                            .run_streaming_pass(
+                                                2,
+                                                finished_slot_ts,
+                                                pcm_12k,
+                                                DecodePassOptions {
+                                                    mode: cur_mode,
+                                                    depth: 3,
+                                                    timeout: Duration::from_millis(1_800),
+                                                    early_pass: false,
+                                                    qso_context,
+                                                    generate_wisdom_if_missing: false,
+                                                    fallback_on_empty_timeout: false,
+                                                },
+                                                &sess_p2,
+                                                &rec_p2,
+                                            )
+                                            .await;
+                                        let dial_freq = mgr_p2.live_dial_freq_hz(&rid_p2, None);
+                                        mgr_p2
+                                            .flush_slot_telemetry(&rid_p2, dial_freq, &rec_p2)
+                                            .await;
+                                    })
+                                })
+                        } else {
+                            None
+                        };
+
+                        if let Some(ref mut handle) = pass2_handle {
+                            let deadline_ms = next_slot_ms + LIVE_DECODE_GRACE_MS;
+                            let grace_ms =
+                                (deadline_ms - Utc::now().timestamp_millis()).max(1) as u64;
+                            tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    let _ = handle.await;
+                                    break;
+                                }
+                                _ = &mut *handle => {
+                                    pass2_handle = None;
+                                }
+                                _ = sleep(Duration::from_millis(grace_ms)) => {
+                                    debug!(radio_id = %radio_id, "live FT4 deep pass continuing asynchronously past TX grace window");
+                                }
+                            }
+                            active_final_pass = pass2_handle;
+                        } else {
+                            let dial_freq = self.live_dial_freq_hz(&radio_id, None);
+                            self.flush_slot_telemetry(&radio_id, dial_freq, &reconciler)
+                                .await;
+                        }
+                    }
                 }
             }
 
@@ -1912,19 +2116,80 @@ impl SessionManager {
             }
         }
 
-        if let Some(bg) = active_pass3.take() {
+        if let Some(bg) = active_final_pass.take() {
             let _ = bg.await;
+        }
+    }
+
+    async fn build_qso_decode_context(
+        &self,
+        rt_arc: &Arc<AsyncMutex<SessionRuntime>>,
+    ) -> QsoDecodeContext {
+        let rt = rt_arc.lock().await;
+        let my_call =
+            (!rt.sequencer.my_call.trim().is_empty()).then(|| rt.sequencer.my_call.clone());
+        let tx_freq_hz = Some(f32::from(rt.sequencer.tx_af_hz));
+
+        let armed_id = rt.sequencer.armed_qso_id();
+        let target_qso = armed_id
+            .as_deref()
+            .and_then(|id| rt.sequencer.queue.iter().find(|q| q.qso_id == id))
+            .or_else(|| rt.sequencer.queue.first());
+
+        if let Some(qso) = target_qso {
+            let rx_freq_hz = qso
+                .transcript
+                .iter()
+                .rev()
+                .find(|t| t.direction == "rx")
+                .map(|t| f32::from(t.af_hz))
+                .or(tx_freq_hz);
+            let qso_progress = match qso.step {
+                QsoStep::CallingCq => 0,
+                QsoStep::SendGrid => 1,
+                QsoStep::SendReport => 2,
+                QsoStep::SendRReport => 3,
+                QsoStep::SendRr73 => 4,
+                QsoStep::Send73 => 5,
+            };
+            QsoDecodeContext {
+                my_call,
+                dx_call: (!qso.their_call.trim().is_empty()).then(|| qso.their_call.clone()),
+                dx_grid: qso.their_grid.clone(),
+                rx_freq_hz,
+                tx_freq_hz,
+                qso_progress: Some(qso_progress),
+                enable_ap: true,
+            }
+        } else {
+            QsoDecodeContext {
+                my_call,
+                dx_call: None,
+                dx_grid: None,
+                rx_freq_hz: tx_freq_hz,
+                tx_freq_hz,
+                qso_progress: Some(0),
+                enable_ap: true,
+            }
         }
     }
 
     async fn should_decode_slot(
         &self,
         rt_arc: &Arc<AsyncMutex<SessionRuntime>>,
+        mode: ModemMode,
         slot_ts: UnixSecs,
         real_audio_start_ms: i64,
     ) -> bool {
+        let (min_real_ms, min_samples) = match mode {
+            ModemMode::Ft8 => (MIN_LIVE_SLOT_REAL_AUDIO_MS, MIN_LIVE_SLOT_SAMPLES_12K),
+            ModemMode::Ft4 => (
+                FT4_MIN_LIVE_SLOT_REAL_AUDIO_MS,
+                FT4_MIN_LIVE_SLOT_SAMPLES_12K,
+            ),
+        };
         let now_ms = Utc::now().timestamp_millis();
-        if now_ms - real_audio_start_ms < MIN_LIVE_SLOT_REAL_AUDIO_MS {
+        if now_ms - real_audio_start_ms < min_real_ms {
             return false;
         }
         let rt = rt_arc.lock().await;
@@ -1933,21 +2198,26 @@ impl SessionManager {
         }
         rt.capture
             .as_ref()
-            .is_some_and(|c| c.buffered_len() >= MIN_LIVE_SLOT_SAMPLES_12K)
+            .is_some_and(|c| c.buffered_len() >= min_samples)
     }
 
     async fn snapshot_prepared_slot_pcm(
         &self,
         rt_arc: &Arc<AsyncMutex<SessionRuntime>>,
+        mode: ModemMode,
     ) -> Option<Vec<f32>> {
+        let min_samples = match mode {
+            ModemMode::Ft8 => MIN_LIVE_SLOT_SAMPLES_12K,
+            ModemMode::Ft4 => FT4_MIN_LIVE_SLOT_SAMPLES_12K,
+        };
         let raw = {
             let rt = rt_arc.lock().await;
             rt.capture.as_ref().map(|c| c.snapshot_slot_samples())?
         };
-        if raw.len() < MIN_LIVE_SLOT_SAMPLES_12K {
+        if raw.len() < min_samples {
             return None;
         }
-        Some(prepare_slot_pcm_12k(raw))
+        Some(prepare_slot_pcm_12k(raw, mode.slot_samples_12k()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2191,14 +2461,25 @@ impl SessionManager {
             return;
         }
 
-        let slot_ms = {
+        let (slot_ms, mode) = {
             let rt = session.runtime.lock().await;
-            rt.clock.spec().slot_ms
+            (
+                rt.clock.spec().slot_ms,
+                ModemMode::from_mode_str(&rt.digital_mode),
+            )
+        };
+        let max_late_tx_start_ms = match mode {
+            ModemMode::Ft8 => MAX_LATE_TX_START_MS,
+            ModemMode::Ft4 => FT4_MAX_LATE_TX_START_MS,
+        };
+        let tx_end_offset_ms = match mode {
+            ModemMode::Ft8 => FT8_TX_END_OFFSET_MS,
+            ModemMode::Ft4 => FT4_TX_END_OFFSET_MS,
         };
         let now_ms = Utc::now().timestamp_millis();
         let slot_start_ms = now_ms.div_euclid(slot_ms) * slot_ms;
         let slot_ts = UnixSecs(slot_start_ms.div_euclid(1000));
-        let slot_parity = SlotParity::from_unix_secs(slot_ts);
+        let slot_parity = SlotParity::from_virtual_ms(slot_start_ms, slot_ms);
         let into_slot_ms = (now_ms - slot_start_ms).max(0);
         let live_freq = self.live_dial_freq_hz(&session.radio_id, None);
 
@@ -2233,7 +2514,7 @@ impl SessionManager {
                 active_intent.as_ref(),
                 desired_intent.as_ref(),
                 into_slot_ms,
-                MAX_LATE_TX_START_MS,
+                max_late_tx_start_ms,
             );
             match decision {
                 TxReconcileDecision::Noop | TxReconcileDecision::TooLateWaitNextSlot => Plan::Noop,
@@ -2274,42 +2555,35 @@ impl SessionManager {
                 expected_gen,
             } => {
                 let offset_ms = (Utc::now().timestamp_millis() - slot_start_ms).max(0) as u64;
-                if (offset_ms as i64) > MAX_LATE_TX_START_MS {
+                if (offset_ms as i64) > max_late_tx_start_ms {
                     self.abort_current_tx_locked(session).await;
                     return;
                 }
-                let msg_mod = intent.message.clone();
                 let af_mod = f32::from(intent.af_hz);
-                let pcm_res = tokio::task::spawn_blocking(move || {
-                    Ft8LibTxModulator::modulate_pcm_from_offset(
-                        &msg_mod,
+                let pcm_48k = match self
+                    .hybrid_decoder
+                    .modulate_tx_from_offset(
+                        mode,
+                        &intent.message,
                         af_mod,
                         DSP_SAMPLE_RATE,
                         offset_ms,
                     )
-                })
-                .await;
-                let pcm_48k = match pcm_res {
-                    Ok(Ok(p)) if !p.is_empty() => p,
-                    Ok(Ok(_)) => {
-                        self.abort_current_tx_locked(session).await;
-                        return;
-                    }
-                    Ok(Err(e)) => {
-                        self.emit_tx_error(
-                            &session.radio_id,
-                            format!(
-                                "Failed to modulate hot-swap FT8 TX waveform '{}': {e}",
-                                intent.message
-                            ),
-                        );
+                    .await
+                {
+                    Ok(p) if !p.is_empty() => p,
+                    Ok(_) => {
                         self.abort_current_tx_locked(session).await;
                         return;
                     }
                     Err(e) => {
                         self.emit_tx_error(
                             &session.radio_id,
-                            format!("TX modulate task error: {e}"),
+                            format!(
+                                "Failed to modulate hot-swap {} TX waveform '{}': {e}",
+                                mode.as_str().to_ascii_uppercase(),
+                                intent.message
+                            ),
                         );
                         self.abort_current_tx_locked(session).await;
                         return;
@@ -2379,37 +2653,31 @@ impl SessionManager {
                 dial_freq_hz,
             } => {
                 let offset_ms = (Utc::now().timestamp_millis() - slot_start_ms).max(0) as u64;
-                if (offset_ms as i64) > MAX_LATE_TX_START_MS {
+                if (offset_ms as i64) > max_late_tx_start_ms {
                     return;
                 }
-                let msg_mod = intent.message.clone();
                 let af_mod = f32::from(intent.af_hz);
-                let pcm_res = tokio::task::spawn_blocking(move || {
-                    Ft8LibTxModulator::modulate_pcm_from_offset(
-                        &msg_mod,
+                let pcm_48k = match self
+                    .hybrid_decoder
+                    .modulate_tx_from_offset(
+                        mode,
+                        &intent.message,
                         af_mod,
                         DSP_SAMPLE_RATE,
                         offset_ms,
                     )
-                })
-                .await;
-                let pcm_48k = match pcm_res {
-                    Ok(Ok(p)) if !p.is_empty() => p,
-                    Ok(Ok(_)) => return,
-                    Ok(Err(e)) => {
-                        self.emit_tx_error(
-                            &session.radio_id,
-                            format!(
-                                "Failed to modulate FT8 TX waveform '{}': {e}",
-                                intent.message
-                            ),
-                        );
-                        return;
-                    }
+                    .await
+                {
+                    Ok(p) if !p.is_empty() => p,
+                    Ok(_) => return,
                     Err(e) => {
                         self.emit_tx_error(
                             &session.radio_id,
-                            format!("TX modulate task error: {e}"),
+                            format!(
+                                "Failed to modulate {} TX waveform '{}': {e}",
+                                mode.as_str().to_ascii_uppercase(),
+                                intent.message
+                            ),
                         );
                         return;
                     }
@@ -2496,6 +2764,7 @@ impl SessionManager {
                                 tx_gen,
                                 slot_ts,
                                 slot_start_ms,
+                                tx_end_offset_ms,
                                 dial_freq_hz,
                                 rt_wait,
                                 confirmed_wait,
@@ -2545,6 +2814,7 @@ impl SessionManager {
         tx_gen: u64,
         slot_ts: UnixSecs,
         slot_start_ms: i64,
+        tx_end_offset_ms: i64,
         dial_freq_hz: Option<i64>,
         rt_arc: Arc<AsyncMutex<SessionRuntime>>,
         confirmed_intent: Arc<AsyncMutex<TxIntent>>,
@@ -2553,7 +2823,7 @@ impl SessionManager {
         tx_cancel: CancellationToken,
         session_cancel: CancellationToken,
     ) {
-        let end_wall_ms = slot_start_ms + FT8_TX_END_OFFSET_MS;
+        let end_wall_ms = slot_start_ms + tx_end_offset_ms;
         let wait_ms = (end_wall_ms - Utc::now().timestamp_millis()).max(50) as u64;
         let tx_end = TokioInstant::now() + Duration::from_millis(wait_ms);
 
@@ -2647,13 +2917,13 @@ fn generate_tune_sine_48k(af_hz: u16, duration_ms: u64) -> Vec<f32> {
     pcm
 }
 
-fn prepare_slot_pcm_12k(mut raw: Vec<f32>) -> Vec<f32> {
-    if raw.len() > FT8_SLOT_SAMPLES_12K {
-        let start = raw.len() - FT8_SLOT_SAMPLES_12K;
+fn prepare_slot_pcm_12k(mut raw: Vec<f32>, target_samples: usize) -> Vec<f32> {
+    if raw.len() > target_samples {
+        let start = raw.len() - target_samples;
         raw.drain(..start);
     }
-    if raw.len() < FT8_SLOT_SAMPLES_12K {
-        raw.resize(FT8_SLOT_SAMPLES_12K, 0.0);
+    if raw.len() < target_samples {
+        raw.resize(target_samples, 0.0);
     }
     raw
 }

@@ -504,7 +504,7 @@ export function useDaemonSocket(): DaemonState {
               dt_sec: Number(parsed.dt_sec ?? 0),
               af_hz: Number(parsed.af_hz ?? 1500),
               message: String(parsed.message ?? ""),
-              decoder_backend: String(parsed.decoder_backend ?? "jt9"),
+              decoder_backend: String(parsed.decoder_backend ?? "ftxr"),
               decoder_metadata: rawMeta,
             };
             setRecentDecodes((prev) => reconcileDecode(prev, dec));
