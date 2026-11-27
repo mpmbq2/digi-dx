@@ -58,7 +58,7 @@
 
 ### 3.1 CLI Contract & Flags
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/digi-dx/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash
 # or from a local checkout:
 bash scripts/install.sh [options]
 ```
@@ -76,13 +76,13 @@ bash scripts/install.sh [options]
 
 ### 3.2 Idempotent Execution Steps
 1. **Platform & Arch Detection:**
-   - Detect `uname -s` (`Linux` | `Darwin`) and normalize `uname -m` (`x86_64`/`amd64` → `x86_64`, `aarch64`/`arm64` → `aarch64`). Abort with a clear message on unsupported architectures (e.g., `armv7l`).
+   - Detect `uname -s` (`Linux` | `Darwin`) and normalize `uname -m` (`x86_64`/`amd64` → `x86_64`, `aarch64`/`arm64` → `aarch64`). Abort with a clear message on unsupported architectures (e.g., `armv7l` or prebuilt Intel macOS).
    - On Linux, parse `/etc/os-release` and detect package manager (`apt-get`, `dnf`, `pacman`).
 2. **System Dependency Installation:**
    - Install `hamlib`, `usbutils` (Linux), `alsa-utils` (Linux), and optionally `wsjtx` / `jt9` using the matrix in §2.1.
    - Verify `rigctl --version` and `rigctld --version`.
 3. **Binary Provisioning:**
-   - Download `digi-dx-<version>-<os>-<arch>.tar.gz` + `SHA256SUMS`, verify checksum via `sha256sum` / `shasum -a 256`, and install atomically to `/usr/local/bin/digi-dx` (`chmod 0755`).
+   - Download `digi-dx-<os>-<arch>.tar.gz` + `SHA256SUMS`, verify checksum via `sha256sum` / `shasum -a 256`, and install atomically to `/opt/homebrew/bin/digi-dx` (Apple Silicon macOS when writable) or `/usr/local/bin/digi-dx` (`chmod 0755`).
    - *(With `--from-source`: build UI bundle, run `cargo build --release`, copy `target/release/digi-dx`.)*
 4. **Linux `udev` Rules & Group Membership (Linux only):**
    - Install `/etc/udev/rules.d/99-digi-dx.rules` (§4).

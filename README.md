@@ -2,35 +2,92 @@
 
 A local-first FT8 & transceiver daemon with an embedded web console (`:8788`).
 
-## Native Linux Install (Ubuntu / Raspberry Pi OS)
+---
+
+## Install on macOS (Apple Silicon)
+
+### Option 1: Homebrew (Recommended)
+
+Requires [Homebrew](https://brew.sh) on an Apple Silicon Mac (M1/M2/M3/M4):
+
+```bash
+brew install mpmbq2/tap/digi-dx
+brew services start digi-dx
+```
+
+Then open **<http://127.0.0.1:8788>** in Safari, Chrome, or Firefox.
+
+- **Optional (full weak-signal sensitivity):** install WSJT-X so Digi-Dx can use `jt9` (without it, Digi-Dx uses its built-in `ft8_lib` decoder):
+  ```bash
+  brew install --cask wsjtx
+  ```
+- **Microphone permission:** macOS treats USB radio soundcards as microphones. If RX audio looks silent on first run, run `digi-dx preflight --probe-audio` and approve access under **System Settings → Privacy & Security → Microphone**.
+- **Upgrade later:**
+  ```bash
+  brew update && brew upgrade digi-dx && brew services restart digi-dx
+  ```
+
+### Option 2: One-Line Installer (without Tap)
+
+Run as your normal user (do **not** use `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash
+```
+
+---
+
+## Install on Raspberry Pi (64-bit) / Linux
+
+Supports 64-bit Raspberry Pi OS (Pi 4 / Pi 5), Ubuntu, Debian, Fedora, and Arch (`aarch64` / `x86_64`). No `git`, Rust, or Node.js required:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash
+```
+
+This downloads the prebuilt binary, installs Hamlib (`rigctld`) and `wsjtx` (`jt9`), sets up USB serial/audio permissions (`udev`), and starts the `digi-dx` `systemd` service automatically.
+
+> **Tip:** You don't need to use a browser on the Raspberry Pi. Open **`http://<pi-hostname>.local:8788`** (or `http://<pi-ip>:8788`) from your Mac, PC, tablet, or phone on the same network.
+
+- **Skip `wsjtx` (~150 MB Qt packages) on a headless Pi** (uses the built-in `ft8_lib` decoder):
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash -s -- --no-jt9
+  ```
+- **Check status / logs:**
+  ```bash
+  sudo systemctl status digi-dx
+  journalctl -u digi-dx -f
+  ```
+- **Uninstall** (preserves your QSO database):
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash -s -- --uninstall
+  ```
+
+---
+
+## Build from Source (Developers)
+
+Only needed if you are hacking on Digi-Dx itself.
 
 ### 1. System Dependencies
 
-Install build tools, Hamlib (`rigctld`), ALSA dev headers, and optionally `wsjtx` (provides `jt9` for full-sensitivity FT8 decoding; without it, Digi-Dx falls back to the built-in `ft8_lib` decoder):
+- **Linux (Debian / Ubuntu / Raspberry Pi OS):**
+  ```bash
+  sudo apt update
+  sudo apt install -y \
+    build-essential pkg-config libasound2-dev \
+    libhamlib-utils wsjtx curl git
+  ```
+- **macOS (Homebrew):**
+  ```bash
+  brew install hamlib
+  ```
+- **Toolchains:** [Rust (`rustup`)](https://rustup.rs) (>= 1.82) and Node.js (>= 20) + `npm`.
+
+### 2. Clone & Build
 
 ```bash
-sudo apt update
-sudo apt install -y \
-  build-essential pkg-config libasound2-dev libsqlite3-dev \
-  libhamlib-utils wsjtx curl git
-```
-
-You also need:
-- **Rust** (`rustup`): <https://rustup.rs>
-- **Node.js & npm** (v20+): for building the embedded UI (`ui/`)
-
-### 2. Serial & Audio Permissions
-
-Add your user to `dialout` (serial CAT) and `audio` (ALSA soundcards), then **log out and back in** (or reboot) so group membership takes effect:
-
-```bash
-sudo usermod -aG dialout,audio "$USER"
-```
-
-### 3. Build from Source
-
-```bash
-git clone https://github.com/n1mpm/digi-dx.git
+git clone https://github.com/mpmbq2/digi-dx.git
 cd digi-dx
 make ui-deps
 make build
@@ -38,24 +95,17 @@ make build
 
 This compiles the frontend into `ui/dist/` and embeds it into the single release binary at `target/release/digi-dx`.
 
-### 4. Verify & Run
-
-Run the preflight check, then start the daemon:
+### 3. Verify & Run
 
 ```bash
 ./target/release/digi-dx preflight
 ./target/release/digi-dx serve
 ```
 
-Open `http://127.0.0.1:8788` (or `http://<host-ip>:8788` on your LAN) in a browser.
-
-### 5. Optional: Install as a `systemd` Service
-
-To install `/usr/local/bin/digi-dx`, udev rules (`/etc/udev/rules.d/99-digi-dx.rules`), and a `systemd` service (`digi-dx.service`):
+Or install your locally built binary as a native service:
 
 ```bash
-sudo ./scripts/install.sh
-sudo systemctl status digi-dx
+./scripts/install.sh --from-source
 ```
 
 ---

@@ -497,6 +497,7 @@ fn run_capture_thread(
             }
         };
         // Drop cpal::Device so ALSA releases the unused playback PCM handle while RX runs.
+        #[allow(clippy::drop_non_drop)]
         drop(dev);
         stream
     };
@@ -662,6 +663,7 @@ fn run_playback_thread(
             }
         };
         // Drop cpal::Device so unused capture handle is released immediately.
+        #[allow(clippy::drop_non_drop)]
         drop(dev);
         (stream, out_rate)
     };

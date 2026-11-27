@@ -169,6 +169,22 @@ resolve_repo_root() {
   printf '\n'
 }
 
+install_binary_file() {
+  local src="$1"
+  local dest="$2"
+  local dest_dir
+  dest_dir="$(dirname "$dest")"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log_info "[dry-run] install -m 0755 $src $dest"
+    return 0
+  fi
+  if [[ -w "$dest_dir" ]]; then
+    install -m 0755 "$src" "$dest"
+  else
+    run_sudo install -m 0755 "$src" "$dest"
+  fi
+}
+
 detect_platform() {
   local raw_os
   local raw_arch
@@ -222,10 +238,22 @@ detect_platform() {
     fi
   else
     log_info "Detected macOS ($ARCH_NORM)"
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+      die "Do not run this installer with sudo on macOS. Re-run as your normal user (without sudo)."
+    fi
+    if [[ "$ARCH_NORM" != "aarch64" && $FROM_SOURCE -eq 0 && $UNINSTALL -eq 0 ]]; then
+      die "Prebuilt macOS binaries support Apple Silicon (arm64) only. Pass --from-source to build on Intel macOS."
+    fi
+    if ! command -v brew >/dev/null 2>&1 && [[ -x /opt/homebrew/bin/brew ]]; then
+      export PATH="/opt/homebrew/bin:$PATH"
+    fi
     if ! command -v brew >/dev/null 2>&1; then
-      die "Homebrew is required on macOS. Install from https://brew.sh and re-run."
+      die "Homebrew is required on macOS. Install it first with: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
     fi
     PKG_MGR="brew"
+    if [[ -d /opt/homebrew/bin && -w /opt/homebrew/bin ]]; then
+      BINARY_PATH="/opt/homebrew/bin/digi-dx"
+    fi
   fi
 
   local fallback_user
@@ -377,7 +405,7 @@ provision_binary() {
     if [[ $DRY_RUN -eq 1 ]]; then
       log_info "[dry-run] Would build frontend SPA in $repo_root/ui via npm ci/install && npm run build"
       log_info "[dry-run] Would compile release binary via cargo build --release in $repo_root"
-      run_sudo install -m 0755 "$repo_root/target/release/digi-dx" "$BINARY_PATH"
+      install_binary_file "$repo_root/target/release/digi-dx" "$BINARY_PATH"
       return 0
     fi
 
@@ -403,7 +431,7 @@ provision_binary() {
       cd "$repo_root"
       cargo build --release
     )
-    run_sudo install -m 0755 "$repo_root/target/release/digi-dx" "$BINARY_PATH"
+    install_binary_file "$repo_root/target/release/digi-dx" "$BINARY_PATH"
     return 0
   fi
 
@@ -415,7 +443,7 @@ provision_binary() {
     base_url="https://github.com/${REPO}/releases/download/${ver_tag}"
   fi
 
-  local tarball="digi-dx-${ver_tag}-${OS_NAME}-${ARCH_NORM}.tar.gz"
+  local tarball="digi-dx-${OS_NAME}-${ARCH_NORM}.tar.gz"
   local tarball_url="${base_url}/${tarball}"
   local sums_url="${base_url}/SHA256SUMS"
 
@@ -429,20 +457,24 @@ provision_binary() {
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' RETURN
 
-  curl -fsSL "$tarball_url" -o "$tmp_dir/$tarball"
-  curl -fsSL "$sums_url" -o "$tmp_dir/SHA256SUMS"
+  if ! curl -fsSL "$tarball_url" -o "$tmp_dir/$tarball"; then
+    die "Failed to download ${tarball_url}. Check https://github.com/${REPO}/releases for available releases."
+  fi
+  if ! curl -fsSL "$sums_url" -o "$tmp_dir/SHA256SUMS"; then
+    die "Failed to download ${sums_url}."
+  fi
 
   if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmp_dir" && grep "  $tarball\$" SHA256SUMS | sha256sum -c -)
+    (cd "$tmp_dir" && grep "  ${tarball}\$" SHA256SUMS | sha256sum -c -)
   elif command -v shasum >/dev/null 2>&1; then
-    (cd "$tmp_dir" && grep "  $tarball\$" SHA256SUMS | shasum -a 256 -c -)
+    (cd "$tmp_dir" && grep "  ${tarball}\$" SHA256SUMS | shasum -a 256 -c -)
   else
     die "Neither sha256sum nor shasum found to verify release checksum"
   fi
 
   tar -xzf "$tmp_dir/$tarball" -C "$tmp_dir"
   [[ -f "$tmp_dir/digi-dx" ]] || die "Archive $tarball did not contain digi-dx executable"
-  run_sudo install -m 0755 "$tmp_dir/digi-dx" "$BINARY_PATH"
+  install_binary_file "$tmp_dir/digi-dx" "$BINARY_PATH"
 }
 
 udev_rules_content() {
@@ -603,7 +635,10 @@ launchd_plist_content() {
   repo_root="$(resolve_repo_root)"
   local current_user="${USER:-$(id -un)}"
   if [[ -n "$repo_root" && -f "$repo_root/deploy/launchd/com.digidx.daemon.plist" ]]; then
-    sed "s/REPLACE_USER/${current_user}/g" "$repo_root/deploy/launchd/com.digidx.daemon.plist"
+    sed \
+      -e "s/REPLACE_USER/${current_user}/g" \
+      -e "s|/usr/local/bin/digi-dx|${BINARY_PATH}|g" \
+      "$repo_root/deploy/launchd/com.digidx.daemon.plist"
     return 0
   fi
   cat <<EOF
@@ -707,11 +742,21 @@ verify_installation() {
       sleep 1
     done
     if [[ $ok -eq 1 ]]; then
-      local host_ip="127.0.0.1"
-      if [[ "$OS_NAME" == "linux" ]] && command -v hostname >/dev/null 2>&1; then
-        host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || printf '127.0.0.1')"
+      if [[ "$OS_NAME" == "linux" ]]; then
+        local host_ip="127.0.0.1"
+        local host_short=""
+        if command -v hostname >/dev/null 2>&1; then
+          host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || printf '127.0.0.1')"
+          host_short="$(hostname -s 2>/dev/null || true)"
+        fi
+        log_info "Digi-Dx daemon is live at http://${host_ip}:8788"
+        if [[ -n "$host_short" ]]; then
+          log_info "From another computer or phone on your network, open: http://${host_short}.local:8788 (or http://${host_ip}:8788)"
+        fi
+      else
+        log_info "Digi-Dx daemon is live at http://127.0.0.1:8788"
+        log_info "macOS tip: If RX audio is silent, approve Microphone permission in System Settings -> Privacy & Security -> Microphone (or run: digi-dx preflight --probe-audio)."
       fi
-      log_info "Digi-Dx daemon is live at http://${host_ip}:8788"
     else
       log_warn "Service started, but http://127.0.0.1:8788/api/v1/health did not respond within 5s. Check service logs."
     fi
@@ -741,7 +786,16 @@ do_uninstall() {
     gui_domain="gui/$(id -u)"
     run_cmd launchctl bootout "${gui_domain}/com.digidx.daemon" || true
     run_cmd rm -f "$plist_path"
-    run_sudo rm -f "$BINARY_PATH"
+    local bin_candidate
+    for bin_candidate in /opt/homebrew/bin/digi-dx /usr/local/bin/digi-dx; do
+      if [[ -e "$bin_candidate" ]]; then
+        if [[ -w "$(dirname "$bin_candidate")" ]]; then
+          run_cmd rm -f "$bin_candidate"
+        else
+          run_sudo rm -f "$bin_candidate"
+        fi
+      fi
+    done
     log_info "Preserved state directory: $HOME/Library/Application Support/digi-dx"
   fi
   log_info "Uninstall complete."
@@ -751,12 +805,16 @@ main() {
   parse_args "$@"
   detect_platform
 
+  if [[ "$OS_NAME" == "linux" && $DRY_RUN -eq 0 && ${EUID:-$(id -u)} -ne 0 ]]; then
+    sudo -v
+  fi
+
   if [[ $UNINSTALL -eq 1 ]]; then
     do_uninstall
     exit 0
   fi
 
-  log_info "Step 1/7: Platform=$OS_NAME Arch=$ARCH_NORM PkgMgr=$PKG_MGR ServiceUser=$SERVICE_USER"
+  log_info "Step 1/7: Platform=$OS_NAME Arch=$ARCH_NORM PkgMgr=$PKG_MGR ServiceUser=$SERVICE_USER Binary=$BINARY_PATH"
   install_dependencies
   provision_binary
   setup_linux_udev_and_groups
