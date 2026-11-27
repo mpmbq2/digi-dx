@@ -30,7 +30,8 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "active_radios": state.supervisor.active_ready_count(),
         "active_ptt": state.supervisor.any_ptt_active(),
         "preflight_status": preflight.overall_status,
-        "active_ft8_decoder": preflight.active_ft8_decoder,
+        "active_ft8_decoder": state.sessions.active_decoder_backend(),
+        "available_decoders": state.sessions.available_decoders(),
     }))
 }
 

@@ -40,7 +40,7 @@ export function SystemHealthGrid({
   radios,
 }: Props) {
   const decoder =
-    preflight?.active_ft8_decoder ?? health?.active_ft8_decoder ?? "unknown";
+    health?.active_ft8_decoder ?? preflight?.active_ft8_decoder ?? "unknown";
   const isFtxr = decoder === "ftxr";
   const isJt9 = decoder === "jt9";
   const isFallback = !isFtxr && !isJt9;

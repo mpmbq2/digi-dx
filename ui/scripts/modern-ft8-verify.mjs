@@ -221,8 +221,21 @@ async function main() {
     await page.click('[data-testid="mft8-flip-feed"]');
 
     // Tab round-trip check (Modern <-> Legacy FT8 <-> Modern) preserves single WS & zero CSS leakage
+    await page.waitForSelector('[data-testid="mft8-decoder-select"]');
+    const mft8Options = await page.$$eval(
+      '[data-testid="mft8-decoder-select"] option',
+      (els) => els.map((e) => e.getAttribute("value"))
+    );
+    assert(mft8Options.includes("ftxr") && mft8Options.includes("jt9") && mft8Options.includes("ft8_lib_fallback"));
+
+    const initialDecoder = health.active_ft8_decoder;
+    const altDecoder = (health.available_decoders ?? []).find(
+      (d) => d.available && d.id !== initialDecoder
+    );
+
     await page.click('[data-testid="tab-radio-ft8"]');
     await page.waitForSelector('[data-testid="ft8-console"]');
+    await page.waitForSelector('[data-testid="ft8-decoder-select"]');
     const afterSwitchLegacy = await page.evaluate(() => ({
       wsCount: window.__wsCount,
       hasModernClass: document
@@ -234,9 +247,45 @@ async function main() {
     assert.equal(afterSwitchLegacy.hasModernClass, false);
     assert.equal(afterSwitchLegacy.hasModernRoot, false);
 
+    if (altDecoder) {
+      await page.selectOption('[data-testid="ft8-decoder-select"]', altDecoder.id);
+      await page.waitForFunction(
+        async (id) => {
+          const r = await fetch("/api/v1/health");
+          if (!r.ok) return false;
+          const h = await r.json();
+          return h.active_ft8_decoder === id;
+        },
+        altDecoder.id,
+        { timeout: 5000 }
+      );
+    }
+
     await page.click('[data-testid="tab-radio-modern-ft8"]');
     await page.waitForSelector('[data-testid="modern-ft8-console"]');
     assert.equal(await page.evaluate(() => window.__wsCount), 1);
+
+    if (altDecoder) {
+      await page.waitForFunction(
+        (id) => {
+          const sel = document.querySelector('[data-testid="mft8-decoder-select"]');
+          return sel && sel.value === id;
+        },
+        altDecoder.id,
+        { timeout: 5000 }
+      );
+      await page.selectOption('[data-testid="mft8-decoder-select"]', initialDecoder);
+      await page.waitForFunction(
+        async (id) => {
+          const r = await fetch("/api/v1/health");
+          if (!r.ok) return false;
+          const h = await r.json();
+          return h.active_ft8_decoder === id;
+        },
+        initialDecoder,
+        { timeout: 5000 }
+      );
+    }
 
     // 3. Band Switcher & Mode Toggle (FT8 <-> FT4)
     await page.selectOption('[data-testid="mft8-band-select"]', "20m");

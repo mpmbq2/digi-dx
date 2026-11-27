@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::domain::adif::QsoRecord;
 use crate::domain::clock::{SlotClockSpec, SlotParity};
 use crate::domain::ft8::{validate_station_callsign, validate_station_grid, validate_tx_message};
-use crate::modem::TxIntent;
+use crate::modem::{DecoderBackendChoice, DecoderOption, TxIntent};
 use crate::qrz::{QrzClientError, QrzPushError, QrzStatusSnapshot, QrzSyncService};
 use crate::qso::sequencer::{ActiveQso, CqState, QsoAction, SequencerMode};
 use crate::qso::SessionManager;
@@ -282,6 +282,10 @@ pub enum WsBroadcastEvent {
     QrzSyncUpdate {
         status: Box<QrzStatusSnapshot>,
     },
+    DecoderConfigUpdated {
+        active_decoder: String,
+        available_decoders: Vec<DecoderOption>,
+    },
 }
 
 pub struct CommandBus {
@@ -486,6 +490,7 @@ impl CommandBus {
             "session.start" => self.exec_session_start(envelope).await,
             "session.stop" => self.exec_session_stop(envelope).await,
             "session.set_mode" => self.exec_session_set_mode(envelope).await,
+            "session.set_decoder" => self.exec_session_set_decoder(envelope).await,
             "tx.tune" => self.exec_tx_tune(envelope).await,
             "tx.arm" => self.exec_tx_arm(envelope).await,
             "tx.cancel" => self.exec_tx_cancel(envelope).await,
@@ -1371,9 +1376,13 @@ impl CommandBus {
             .unwrap_or(false);
         let scale = envelope.payload.get("scale").and_then(Value::as_f64);
         let mode = envelope.payload.get("mode").and_then(Value::as_str);
+        let decoder = envelope
+            .payload
+            .get("decoder_backend")
+            .and_then(Value::as_str);
         match self
             .sessions
-            .start_session_with_mode(&radio_id, &envelope.actor, demo, scale, mode)
+            .start_session_with_options(&radio_id, &envelope.actor, demo, scale, mode, decoder)
             .await
         {
             Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
@@ -1414,6 +1423,23 @@ impl CommandBus {
             .and_then(Value::as_str)
             .unwrap_or("");
         match self.sessions.set_session_mode(&radio_id, mode).await {
+            Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
+            Err((code, msg)) => CommandAck::err(
+                envelope.command_id.clone(),
+                status_for_error(code),
+                code,
+                msg,
+            ),
+        }
+    }
+
+    async fn exec_session_set_decoder(&self, envelope: &CommandEnvelope) -> CommandAck {
+        let decoder = envelope
+            .payload
+            .get("decoder_backend")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match self.sessions.set_decoder_backend(decoder).await {
             Ok(v) => CommandAck::ok(envelope.command_id.clone(), v),
             Err((code, msg)) => CommandAck::err(
                 envelope.command_id.clone(),
@@ -2189,6 +2215,22 @@ fn validate_command(envelope: &CommandEnvelope) -> Result<(), (ErrorCode, String
                     ));
                 }
             }
+            if let Some(dec_val) = envelope.payload.get("decoder_backend") {
+                let Some(dec_str) = dec_val.as_str() else {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        "decoder_backend must be a string".to_string(),
+                    ));
+                };
+                if DecoderBackendChoice::parse(dec_str).is_none() {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        format!(
+                            "unsupported decoder_backend '{dec_str}' (expected ftxr, jt9, ft8_lib_fallback, or auto)"
+                        ),
+                    ));
+                }
+            }
             Ok(())
         }
         "session.set_mode" => {
@@ -2203,6 +2245,21 @@ fn validate_command(envelope: &CommandEnvelope) -> Result<(), (ErrorCode, String
                 return Err((
                     ErrorCode::ValidationFailed,
                     "mode must be 'FT8' or 'FT4'".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "session.set_decoder" => {
+            let dec = envelope
+                .payload
+                .get("decoder_backend")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if DecoderBackendChoice::parse(dec).is_none() {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "decoder_backend must be 'ftxr', 'jt9', 'ft8_lib_fallback', or 'auto'"
+                        .to_string(),
                 ));
             }
             Ok(())

@@ -125,6 +125,50 @@ async function main() {
     assert(wfBox && decBox, "waterfall or live decodes missing bounding box");
     assert(wfBox.width > decBox.width, `expected waterfall (${wfBox.width}) wider than decodes (${decBox.width})`);
 
+    // Verify available decoder selector in classic FT8 UI
+    await page.waitForSelector('[data-testid="ft8-decoder-select"]');
+    const initialDecoder = health.active_ft8_decoder;
+    const altDecoder = (health.available_decoders ?? []).find(
+      (d) => d.available && d.id !== initialDecoder
+    );
+    const optionValues = await page.$$eval(
+      '[data-testid="ft8-decoder-select"] option',
+      (els) => els.map((e) => e.getAttribute("value"))
+    );
+    assert(optionValues.includes("ftxr") && optionValues.includes("jt9") && optionValues.includes("ft8_lib_fallback"));
+    if (altDecoder) {
+      await page.selectOption('[data-testid="ft8-decoder-select"]', altDecoder.id);
+      await page.waitForFunction(
+        (id) => {
+          const sel = document.querySelector('[data-testid="ft8-decoder-select"]');
+          return sel && sel.value === id;
+        },
+        altDecoder.id,
+        { timeout: 5000 }
+      );
+      await page.waitForFunction(
+        async (id) => {
+          const r = await fetch("/api/v1/health");
+          if (!r.ok) return false;
+          const h = await r.json();
+          return h.active_ft8_decoder === id;
+        },
+        altDecoder.id,
+        { timeout: 5000 }
+      );
+      await page.selectOption('[data-testid="ft8-decoder-select"]', initialDecoder);
+      await page.waitForFunction(
+        async (id) => {
+          const r = await fetch("/api/v1/health");
+          if (!r.ok) return false;
+          const h = await r.json();
+          return h.active_ft8_decoder === id;
+        },
+        initialDecoder,
+        { timeout: 5000 }
+      );
+    }
+
     // Tune Dummy Rig to 20m (14.074 MHz) before starting 20x Demo Session
     await page.selectOption('[data-testid="ft8-band-select"]', "14074000");
     await page.waitForFunction(() => {

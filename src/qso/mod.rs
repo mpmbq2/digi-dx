@@ -32,7 +32,8 @@ use crate::domain::ft8::{
 };
 use crate::modem::simulator::SimulatedModem;
 use crate::modem::{
-    DecodePassOptions, Ft8Decode, HybridFt8Decoder, ModemMode, QsoDecodeContext, TxIntent,
+    DecodePassOptions, DecoderBackendChoice, DecoderOption, Ft8Decode, HybridFt8Decoder, ModemMode,
+    QsoDecodeContext, TxIntent,
 };
 use crate::store::{channel_key_for_freq, now_utc_str, StateStore, UpsertChannelRosterInput};
 use crate::supervisor::radio_worker::{CmdResult, RadioLifecycleState};
@@ -333,6 +334,14 @@ impl SessionManager {
         self.hybrid_decoder.shutdown().await;
     }
 
+    pub fn available_decoders(&self) -> Vec<DecoderOption> {
+        self.hybrid_decoder.available_decoders()
+    }
+
+    pub fn active_decoder_backend(&self) -> &'static str {
+        self.hybrid_decoder.active_backend_name()
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         self.snapshot_cache
             .read()
@@ -365,12 +374,59 @@ impl SessionManager {
         scale_opt: Option<f64>,
         mode_opt: Option<&str>,
     ) -> CmdResult {
+        self.start_session_with_options(radio_id, actor, demo, scale_opt, mode_opt, None)
+            .await
+    }
+
+    pub async fn start_session_with_options(
+        self: &Arc<Self>,
+        radio_id: &str,
+        actor: &str,
+        demo: bool,
+        scale_opt: Option<f64>,
+        mode_opt: Option<&str>,
+        decoder_opt: Option<&str>,
+    ) -> CmdResult {
         let digital_mode = match mode_opt {
             Some(raw) => {
                 normalize_digital_mode(raw).map_err(|msg| (ErrorCode::ValidationFailed, msg))?
             }
             None => default_digital_mode(),
         };
+        let requested_decoder = match decoder_opt.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let choice = DecoderBackendChoice::parse(raw).ok_or_else(|| {
+                    (
+                        ErrorCode::ValidationFailed,
+                        format!(
+                            "Unsupported decoder backend '{raw}'; expected ftxr, jt9, ft8_lib_fallback, or auto"
+                        ),
+                    )
+                })?;
+                if !self.hybrid_decoder.is_choice_available(choice) {
+                    return Err((
+                        ErrorCode::ValidationFailed,
+                        format!("Decoder backend '{raw}' is not available on this host"),
+                    ));
+                }
+                Some(choice)
+            }
+            None => None,
+        };
+        let effective_choice =
+            requested_decoder.unwrap_or_else(|| self.hybrid_decoder.selected_choice());
+        if !demo
+            && ModemMode::from_mode_str(&digital_mode) == ModemMode::Ft4
+            && !self
+                .hybrid_decoder
+                .supports_mode_for_choice(effective_choice, ModemMode::Ft4)
+        {
+            return Err((
+                ErrorCode::ValidationFailed,
+                "FT4 mode requires the ftxr decoder".to_string(),
+            ));
+        }
+
         self.stop_tune(Some(radio_id)).await;
 
         let mut guard = self.inner.lock().await;
@@ -447,6 +503,13 @@ impl SessionManager {
         let mut wf_task = None;
         let mut matched_audio_name = None;
         let decoder_backend = if demo {
+            if let Some(choice) = requested_decoder {
+                let _ = self.hybrid_decoder.set_backend(choice);
+                let _ = self.ws_tx.send(WsBroadcastEvent::DecoderConfigUpdated {
+                    active_decoder: self.hybrid_decoder.active_backend_name().to_string(),
+                    available_decoders: self.hybrid_decoder.available_decoders(),
+                });
+            }
             "simulated".to_string()
         } else {
             let Some(ref rs) = radio_snap else {
@@ -545,6 +608,13 @@ impl SessionManager {
                 }
             });
             wf_task = Some(wf_handle);
+            if let Some(choice) = requested_decoder {
+                let _ = self.hybrid_decoder.set_backend(choice);
+                let _ = self.ws_tx.send(WsBroadcastEvent::DecoderConfigUpdated {
+                    active_decoder: self.hybrid_decoder.active_backend_name().to_string(),
+                    available_decoders: self.hybrid_decoder.available_decoders(),
+                });
+            }
             self.supervisor.set_session_active(radio_id, true).await;
             self.hybrid_decoder.warm_up().await;
             self.hybrid_decoder.reset_session().await;
@@ -770,6 +840,80 @@ impl SessionManager {
         }
     }
 
+    pub async fn set_decoder_backend(&self, raw: &str) -> CmdResult {
+        let choice = DecoderBackendChoice::parse(raw).ok_or_else(|| {
+            (
+                ErrorCode::ValidationFailed,
+                format!(
+                    "Unsupported decoder backend '{}'; expected ftxr, jt9, ft8_lib_fallback, or auto",
+                    raw.trim()
+                ),
+            )
+        })?;
+
+        let active_session = {
+            let guard = self.inner.lock().await;
+            guard.as_ref().map(RunningSession::handle)
+        };
+
+        if let Some(ref session) = active_session {
+            let mut rt = session.runtime.lock().await;
+            if !rt.sequencer.is_demo
+                && ModemMode::from_mode_str(&rt.digital_mode) == ModemMode::Ft4
+                && !self
+                    .hybrid_decoder
+                    .supports_mode_for_choice(choice, ModemMode::Ft4)
+            {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "Cannot switch away from ftxr while a live FT4 session is active; switch to FT8 first"
+                        .to_string(),
+                ));
+            }
+            let resolved = self
+                .hybrid_decoder
+                .set_backend(choice)
+                .map_err(|e| (ErrorCode::ValidationFailed, e.to_string()))?;
+            if !rt.sequencer.is_demo {
+                rt.decoder_backend = resolved.to_string();
+                let snap = rt.to_snapshot();
+                let clock_spec = rt.clock.spec().clone();
+                let mode = rt.digital_mode.clone();
+                drop(rt);
+                if resolved == "ftxr" {
+                    self.hybrid_decoder.warm_up().await;
+                    self.hybrid_decoder.reset_session().await;
+                }
+                self.update_snapshot_cache(snap.clone());
+                let _ = self.ws_tx.send(WsBroadcastEvent::SlotClockUpdated {
+                    radio_id: Some(session.radio_id.clone()),
+                    active: true,
+                    is_demo: false,
+                    decoder_backend: Some(resolved.to_string()),
+                    digital_mode: Some(mode),
+                    slot_clock: clock_spec,
+                });
+                self.broadcast_qso_update(&snap, None);
+            }
+        } else {
+            self.hybrid_decoder
+                .set_backend(choice)
+                .map_err(|e| (ErrorCode::ValidationFailed, e.to_string()))?;
+        }
+
+        let active_decoder = self.hybrid_decoder.active_backend_name().to_string();
+        let available_decoders = self.hybrid_decoder.available_decoders();
+        let _ = self.ws_tx.send(WsBroadcastEvent::DecoderConfigUpdated {
+            active_decoder: active_decoder.clone(),
+            available_decoders: available_decoders.clone(),
+        });
+
+        Ok(json!({
+            "active_ft8_decoder": active_decoder,
+            "available_decoders": available_decoders,
+        }))
+    }
+
     pub async fn set_session_mode(&self, radio_id: &str, mode: &str) -> CmdResult {
         let norm =
             normalize_digital_mode(mode).map_err(|msg| (ErrorCode::ValidationFailed, msg))?;
@@ -777,6 +921,15 @@ impl SessionManager {
         let session = self.get_active_runtime(radio_id).await?;
         let (snap, clock_spec, decoder_backend, is_demo) = {
             let mut rt = session.runtime.lock().await;
+            if !rt.sequencer.is_demo
+                && ModemMode::from_mode_str(&norm) == ModemMode::Ft4
+                && !self.hybrid_decoder.supports_mode(ModemMode::Ft4)
+            {
+                return Err((
+                    ErrorCode::ValidationFailed,
+                    "FT4 mode requires the ftxr decoder; select ftxr first".to_string(),
+                ));
+            }
             let now_ms = Utc::now().timestamp_millis();
             let vnow = rt.clock.virtual_ms_at(now_ms).0;
             let mut next_spec = rt.clock.spec().clone();

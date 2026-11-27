@@ -150,11 +150,28 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
     await runSessionCmd("radio.set_freq", { freq_hz: freqHz });
   };
 
+  const handleSelectDecoder = async (decoderBackend: string) => {
+    const ack = await daemon.setDecoderBackend(decoderBackend);
+    const active =
+      typeof ack.result?.active_ft8_decoder === "string"
+        ? ack.result.active_ft8_decoder
+        : decoderBackend;
+    setStatusMsg({
+      ok: ack.status === "ok",
+      text:
+        ack.status === "ok"
+          ? `Decoder switched to ${active}.`
+          : `${ack.error_code ?? "ERR"}: ${
+              ack.error_message ?? "Failed to switch decoder"
+            }`,
+    });
+  };
+
   const handleStartLive = async () => {
     if (!(await ensureLease())) return;
     const ack = await daemon.sendCommand(
       "session.start",
-      { demo: false },
+      { demo: false, decoder_backend: daemon.activeDecoder },
       undefined,
       rid
     );
@@ -365,6 +382,76 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
                 ))}
               </select>
               {radio.mode && <span class="badge badge-info">{radio.mode}</span>}
+              <label
+                class="muted mono"
+                style={{
+                  fontSize: "0.75rem",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "0.3rem",
+                }}
+              >
+                <span>Decoder</span>
+                <select
+                  class="input-sm"
+                  data-testid="ft8-decoder-select"
+                  aria-label="FT8 Decoder Backend"
+                  value={daemon.activeDecoder}
+                  onChange={(e) => {
+                    const next = (e.currentTarget as HTMLSelectElement).value;
+                    if (next) void handleSelectDecoder(next);
+                  }}
+                >
+                  {(daemon.availableDecoders.length > 0
+                    ? daemon.availableDecoders
+                    : [
+                        {
+                          id: "ftxr",
+                          label: "ftxr-modem (FT8 / FT4)",
+                          available: true,
+                          supports_ft8: true,
+                          supports_ft4: true,
+                          is_default: true,
+                        },
+                        {
+                          id: "jt9",
+                          label: "WSJT-X jt9 (FT8)",
+                          available: false,
+                          supports_ft8: true,
+                          supports_ft4: false,
+                          is_default: false,
+                        },
+                        {
+                          id: "ft8_lib_fallback",
+                          label: "Embedded ft8_lib (FT8)",
+                          available: true,
+                          supports_ft8: true,
+                          supports_ft4: false,
+                          is_default: false,
+                        },
+                      ]
+                  ).map((opt) => {
+                    const ft4Conflict =
+                      Boolean(
+                        activeSession &&
+                          !activeSession.is_demo &&
+                          activeSession.digital_mode === "FT4"
+                      ) && !opt.supports_ft4;
+                    const disabled = !opt.available || ft4Conflict;
+                    const suffix = !opt.available
+                      ? " (not installed)"
+                      : ft4Conflict
+                      ? " (FT8 only)"
+                      : "";
+                    return (
+                      <option key={opt.id} value={opt.id} disabled={disabled}>
+                        {opt.label}
+                        {suffix}
+                      </option>
+                    );
+                  })}
+                </select>
+              </label>
               <button
                 type="button"
                 class="btn btn-secondary btn-xs"
@@ -375,9 +462,9 @@ export function OperatingConsole({ daemon, radio, onNavigateInfo }: Props) {
             </div>
             <p class="muted mono" style={{ fontSize: "0.74rem", marginTop: "0.2rem" }}>
               {radio.profile.name} · {formatLifecycleLabel(radio.lifecycle_state)} · {stationLabel} · decoder:{" "}
-              {activeSession?.decoder_backend ??
-                daemon.preflight?.active_ft8_decoder ??
-                "auto"}
+              {activeSession?.is_demo
+                ? `simulated (${daemon.activeDecoder})`
+                : activeSession?.decoder_backend ?? daemon.activeDecoder}
             </p>
           </div>
 

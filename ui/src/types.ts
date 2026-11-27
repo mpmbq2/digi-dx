@@ -24,6 +24,15 @@ export interface PreflightReport {
   checks: PreflightCheck[];
 }
 
+export interface DecoderOption {
+  id: string;
+  label: string;
+  available: boolean;
+  supports_ft8: boolean;
+  supports_ft4: boolean;
+  is_default: boolean;
+}
+
 export interface HealthResponse {
   status: string;
   version: string;
@@ -32,6 +41,7 @@ export interface HealthResponse {
   active_ptt: boolean;
   preflight_status: OverallStatus;
   active_ft8_decoder: string;
+  available_decoders?: DecoderOption[];
 }
 
 export interface StationConfig {
@@ -407,6 +417,8 @@ export interface SnapshotEvent {
   session?: SessionSnapshot;
   active_qsos?: ActiveQso[];
   recent_decodes?: DecodeItem[];
+  active_ft8_decoder?: string;
+  available_decoders?: DecoderOption[];
 }
 
 export type ConnectionState =

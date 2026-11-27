@@ -241,6 +241,40 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
     }
   };
 
+  const handleSelectDecoder = async (decoderBackend: string) => {
+    const chosenOption = daemon.availableDecoders.find(
+      (d) => d.id === decoderBackend
+    );
+    const supportsFt4 =
+      chosenOption?.supports_ft4 ?? decoderBackend === "ftxr";
+    const ack = await daemon.setDecoderBackend(decoderBackend);
+    if (ack.status !== "ok") {
+      setStatusMsg({
+        ok: false,
+        text: `${ack.error_code ?? "ERR"}: ${
+          ack.error_message ?? "Failed to switch decoder"
+        }`,
+      });
+      return;
+    }
+    const active =
+      typeof ack.result?.active_ft8_decoder === "string"
+        ? ack.result.active_ft8_decoder
+        : decoderBackend;
+    if (!activeSession && effectiveMode === "FT4" && !supportsFt4) {
+      setPreferredMode("FT8");
+      setStatusMsg({
+        ok: true,
+        text: `Decoder set to ${active} (mode switched to FT8)`,
+      });
+      return;
+    }
+    setStatusMsg({
+      ok: true,
+      text: `Decoder switched to ${active}`,
+    });
+  };
+
   const handleSetRfPower = async (level0to1: number) => {
     await runRadioCmd("radio.set_level", { name: "RFPOWER", value: level0to1 });
   };
@@ -614,6 +648,8 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                   activeSession={activeSession}
                   otherRadioSession={otherRadioSession}
                   digitalMode={effectiveMode}
+                  activeDecoder={daemon.activeDecoder}
+                  availableDecoders={daemon.availableDecoders}
                   pendingDialFreqHz={pendingDialFreqHz}
                   txState={effectiveTxState}
                   isTuning={isTuning}
@@ -622,6 +658,7 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                   onToggleFlipFeed={toggleFlipFeed}
                   onSelectBand={(b) => void handleSelectBand(b)}
                   onSelectMode={(m) => void handleSelectMode(m)}
+                  onSelectDecoder={(dec) => void handleSelectDecoder(dec)}
                   onSetRfPower={handleSetRfPower}
                   onSetRfGain={handleSetRfGain}
                   onToggleTxEnabled={() =>
@@ -636,7 +673,11 @@ export function ModernFt8Console({ daemon, radio, onNavigateSetup }: Props) {
                   onStartLive={() =>
                     void runRadioCmd(
                       "session.start",
-                      { demo: false, mode: effectiveMode },
+                      {
+                        demo: false,
+                        mode: effectiveMode,
+                        decoder_backend: daemon.activeDecoder,
+                      },
                       `Live ${effectiveMode} session started`
                     )
                   }

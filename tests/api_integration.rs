@@ -328,3 +328,86 @@ async fn http_endpoints_and_command_rest_route_work_end_to_end() {
     assert_eq!(ack.status, CommandStatus::Ok);
     let _unused: PathBuf = PathBuf::from(".");
 }
+
+#[tokio::test]
+async fn health_and_command_bus_decoder_selection() {
+    let (_dir, state) = test_state(None);
+    let app = build_router(Arc::clone(&state));
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let health: Value = serde_json::from_slice(&body).unwrap();
+    let opts = health["available_decoders"]
+        .as_array()
+        .expect("available_decoders must be an array");
+    assert_eq!(opts.len(), 3);
+    assert!(opts
+        .iter()
+        .any(|o| o["id"] == "ft8_lib_fallback" && o["available"] == true));
+
+    // Switch decoder to embedded ft8_lib_fallback (always available)
+    let switch_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: "cmd-dec-1".to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "ui-test".to_string(),
+                radio_id: None,
+                kind: "session.set_decoder".to_string(),
+                issued_at_utc: "2026-11-27T12:00:00Z".to_string(),
+                payload: json!({ "decoder_backend": "ft8_lib_fallback" }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(switch_ack.status, CommandStatus::Ok);
+    assert_eq!(
+        switch_ack.result.as_ref().unwrap()["active_ft8_decoder"],
+        "ft8_lib_fallback"
+    );
+
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body2 = res2.into_body().collect().await.unwrap().to_bytes();
+    let health2: Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(health2["active_ft8_decoder"], "ft8_lib_fallback");
+
+    // Invalid backend is rejected at validation
+    let bad_ack = state
+        .bus
+        .dispatch(
+            CommandEnvelope {
+                command_id: "cmd-dec-bad".to_string(),
+                idempotency_key: None,
+                origin: CommandOrigin::LocalUi,
+                actor: "ui-test".to_string(),
+                radio_id: None,
+                kind: "session.set_decoder".to_string(),
+                issued_at_utc: "2026-11-27T12:00:01Z".to_string(),
+                payload: json!({ "decoder_backend": "not_a_decoder" }),
+            },
+            None,
+        )
+        .await;
+    assert_eq!(bad_ack.status, CommandStatus::Rejected);
+    assert_eq!(bad_ack.error_code, Some(ErrorCode::ValidationFailed));
+}

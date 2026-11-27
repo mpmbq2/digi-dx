@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { RadioSummary, SessionSnapshot } from "../../types";
+import type { DecoderOption, RadioSummary, SessionSnapshot } from "../../types";
 import type { DigitalMode } from "./types";
 import { SUBBAND_PRESETS, fmtDialMhz, normalizeCall } from "./utils";
 
@@ -10,6 +10,8 @@ interface Props {
   activeSession: SessionSnapshot | null;
   otherRadioSession: SessionSnapshot | null;
   digitalMode: DigitalMode;
+  activeDecoder: string;
+  availableDecoders: DecoderOption[];
   pendingDialFreqHz: number | null;
   txState: "idle" | "armed" | "transmitting";
   isTuning: boolean;
@@ -18,6 +20,7 @@ interface Props {
   onToggleFlipFeed: () => void;
   onSelectBand: (band: string) => void;
   onSelectMode: (mode: DigitalMode) => void;
+  onSelectDecoder: (decoderBackend: string) => void;
   onSetRfPower: (level0to1: number) => Promise<void>;
   onSetRfGain: (level0to1: number) => Promise<void>;
   onToggleTxEnabled: () => void;
@@ -72,6 +75,8 @@ export function RadioControlBar({
   activeSession,
   otherRadioSession,
   digitalMode,
+  activeDecoder,
+  availableDecoders,
   pendingDialFreqHz,
   txState,
   isTuning,
@@ -80,6 +85,7 @@ export function RadioControlBar({
   onToggleFlipFeed,
   onSelectBand,
   onSelectMode,
+  onSelectDecoder,
   onSetRfPower,
   onSetRfGain,
   onToggleTxEnabled,
@@ -384,11 +390,87 @@ export function RadioControlBar({
             type="button"
             data-testid="mft8-mode-ft4"
             class={`mft8-mode-btn ${digitalMode === "FT4" ? "active" : ""}`}
+            disabled={
+              Boolean(activeSession && !activeSession.is_demo) &&
+              !(
+                availableDecoders.find((d) => d.id === activeDecoder)
+                  ?.supports_ft4 ?? activeDecoder === "ftxr"
+              )
+            }
+            title={
+              Boolean(activeSession && !activeSession.is_demo) &&
+              !(
+                availableDecoders.find((d) => d.id === activeDecoder)
+                  ?.supports_ft4 ?? activeDecoder === "ftxr"
+              )
+                ? "FT4 requires the ftxr decoder"
+                : undefined
+            }
             onClick={() => onSelectMode("FT4")}
           >
             FT4 7.5s
           </button>
         </div>
+
+        <select
+          class="mft8-dark-select mft8-mono"
+          data-testid="mft8-decoder-select"
+          aria-label="Decoder Backend"
+          title="Select FT8 / FT4 decoder engine"
+          value={activeDecoder}
+          onChange={(e) => {
+            const next = (e.currentTarget as HTMLSelectElement).value;
+            if (next) onSelectDecoder(next);
+          }}
+        >
+          {(availableDecoders.length > 0
+            ? availableDecoders
+            : [
+                {
+                  id: "ftxr",
+                  label: "ftxr-modem (FT8 / FT4)",
+                  available: true,
+                  supports_ft8: true,
+                  supports_ft4: true,
+                  is_default: true,
+                },
+                {
+                  id: "jt9",
+                  label: "WSJT-X jt9 (FT8)",
+                  available: false,
+                  supports_ft8: true,
+                  supports_ft4: false,
+                  is_default: false,
+                },
+                {
+                  id: "ft8_lib_fallback",
+                  label: "Embedded ft8_lib (FT8)",
+                  available: true,
+                  supports_ft8: true,
+                  supports_ft4: false,
+                  is_default: false,
+                },
+              ]
+          ).map((opt) => {
+            const ft4Live = Boolean(
+              activeSession && !activeSession.is_demo && digitalMode === "FT4"
+            );
+            const ft4Conflict = ft4Live && !opt.supports_ft4;
+            const disabled = !opt.available || ft4Conflict;
+            const suffix = !opt.available
+              ? " (not installed)"
+              : ft4Conflict
+              ? " (FT8 only)"
+              : "";
+            return (
+              <option key={opt.id} value={opt.id} disabled={disabled}>
+                DEC: {opt.id === "ftxr" ? "ftxr" : opt.id === "jt9" ? "jt9" : "ft8_lib"}
+                {opt.supports_ft4 ? " · FT8/4" : " · FT8"}
+                {suffix}
+              </option>
+            );
+          })}
+        </select>
 
         <span
           class={`mft8-rig-pill dial ${pendingDialFreqHz !== null ? "syncing" : ""}`}

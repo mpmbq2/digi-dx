@@ -12,7 +12,8 @@ use digi_dx::domain::clock::UnixSecs;
 use digi_dx::modem::ft8_lib::{Ft8LibEmbeddedDecoder, Ft8LibTxModulator};
 use digi_dx::modem::jt9::{parse_jt9_stdout, Jt9SubprocessDecoder};
 use digi_dx::modem::{
-    DecodePassOptions, Ft8Decode, Ft8Decoder, HybridFt8Decoder, ModemMode, QsoDecodeContext,
+    DecodePassOptions, DecoderBackendChoice, Ft8Decode, Ft8Decoder, HybridFt8Decoder, ModemMode,
+    QsoDecodeContext,
 };
 use digi_dx::preflight::{run_preflight, CheckStatus};
 use digi_dx::qso::reconciler::{ReconcileOutcome, SlotDecodeReconciler};
@@ -767,4 +768,68 @@ fn preflight_selects_ftxr_by_default_without_jt9_warning() {
         !report.checks.iter().any(|c| c.id == "ft8_decoder_jt9"),
         "should not emit jt9 warning when ftxr-modem is active"
     );
+}
+
+#[tokio::test]
+async fn hybrid_decoder_switches_between_available_backends_for_decode_and_tx() {
+    let Some(ftxr_bin) = locate_test_ftxr_bin() else {
+        return;
+    };
+
+    let hybrid = HybridFt8Decoder::with_backends(Some(&ftxr_bin), None, None);
+    let options = hybrid.available_decoders();
+    assert!(options
+        .iter()
+        .any(|o| o.id == "ftxr" && o.available && o.is_default));
+    assert!(options
+        .iter()
+        .any(|o| o.id == "ft8_lib_fallback" && o.available && !o.supports_ft4));
+    assert_eq!(hybrid.active_backend_name(), "ftxr");
+
+    // Modulate a test FT8 frame and verify decoding follows selected backend.
+    let pcm_48k = hybrid
+        .modulate_tx_from_offset(ModemMode::Ft8, "CQ N1MPM FN33", 1500.0, DSP_SAMPLE_RATE, 0)
+        .await
+        .unwrap();
+    let mut slot_48k = vec![0.0_f32; 15 * (DSP_SAMPLE_RATE as usize)];
+    let copy_len = pcm_48k.len().min(slot_48k.len());
+    slot_48k[..copy_len].copy_from_slice(&pcm_48k[..copy_len]);
+    let slot_12k = resample_48k_to_12k(&slot_48k).unwrap();
+    let slot_ts = UnixSecs(1_795_212_975);
+
+    // 1. Switch to embedded ft8_lib_fallback: decode must come from ft8_lib_fallback and FT4 must be rejected.
+    assert_eq!(
+        hybrid.set_backend(DecoderBackendChoice::Ft8Lib).unwrap(),
+        "ft8_lib_fallback"
+    );
+    let fallback_decodes = hybrid.decode_slot(slot_ts, &slot_12k).await.unwrap();
+    let fb_hit = fallback_decodes
+        .iter()
+        .find(|d| d.message == "CQ N1MPM FN33")
+        .expect("ft8_lib_fallback should decode generated FT8 test message");
+    assert_eq!(fb_hit.decoder_backend, "ft8_lib_fallback");
+    assert!(!hybrid.supports_mode(ModemMode::Ft4));
+    assert!(hybrid
+        .modulate_tx_from_offset(ModemMode::Ft4, "CQ N1MPM FN33", 1500.0, DSP_SAMPLE_RATE, 0)
+        .await
+        .is_err());
+
+    // 2. Switch back to ftxr: decode must come from ftxr and FT4 TX modulation succeeds again.
+    assert_eq!(
+        hybrid.set_backend(DecoderBackendChoice::Ftxr).unwrap(),
+        "ftxr"
+    );
+    assert!(hybrid.supports_mode(ModemMode::Ft4));
+    let ftxr_decodes = hybrid.decode_slot(slot_ts, &slot_12k).await.unwrap();
+    let ftxr_hit = ftxr_decodes
+        .iter()
+        .find(|d| d.message == "CQ N1MPM FN33")
+        .expect("ftxr should decode generated FT8 test message after switching back");
+    assert_eq!(ftxr_hit.decoder_backend, "ftxr");
+    assert!(hybrid
+        .modulate_tx_from_offset(ModemMode::Ft4, "CQ N1MPM FN33", 1500.0, DSP_SAMPLE_RATE, 0)
+        .await
+        .is_ok());
+
+    hybrid.shutdown().await;
 }

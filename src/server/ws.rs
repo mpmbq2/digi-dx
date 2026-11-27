@@ -165,6 +165,8 @@ fn build_snapshot(state: &AppState) -> String {
         "session": session,
         "active_qsos": session.active_qsos,
         "recent_decodes": session.recent_decodes,
+        "active_ft8_decoder": state.sessions.active_decoder_backend(),
+        "available_decoders": state.sessions.available_decoders(),
     })
     .to_string()
 }

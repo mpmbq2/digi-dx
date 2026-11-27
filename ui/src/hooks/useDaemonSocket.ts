@@ -9,6 +9,7 @@ import type {
   ConnectionState,
   CqState,
   DecodeItem,
+  DecoderOption,
   EventLogItem,
   HamlibModel,
   HealthResponse,
@@ -66,6 +67,8 @@ export interface DaemonState {
   radios: RadioSummary[];
   heldLeases: Record<string, string>;
   session: SessionSnapshot | null;
+  activeDecoder: string;
+  availableDecoders: DecoderOption[];
   recentDecodes: DecodeItem[];
   txState: TxStateEvent | null;
   waterfallFrames: WaterfallEvent[];
@@ -96,6 +99,7 @@ export interface DaemonState {
     token?: string,
     radioId?: string
   ) => Promise<CommandAck>;
+  setDecoderBackend: (decoderBackend: string) => Promise<CommandAck>;
   claimLease: (radioId: string, force?: boolean) => Promise<CommandAck>;
   releaseLease: (radioId: string) => Promise<CommandAck>;
 }
@@ -127,6 +131,8 @@ export function useDaemonSocket(): DaemonState {
   const [radios, setRadios] = useState<RadioSummary[]>([]);
   const [heldLeases, setHeldLeases] = useState<Record<string, string>>({});
   const [session, setSession] = useState<SessionSnapshot | null>(null);
+  const [activeDecoder, setActiveDecoder] = useState<string>("ftxr");
+  const [availableDecoders, setAvailableDecoders] = useState<DecoderOption[]>([]);
   const [recentDecodes, setRecentDecodes] = useState<DecodeItem[]>([]);
   const [txState, setTxState] = useState<TxStateEvent | null>(null);
   const [waterfallFrames, setWaterfallFrames] = useState<WaterfallEvent[]>([]);
@@ -273,7 +279,16 @@ export function useDaemonSocket(): DaemonState {
         fetch("/api/v1/outbox/stats"),
         fetch("/api/v1/radios"),
       ]);
-      if (hRes.ok) setHealth((await hRes.json()) as HealthResponse);
+      if (hRes.ok) {
+        const h = (await hRes.json()) as HealthResponse;
+        setHealth(h);
+        if (typeof h.active_ft8_decoder === "string") {
+          setActiveDecoder(h.active_ft8_decoder);
+        }
+        if (Array.isArray(h.available_decoders)) {
+          setAvailableDecoders(h.available_decoders);
+        }
+      }
       if (oRes.ok) setOutboxStats((await oRes.json()) as OutboxStats);
       if (rRes.ok) {
         const data = (await rRes.json()) as { radios: RadioSummary[] };
@@ -300,8 +315,20 @@ export function useDaemonSocket(): DaemonState {
           fetch("/api/v1/devices/usb"),
           fetch("/api/v1/radios"),
         ]);
-        if (hRes.ok) setHealth((await hRes.json()) as HealthResponse);
-        if (pRes.ok) setPreflight((await pRes.json()) as PreflightReport);
+        if (hRes.ok) {
+          const h = (await hRes.json()) as HealthResponse;
+          setHealth(h);
+          if (typeof h.active_ft8_decoder === "string") {
+            setActiveDecoder(h.active_ft8_decoder);
+          }
+          if (Array.isArray(h.available_decoders)) {
+            setAvailableDecoders(h.available_decoders);
+          }
+        }
+        if (pRes.ok) {
+          const p = (await pRes.json()) as PreflightReport;
+          setPreflight(p);
+        }
         if (sRes.ok) {
           const st = (await sRes.json()) as StationConfig;
           stationRef.current = st;
@@ -394,6 +421,14 @@ export function useDaemonSocket(): DaemonState {
             slotClockRef.current = snap.slot_clock;
             setSlotClock(snap.slot_clock);
             setPreflight(snap.preflight);
+            if (typeof snap.active_ft8_decoder === "string") {
+              setActiveDecoder(snap.active_ft8_decoder);
+            } else if (snap.preflight?.active_ft8_decoder) {
+              setActiveDecoder(snap.preflight.active_ft8_decoder);
+            }
+            if (Array.isArray(snap.available_decoders)) {
+              setAvailableDecoders(snap.available_decoders);
+            }
             if (snap.station) {
               stationRef.current = snap.station;
               setStation(snap.station);
@@ -421,6 +456,9 @@ export function useDaemonSocket(): DaemonState {
             const nextClock = parsed.slot_clock as SlotClockSpec;
             const active = Boolean(parsed.active);
             const isDemo = Boolean(parsed.is_demo);
+            if (typeof parsed.decoder_backend === "string" && !isDemo) {
+              setActiveDecoder(parsed.decoder_backend);
+            }
             const rawMode =
               typeof parsed.digital_mode === "string"
                 ? parsed.digital_mode.toUpperCase()
@@ -781,6 +819,21 @@ export function useDaemonSocket(): DaemonState {
             });
             pushEvent("preflight_alert", `${title}: ${detail}`);
             void refreshAll(false);
+          } else if (evType === "decoder_config_updated") {
+            if (typeof parsed.active_decoder === "string") {
+              setActiveDecoder(parsed.active_decoder);
+            }
+            if (Array.isArray(parsed.available_decoders)) {
+              setAvailableDecoders(
+                parsed.available_decoders as DecoderOption[]
+              );
+            }
+            pushEvent(
+              "decoder_config",
+              `Decoder backend switched to ${String(
+                parsed.active_decoder ?? "unknown"
+              )}`
+            );
           } else if (evType === "command_ack") {
             const cmdId = String(parsed.command_id ?? "");
             const hbRadioId = pendingHbRef.current[cmdId];
@@ -974,6 +1027,25 @@ export function useDaemonSocket(): DaemonState {
     [clearLeaseTimer, sendCommand]
   );
 
+  const setDecoderBackend = useCallback(
+    async (decoderBackend: string): Promise<CommandAck> => {
+      const ack = await sendCommand("session.set_decoder", {
+        decoder_backend: decoderBackend,
+      });
+      if (ack.status === "ok" && ack.result) {
+        const next = ack.result.active_ft8_decoder;
+        if (typeof next === "string") setActiveDecoder(next);
+        if (Array.isArray(ack.result.available_decoders)) {
+          setAvailableDecoders(
+            ack.result.available_decoders as DecoderOption[]
+          );
+        }
+      }
+      return ack;
+    },
+    [sendCommand]
+  );
+
   return {
     actor: actorRef.current,
     authToken,
@@ -993,6 +1065,8 @@ export function useDaemonSocket(): DaemonState {
     radios,
     heldLeases,
     session,
+    activeDecoder,
+    availableDecoders,
     recentDecodes,
     txState,
     waterfallFrames,
@@ -1014,6 +1088,7 @@ export function useDaemonSocket(): DaemonState {
     refreshQrzStatus,
     refreshRoster,
     sendCommand,
+    setDecoderBackend,
     claimLease,
     releaseLease,
   };
