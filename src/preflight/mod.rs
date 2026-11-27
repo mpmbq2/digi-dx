@@ -64,6 +64,10 @@ impl PreflightReport {
     }
 }
 
+pub const RIGCTL_FALLBACK_PATHS: &[&str] = &["/opt/homebrew/bin/rigctl", "/usr/local/bin/rigctl"];
+pub const RIGCTLD_FALLBACK_PATHS: &[&str] =
+    &["/opt/homebrew/bin/rigctld", "/usr/local/bin/rigctld"];
+
 pub fn run_preflight(cfg: &DaemonConfig, probe_audio: bool) -> PreflightReport {
     let mut checks = Vec::new();
 
@@ -71,6 +75,7 @@ pub fn run_preflight(cfg: &DaemonConfig, probe_audio: bool) -> PreflightReport {
         "hamlib_rigctl",
         "rigctl",
         cfg.rigctl_path.as_deref(),
+        RIGCTL_FALLBACK_PATHS,
         &["--version"],
         "Install libhamlib-utils (apt) / hamlib (dnf/pacman/brew).",
     );
@@ -78,6 +83,7 @@ pub fn run_preflight(cfg: &DaemonConfig, probe_audio: bool) -> PreflightReport {
         "hamlib_rigctld",
         "rigctld",
         cfg.rigctld_path.as_deref(),
+        RIGCTLD_FALLBACK_PATHS,
         &["--version"],
         "Install libhamlib-utils (apt) / hamlib (dnf/pacman/brew).",
     );
@@ -149,10 +155,11 @@ fn check_binary_version(
     id: &str,
     bin_name: &str,
     override_path: Option<&Path>,
+    extra_candidates: &[&str],
     args: &[&str],
     remediation: &str,
 ) -> BinaryProbe {
-    let resolved = resolve_executable(bin_name, override_path, &[]);
+    let resolved = resolve_executable(bin_name, override_path, extra_candidates);
     let Some(path) = resolved else {
         return BinaryProbe {
             check: PreflightCheck {

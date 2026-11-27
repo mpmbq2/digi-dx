@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::command_bus::{ErrorCode, WsBroadcastEvent};
 use crate::config::DaemonConfig;
+use crate::preflight::{resolve_executable, RIGCTLD_FALLBACK_PATHS, RIGCTL_FALLBACK_PATHS};
 use crate::store::{now_utc_str, RadioProfile, StateStore, StoreError, UsbDeviceRecord};
 use crate::supervisor::discovery::{
     match_profile_to_device, spawn_hotplug_watchers, DeviceScanner, MatchOutcome, OsDeviceScanner,
@@ -45,11 +46,19 @@ impl SupervisorConfig {
             .rigctld_path
             .as_ref()
             .map(|p| p.display().to_string())
+            .or_else(|| {
+                resolve_executable("rigctld", None, RIGCTLD_FALLBACK_PATHS)
+                    .map(|p| p.display().to_string())
+            })
             .unwrap_or_else(|| "rigctld".to_string());
         let rigctl_bin = cfg
             .rigctl_path
             .as_ref()
             .map(|p| p.display().to_string())
+            .or_else(|| {
+                resolve_executable("rigctl", None, RIGCTL_FALLBACK_PATHS)
+                    .map(|p| p.display().to_string())
+            })
             .unwrap_or_else(|| "rigctl".to_string());
 
         let default_scanner = OsDeviceScanner::default();
