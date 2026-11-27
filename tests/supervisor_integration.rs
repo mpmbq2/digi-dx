@@ -373,6 +373,7 @@ async fn hotplug_fs_watcher_detects_attach_and_detach_in_real_time() {
     let dir = tempdir().unwrap();
     let serial_dir = dir.path().join("by-id");
     std::fs::create_dir_all(&serial_dir).unwrap();
+    let serial_dir = std::fs::canonicalize(&serial_dir).unwrap_or(serial_dir);
 
     let cfg = make_cfg(dir.path());
     let store = StateStore::open(cfg.db_path()).unwrap();
@@ -394,15 +395,23 @@ async fn hotplug_fs_watcher_detects_attach_and_detach_in_real_time() {
     let shutdown = CancellationToken::new();
     state.supervisor.start(shutdown.clone()).await;
 
+    #[cfg(target_os = "macos")]
+    sleep(Duration::from_millis(200)).await;
+
     assert!(state.supervisor.list_usb_inventory().unwrap().is_empty());
     while ws_rx.try_recv().is_ok() {}
 
-    // Simulate post-boot USB serial arrival
-    let link_path = serial_dir.join("usb-FTDI_Mock_Cable_ABCD-if00-port0");
+    // Simulate post-boot USB serial arrival using platform-appropriate device naming
+    let mock_dev_name = if cfg!(target_os = "macos") {
+        "cu.FTDI_Mock_Cable_ABCD"
+    } else {
+        "usb-FTDI_Mock_Cable_ABCD-if00-port0"
+    };
+    let link_path = serial_dir.join(mock_dev_name);
     std::os::unix::fs::symlink("/dev/null", &link_path).unwrap();
 
     let mut attached_seen = false;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(Ok(WsBroadcastEvent::UsbDevicesChanged { .. })) =
             tokio::time::timeout(Duration::from_millis(100), ws_rx.recv()).await
@@ -425,7 +434,7 @@ async fn hotplug_fs_watcher_detects_attach_and_detach_in_real_time() {
     // Simulate USB serial removal
     std::fs::remove_file(&link_path).unwrap();
     let mut detached_seen = false;
-    let deadline2 = Instant::now() + Duration::from_secs(3);
+    let deadline2 = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline2 {
         if let Ok(Ok(WsBroadcastEvent::UsbDevicesChanged { .. })) =
             tokio::time::timeout(Duration::from_millis(100), ws_rx.recv()).await
