@@ -15,9 +15,9 @@ use crate::telemetry::TelemetryEnvelope;
 
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 500;
 pub const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 2_000;
-/// 13,400 ms provides 100 ms CAT/serial teardown margin under the 13.5 s hard ceiling
-/// while preserving > 750 ms headroom past FT8's 12.64 s active transmission.
-pub const DEFAULT_MAX_TX_DURATION_MS: u64 = 13_400;
+/// 13,300 ms provides 200 ms CAT/serial teardown margin under the 13.5 s hard ceiling
+/// while preserving > 650 ms headroom past FT8's 12.64 s active transmission.
+pub const DEFAULT_MAX_TX_DURATION_MS: u64 = 13_300;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PttWatchdogConfig {
