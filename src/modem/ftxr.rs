@@ -39,9 +39,13 @@ const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 const WORKER_TIMEOUT_MARGIN: Duration = Duration::from_millis(600);
 
 pub const FTXR_FALLBACK_PATHS: &[&str] = &[
+    "/opt/homebrew/opt/digi-dx/libexec/ftxr-modem",
+    "/usr/local/opt/digi-dx/libexec/ftxr-modem",
+    "/opt/homebrew/lib/digi-dx/ftxr-modem",
+    "/usr/local/lib/digi-dx/ftxr-modem",
+    "/usr/lib/digi-dx/ftxr-modem",
     "/opt/homebrew/bin/ftxr-modem",
     "/usr/local/bin/ftxr-modem",
-    "/usr/local/lib/digi-dx/ftxr-modem",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,21 +63,34 @@ struct VersionProbeJson {
     ipc_protocol_version: u16,
 }
 
+fn find_ftxr_relative_to_exe(exe_path: &Path) -> Option<PathBuf> {
+    let dir = exe_path.parent()?;
+    let mut candidates = vec![dir.join("ftxr-modem"), dir.join("libexec/ftxr-modem")];
+    if let Some(prefix_dir) = dir.parent() {
+        candidates.push(prefix_dir.join("libexec/ftxr-modem"));
+        candidates.push(prefix_dir.join("lib/digi-dx/ftxr-modem"));
+    }
+    for candidate in candidates {
+        if let Some(found) = resolve_executable("ftxr-modem", Some(&candidate), &[]) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Locate the `ftxr-modem` executable using:
 /// 1. Explicit override path (`DIGI_DX_FTXR_PATH`) if provided
-/// 2. Sibling `ftxr-modem` binary next to the running `digi-dx` executable
-/// 3. `PATH` and standard install directories
+/// 2. Co-bundled sidecar binary relative to the running `digi-dx` executable
+///    (`ftxr-modem`, `libexec/ftxr-modem`, `../libexec/ftxr-modem`, `../lib/digi-dx/ftxr-modem`)
+/// 3. Standard Homebrew/system directories and `PATH`
 pub fn find_ftxr_candidate(override_path: Option<&Path>) -> Option<PathBuf> {
     if override_path.is_some() {
         return resolve_executable("ftxr-modem", override_path, &[]);
     }
 
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join("ftxr-modem");
-            if let Some(found) = resolve_executable("ftxr-modem", Some(&sibling), &[]) {
-                return Some(found);
-            }
+        if let Some(found) = find_ftxr_relative_to_exe(&exe) {
+            return Some(found);
         }
     }
 
@@ -1292,5 +1309,43 @@ mod tests {
         assert!((i16_back[0] - 0.0).abs() < 1e-6);
         assert!((i16_back[1] - 0.5).abs() < 1e-4);
         assert!((i16_back[2] + 0.5).abs() < 1e-4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_co_bundled_sidecar_layouts_relative_to_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let make_exec = |path: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        };
+
+        // 1. Extracted tarball layout: <dir>/digi-dx + <dir>/libexec/ftxr-modem
+        let root_tar = tempfile::tempdir().unwrap();
+        let exe_tar = root_tar.path().join("digi-dx");
+        let libexec_tar = root_tar.path().join("libexec/ftxr-modem");
+        make_exec(&exe_tar);
+        make_exec(&libexec_tar);
+        assert_eq!(find_ftxr_relative_to_exe(&exe_tar), Some(libexec_tar));
+
+        // 2. Homebrew layout: <prefix>/bin/digi-dx + <prefix>/libexec/ftxr-modem
+        let root_brew = tempfile::tempdir().unwrap();
+        let exe_brew = root_brew.path().join("bin/digi-dx");
+        let libexec_brew = root_brew.path().join("libexec/ftxr-modem");
+        make_exec(&exe_brew);
+        make_exec(&libexec_brew);
+        assert_eq!(find_ftxr_relative_to_exe(&exe_brew), Some(libexec_brew));
+
+        // 3. System installer layout: <prefix>/bin/digi-dx + <prefix>/lib/digi-dx/ftxr-modem
+        let root_sys = tempfile::tempdir().unwrap();
+        let exe_sys = root_sys.path().join("bin/digi-dx");
+        let lib_sys = root_sys.path().join("lib/digi-dx/ftxr-modem");
+        make_exec(&exe_sys);
+        make_exec(&lib_sys);
+        assert_eq!(find_ftxr_relative_to_exe(&exe_sys), Some(lib_sys));
     }
 }

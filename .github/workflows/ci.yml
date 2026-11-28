@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - mvp-rebuild
+      - "feat/*"
   pull_request:
     branches:
       - main
@@ -16,6 +17,12 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  FTXR_REPO: mpmbq2/ftxr-modem
+  FTXR_VERSION: v0.1.0
+  FTXR_SHA256_LINUX_X86_64: d811a697c82543d4e76999bc7315e051807b132f7c7e2f441b979879ce96d562
+  FTXR_SHA256_DARWIN_AARCH64: c11993daab5024260140992d917417975b5199db4ffcb5ee84f097c1810c9c4e
 
 jobs:
   test-and-lint:
@@ -54,8 +61,21 @@ jobs:
       - name: Run Rust and script linters
         run: make lint
 
-      - name: Verify installer dry-run
-        run: ./scripts/install.sh --dry-run --from-source --no-ftxr
+      - name: Verify installer dry-runs
+        run: |
+          ./scripts/install.sh --dry-run
+          ./scripts/install.sh --dry-run --from-source --no-ftxr
+
+      - name: Stage verified FT8/FT4 decoder sidecar for tests
+        run: |
+          mkdir -p ftxr-stage target/debug/libexec
+          TARBALL="ftxr-modem-${FTXR_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSL "https://github.com/${FTXR_REPO}/releases/download/${FTXR_VERSION}/${TARBALL}" -o "ftxr-stage/${TARBALL}"
+          echo "${FTXR_SHA256_LINUX_X86_64}  ftxr-stage/${TARBALL}" | sha256sum -c -
+          tar -xzf "ftxr-stage/${TARBALL}" -C ftxr-stage
+          chmod 0755 ftxr-stage/ftxr-modem
+          cp ftxr-stage/ftxr-modem target/debug/libexec/ftxr-modem
+          echo "DIGI_DX_FTXR_PATH=$PWD/target/debug/libexec/ftxr-modem" >> "$GITHUB_ENV"
 
       - name: Run Rust unit and integration tests
         run: cargo test
@@ -107,8 +127,22 @@ jobs:
       - name: Run Rust clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Verify installer dry-run on macOS
-        run: ./scripts/install.sh --dry-run --no-ftxr
+      - name: Verify installer dry-runs on macOS
+        run: |
+          ./scripts/install.sh --dry-run
+          ./scripts/install.sh --dry-run --no-ftxr
+
+      - name: Stage verified FT8/FT4 decoder sidecar for tests
+        run: |
+          mkdir -p ftxr-stage target/debug/libexec target/release/libexec
+          TARBALL="ftxr-modem-${FTXR_VERSION}-darwin-aarch64.tar.gz"
+          curl -fsSL "https://github.com/${FTXR_REPO}/releases/download/${FTXR_VERSION}/${TARBALL}" -o "ftxr-stage/${TARBALL}"
+          echo "${FTXR_SHA256_DARWIN_AARCH64}  ftxr-stage/${TARBALL}" | shasum -a 256 -c -
+          tar -xzf "ftxr-stage/${TARBALL}" -C ftxr-stage
+          chmod 0755 ftxr-stage/ftxr-modem
+          cp ftxr-stage/ftxr-modem target/debug/libexec/ftxr-modem
+          cp ftxr-stage/ftxr-modem target/release/libexec/ftxr-modem
+          echo "DIGI_DX_FTXR_PATH=$PWD/target/release/libexec/ftxr-modem" >> "$GITHUB_ENV"
 
       - name: Run Rust unit and integration tests
         run: cargo test

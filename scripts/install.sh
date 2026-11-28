@@ -8,7 +8,8 @@ REPO="${DIGI_DX_REPO:-mpmbq2/digi-dx}"
 FTXR_REPO="${DIGI_DX_FTXR_REPO:-mpmbq2/ftxr-modem}"
 FTXR_VERSION="${DIGI_DX_FTXR_VERSION:-v0.1.0}"
 BINARY_PATH="/usr/local/bin/digi-dx"
-FTXR_BINARY_PATH="/usr/local/bin/ftxr-modem"
+FTXR_BINARY_PATH="/usr/local/lib/digi-dx/ftxr-modem"
+FTXR_LICENSE_DIR="/usr/local/share/licenses/digi-dx/ftxr-modem"
 UDEV_RULES_PATH="/etc/udev/rules.d/99-digi-dx.rules"
 SYSTEMD_UNIT_PATH="/etc/systemd/system/digi-dx.service"
 ENV_DIR="/etc/digi-dx"
@@ -58,10 +59,10 @@ Usage:
 Options:
   -y, --yes                 Non-interactive mode; accept package manager prompts
       --version <tag>       Pin a specific digi-dx release tag (default: latest)
-      --ftxr-version <tag>  Pin a specific ftxr-modem release tag (default: v0.1.0)
+      --ftxr-version <tag>  Pin a specific bundled decoder release tag (default: v0.1.0)
       --from-source         Build UI (npm) and Rust binary locally via cargo
-      --no-ftxr             Skip installing ftxr-modem (use legacy jt9 or built-in ft8_lib fallback)
-      --no-jt9              Deprecated alias (wsjtx/jt9 is no longer installed by default)
+      --no-ftxr             Skip bundled FT8/FT4 decoder (use optional jt9 or embedded ft8_lib)
+      --no-jt9              Deprecated alias (wsjtx/jt9 is optional and not installed by default)
       --no-service          Install binary/deps/udev without systemd or launchd service
       --user <name>         Service user on Linux (default: digi-dx, or current user with --no-service)
       --dry-run             Print planned actions without modifying the system
@@ -188,13 +189,31 @@ install_binary_file() {
   local dest_dir
   dest_dir="$(dirname "$dest")"
   if [[ $DRY_RUN -eq 1 ]]; then
-    log_info "[dry-run] install -m 0755 $src $dest"
+    log_info "[dry-run] install -d -m 0755 $dest_dir && install -m 0755 $src $dest"
     return 0
   fi
-  if [[ -w "$dest_dir" ]]; then
+  if [[ -d "$dest_dir" && -w "$dest_dir" ]] || { mkdir -p "$dest_dir" 2>/dev/null && [[ -w "$dest_dir" ]]; }; then
     install -m 0755 "$src" "$dest"
   else
+    run_sudo install -d -m 0755 "$dest_dir"
     run_sudo install -m 0755 "$src" "$dest"
+  fi
+}
+
+install_data_file() {
+  local src="$1"
+  local dest="$2"
+  local dest_dir
+  dest_dir="$(dirname "$dest")"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log_info "[dry-run] install -d -m 0755 $dest_dir && install -m 0644 $src $dest"
+    return 0
+  fi
+  if [[ -d "$dest_dir" && -w "$dest_dir" ]] || { mkdir -p "$dest_dir" 2>/dev/null && [[ -w "$dest_dir" ]]; }; then
+    install -m 0644 "$src" "$dest"
+  else
+    run_sudo install -d -m 0755 "$dest_dir"
+    run_sudo install -m 0644 "$src" "$dest"
   fi
 }
 
@@ -266,7 +285,8 @@ detect_platform() {
     PKG_MGR="brew"
     if [[ -d /opt/homebrew/bin && -w /opt/homebrew/bin ]]; then
       BINARY_PATH="/opt/homebrew/bin/digi-dx"
-      FTXR_BINARY_PATH="/opt/homebrew/bin/ftxr-modem"
+      FTXR_BINARY_PATH="/opt/homebrew/lib/digi-dx/ftxr-modem"
+      FTXR_LICENSE_DIR="/opt/homebrew/share/doc/digi-dx/licenses/ftxr-modem"
     fi
   fi
 
@@ -318,8 +338,6 @@ install_dependencies() {
   esac
 
   verify_hamlib
-  provision_ftxr_modem
-  verify_ftxr_if_present
 }
 
 verify_hamlib() {
@@ -349,32 +367,21 @@ verify_hamlib() {
   fi
 }
 
-find_ftxr_path() {
-  if [[ -n "${DIGI_DX_FTXR_PATH:-}" && -x "${DIGI_DX_FTXR_PATH}" ]]; then
-    printf '%s\n' "${DIGI_DX_FTXR_PATH}"
+install_bundled_ftxr_licenses() {
+  local lic_src_dir="$1"
+  if [[ ! -d "$lic_src_dir" ]]; then
     return 0
   fi
-  if [[ -x "$FTXR_BINARY_PATH" ]]; then
-    printf '%s\n' "$FTXR_BINARY_PATH"
-    return 0
-  fi
-  if command -v ftxr-modem >/dev/null 2>&1; then
-    command -v ftxr-modem
-    return 0
-  fi
-  local candidate
-  for candidate in /opt/homebrew/bin/ftxr-modem /usr/local/bin/ftxr-modem /usr/local/lib/digi-dx/ftxr-modem; do
-    if [[ -x "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
+  local f
+  for f in LICENSE NOTICE; do
+    if [[ -f "$lic_src_dir/$f" ]]; then
+      install_data_file "$lic_src_dir/$f" "$FTXR_LICENSE_DIR/$f"
     fi
   done
-  return 1
 }
 
-provision_ftxr_modem() {
+provision_ftxr_fallback() {
   if [[ $NO_FTXR -eq 1 ]]; then
-    log_info "Skipping ftxr-modem installation (--no-ftxr); Digi-Dx will use jt9 or built-in ft8_lib fallback."
     return 0
   fi
 
@@ -385,8 +392,7 @@ provision_ftxr_modem() {
   local sums_url="${base_url}/SHA256SUMS"
 
   if [[ $DRY_RUN -eq 1 ]]; then
-    log_info "[dry-run] Would download $tarball_url and $sums_url"
-    log_info "[dry-run] Would verify SHA-256 checksum and install ftxr-modem to $FTXR_BINARY_PATH (0755)"
+    log_info "[dry-run] Would ensure bundled FT8/FT4 decoder is installed to $FTXR_BINARY_PATH (0755)"
     return 0
   fi
 
@@ -395,28 +401,28 @@ provision_ftxr_modem() {
 
   if ! curl -fsSL "$tarball_url" -o "$tmp_dir/$tarball" || ! curl -fsSL "$sums_url" -o "$tmp_dir/SHA256SUMS"; then
     rm -rf "$tmp_dir"
-    log_warn "Failed to download ftxr-modem from ${tarball_url}; Digi-Dx will fall back to jt9 or built-in ft8_lib"
+    log_warn "Could not stage bundled FT8/FT4 decoder; Digi-Dx will use legacy jt9 or built-in ft8_lib fallback"
     return 0
   fi
 
   local checksum_ok=0
   if command -v sha256sum >/dev/null 2>&1; then
-    if (cd "$tmp_dir" && grep "  ${tarball}\$" SHA256SUMS | sha256sum -c -); then
+    if (cd "$tmp_dir" && grep "  ${tarball}\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
       checksum_ok=1
     fi
   elif command -v shasum >/dev/null 2>&1; then
-    if (cd "$tmp_dir" && grep "  ${tarball}\$" SHA256SUMS | shasum -a 256 -c -); then
+    if (cd "$tmp_dir" && grep "  ${tarball}\$" SHA256SUMS | shasum -a 256 -c - >/dev/null 2>&1); then
       checksum_ok=1
     fi
   else
     rm -rf "$tmp_dir"
-    log_warn "Neither sha256sum nor shasum found; skipping ftxr-modem download"
+    log_warn "Neither sha256sum nor shasum found; skipping bundled FT8/FT4 decoder checksum verification"
     return 0
   fi
 
   if [[ $checksum_ok -ne 1 ]]; then
     rm -rf "$tmp_dir"
-    log_warn "SHA-256 verification failed for ${tarball}; skipping ftxr-modem installation"
+    log_warn "Checksum verification failed for bundled FT8/FT4 decoder archive; using built-in fallback"
     return 0
   fi
 
@@ -425,37 +431,17 @@ provision_ftxr_modem() {
   extracted_bin="$(find "$tmp_dir" -type f -name ftxr-modem | head -n 1 || true)"
   if [[ -z "$extracted_bin" || ! -f "$extracted_bin" ]]; then
     rm -rf "$tmp_dir"
-    log_warn "Archive ${tarball} did not contain ftxr-modem executable"
+    log_warn "Bundled FT8/FT4 decoder executable missing from archive; using built-in fallback"
     return 0
   fi
 
   install_binary_file "$extracted_bin" "$FTXR_BINARY_PATH"
+  install_bundled_ftxr_licenses "$(dirname "$extracted_bin")"
   rm -rf "$tmp_dir"
 }
 
-verify_ftxr_if_present() {
-  if [[ $NO_FTXR -eq 1 ]]; then
-    return 0
-  fi
-  if [[ $DRY_RUN -eq 1 ]]; then
-    log_info "[dry-run] Would verify ftxr-modem --version --json"
-    return 0
-  fi
-  local ftxr_bin=""
-  if ftxr_bin="$(find_ftxr_path)"; then
-    local ftxr_ver=""
-    if ftxr_ver="$("$ftxr_bin" --version 2>&1 | head -n 1)"; then
-      log_info "Verified: $ftxr_ver at $ftxr_bin"
-    else
-      log_warn "ftxr-modem at $ftxr_bin failed execution probe; Digi-Dx will use fallback decoder"
-    fi
-  else
-    log_warn "ftxr-modem binary not found; Digi-Dx will use jt9 or built-in ft8_lib fallback decoder"
-  fi
-}
-
 provision_binary() {
-  log_info "Step 3/7: Provisioning digi-dx binary..."
+  log_info "Step 3/7: Provisioning Digi-Dx..."
   local repo_root
   repo_root="$(resolve_repo_root)"
 
@@ -465,6 +451,9 @@ provision_binary() {
       log_info "[dry-run] Would build frontend SPA in $repo_root/ui via npm ci/install && npm run build"
       log_info "[dry-run] Would compile release binary via cargo build --release in $repo_root"
       install_binary_file "$repo_root/target/release/digi-dx" "$BINARY_PATH"
+      if [[ $NO_FTXR -eq 0 ]]; then
+        log_info "[dry-run] Would install bundled FT8/FT4 decoder to $FTXR_BINARY_PATH (0755)"
+      fi
       return 0
     fi
 
@@ -491,6 +480,21 @@ provision_binary() {
       cargo build --release
     )
     install_binary_file "$repo_root/target/release/digi-dx" "$BINARY_PATH"
+
+    if [[ $NO_FTXR -eq 0 ]]; then
+      local local_ftxr=""
+      if [[ -x "$repo_root/target/release/libexec/ftxr-modem" ]]; then
+        local_ftxr="$repo_root/target/release/libexec/ftxr-modem"
+      elif [[ -x "$repo_root/../ftxr-modem/target/release/ftxr-modem" ]]; then
+        local_ftxr="$repo_root/../ftxr-modem/target/release/ftxr-modem"
+      fi
+      if [[ -n "$local_ftxr" ]]; then
+        install_binary_file "$local_ftxr" "$FTXR_BINARY_PATH"
+        install_bundled_ftxr_licenses "$repo_root/../ftxr-modem"
+      else
+        provision_ftxr_fallback
+      fi
+    fi
     return 0
   fi
 
@@ -508,7 +512,10 @@ provision_binary() {
 
   if [[ $DRY_RUN -eq 1 ]]; then
     log_info "[dry-run] Would download $tarball_url and $sums_url"
-    log_info "[dry-run] Would verify SHA-256 checksum and install binary to $BINARY_PATH (0755)"
+    log_info "[dry-run] Would verify SHA-256 checksum and install Digi-Dx to $BINARY_PATH (0755)"
+    if [[ $NO_FTXR -eq 0 ]]; then
+      log_info "[dry-run] Would install bundled FT8/FT4 decoder to $FTXR_BINARY_PATH (0755)"
+    fi
     return 0
   fi
 
@@ -534,6 +541,21 @@ provision_binary() {
   tar -xzf "$tmp_dir/$tarball" -C "$tmp_dir"
   [[ -f "$tmp_dir/digi-dx" ]] || die "Archive $tarball did not contain digi-dx executable"
   install_binary_file "$tmp_dir/digi-dx" "$BINARY_PATH"
+
+  if [[ $NO_FTXR -eq 0 ]]; then
+    local bundled_ftxr=""
+    if [[ -f "$tmp_dir/libexec/ftxr-modem" ]]; then
+      bundled_ftxr="$tmp_dir/libexec/ftxr-modem"
+    elif [[ -f "$tmp_dir/ftxr-modem" ]]; then
+      bundled_ftxr="$tmp_dir/ftxr-modem"
+    fi
+    if [[ -n "$bundled_ftxr" ]]; then
+      install_binary_file "$bundled_ftxr" "$FTXR_BINARY_PATH"
+      install_bundled_ftxr_licenses "$tmp_dir/LICENSES/ftxr-modem"
+    else
+      provision_ftxr_fallback
+    fi
+  fi
 }
 
 udev_rules_content() {
@@ -838,6 +860,12 @@ do_uninstall() {
       run_sudo udevadm trigger --subsystem-match=tty --subsystem-match=sound || true
     fi
     run_sudo rm -f "$BINARY_PATH"
+    run_sudo rm -f "$FTXR_BINARY_PATH" /usr/local/bin/ftxr-modem
+    if [[ "$FTXR_BINARY_PATH" != "/usr/local/lib/digi-dx/ftxr-modem" ]]; then
+      run_sudo rm -f /usr/local/lib/digi-dx/ftxr-modem
+    fi
+    run_sudo rmdir /usr/local/lib/digi-dx 2>/dev/null || true
+    run_sudo rm -rf /usr/local/share/licenses/digi-dx
     log_info "Preserved state directory: $LINUX_DATA_DIR and config: $ENV_DIR"
   else
     local plist_path="$HOME/Library/LaunchAgents/com.digidx.daemon.plist"
@@ -846,7 +874,13 @@ do_uninstall() {
     run_cmd launchctl bootout "${gui_domain}/com.digidx.daemon" || true
     run_cmd rm -f "$plist_path"
     local bin_candidate
-    for bin_candidate in /opt/homebrew/bin/digi-dx /usr/local/bin/digi-dx; do
+    for bin_candidate in \
+      /opt/homebrew/bin/digi-dx \
+      /usr/local/bin/digi-dx \
+      /opt/homebrew/lib/digi-dx/ftxr-modem \
+      /usr/local/lib/digi-dx/ftxr-modem \
+      /opt/homebrew/bin/ftxr-modem \
+      /usr/local/bin/ftxr-modem; do
       if [[ -e "$bin_candidate" ]]; then
         if [[ -w "$(dirname "$bin_candidate")" ]]; then
           run_cmd rm -f "$bin_candidate"
@@ -855,6 +889,9 @@ do_uninstall() {
         fi
       fi
     done
+    run_cmd rmdir /opt/homebrew/lib/digi-dx 2>/dev/null || true
+    run_cmd rmdir /usr/local/lib/digi-dx 2>/dev/null || true
+    run_cmd rm -rf /opt/homebrew/share/doc/digi-dx /usr/local/share/licenses/digi-dx 2>/dev/null || true
     log_info "Preserved state directory: $HOME/Library/Application Support/digi-dx"
   fi
   log_info "Uninstall complete."

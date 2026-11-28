@@ -17,7 +17,7 @@ brew services start digi-dx
 
 Then open **<http://127.0.0.1:8788>** in Safari, Chrome, or Firefox.
 
-- **Default weak-signal FT8/FT4 decoder (`ftxr-modem`):** the one-line installer installs the standalone pure-Rust [`ftxr-modem`](https://github.com/mpmbq2/ftxr-modem/releases) binary automatically (no Qt/WSJT-X needed). Without `ftxr-modem`, Digi-Dx falls back to legacy `jt9` (if installed) or its built-in MIT `ft8_lib` decoder.
+- **Built-in FT8 & FT4 decoding:** Digi-Dx bundles its high-sensitivity pure-Rust FT8/FT4 decoder engine out of the box (with embedded `ft8_lib` fallback and optional support for an existing WSJT-X `jt9` installation switchable from the UI).
 - **Microphone permission:** macOS treats USB radio soundcards as microphones. If RX audio looks silent on first run, run `digi-dx preflight --probe-audio` and approve access under **System Settings → Privacy & Security → Microphone**.
 - **Upgrade later:**
   ```bash
@@ -42,14 +42,11 @@ Supports 64-bit Raspberry Pi OS (Pi 4 / Pi 5), Ubuntu, Debian, Fedora, and Arch 
 curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash
 ```
 
-This downloads the prebuilt `digi-dx` and `ftxr-modem` binaries, installs Hamlib (`rigctld`), sets up USB serial/audio permissions (`udev`), and starts the `digi-dx` `systemd` service automatically.
+This installs Digi-Dx (with its default FT8/FT4 decoder), installs Hamlib (`rigctld`), sets up USB serial/audio permissions (`udev`), and starts the `digi-dx` `systemd` service automatically.
 
 > **Tip:** You don't need to use a browser on the Raspberry Pi. Open **`http://<pi-hostname>.local:8788`** (or `http://<pi-ip>:8788`) from your Mac, PC, tablet, or phone on the same network.
 
-- **Skip `ftxr-modem`** (use legacy `jt9` if present or the built-in `ft8_lib` fallback decoder):
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/mpmbq2/digi-dx/main/scripts/install.sh | bash -s -- --no-ftxr
-  ```
+- **Optional WSJT-X `jt9` decoder:** if you separately install `wsjtx` (`jt9`), Digi-Dx lets you switch between `ftxr` (default), `jt9`, and embedded `ft8_lib` right from the UI.
 - **Check status / logs:**
   ```bash
   sudo systemctl status digi-dx
@@ -113,3 +110,8 @@ Or install your locally built binary as a native service:
 - [`docs/architecture.md`](docs/architecture.md) — System architecture
 - [`docs/deployment-and-deps.md`](docs/deployment-and-deps.md) — Deployment & dependency notes
 - [`docs/legacy-domain-notes.md`](docs/legacy-domain-notes.md) — Radio, CAT/Hamlib, audio/DSP, and FT8 domain notes
+
+## License
+
+- **Digi-Dx daemon & web UI:** [`MIT`](LICENSE)
+- **Bundled default FT8/FT4 DSP sidecar (`ftxr-modem`):** `GPL-3.0-only` (executed as a standalone worker binary over stdio IPC; license, notices, and corresponding source archive are included alongside Digi-Dx release packages).

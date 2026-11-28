@@ -14,6 +14,12 @@ on:
 permissions:
   contents: write
 
+env:
+  FTXR_REPO: mpmbq2/ftxr-modem
+  FTXR_VERSION: v0.1.0
+  FTXR_SHA256_DARWIN_AARCH64: c11993daab5024260140992d917417975b5199db4ffcb5ee84f097c1810c9c4e
+  FTXR_SHA256_SRC: 308f7e75d063b8f1f61c79193a3ba323afadec340e92ab9accaf0a5da8e7cb39
+
 jobs:
   build-ui:
     name: Build Frontend UI
@@ -53,8 +59,10 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
+            ftxr_sha256: d811a697c82543d4e76999bc7315e051807b132f7c7e2f441b979879ce96d562
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            ftxr_sha256: 988bc06f501df02aa6cb482e68783240d44001dbc389c9ed3a77c60fabadb6a8
 
     steps:
       - name: Checkout repository
@@ -78,15 +86,34 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Fetch and verify bundled FT8/FT4 decoder sidecar
+        env:
+          ARCH: ${{ matrix.arch }}
+          EXPECTED_SHA: ${{ matrix.ftxr_sha256 }}
+        run: |
+          mkdir -p ftxr-stage
+          TARBALL="ftxr-modem-${FTXR_VERSION}-linux-${ARCH}.tar.gz"
+          curl -fsSL "https://github.com/${FTXR_REPO}/releases/download/${FTXR_VERSION}/${TARBALL}" -o "ftxr-stage/${TARBALL}"
+          echo "${EXPECTED_SHA}  ftxr-stage/${TARBALL}" | sha256sum -c -
+          tar -xzf "ftxr-stage/${TARBALL}" -C ftxr-stage
+          chmod 0755 ftxr-stage/ftxr-modem
+          ftxr-stage/ftxr-modem --version --json
+
       - name: Package release archive
         env:
           ARCH: ${{ matrix.arch }}
         run: |
-          mkdir -p dist/stage
+          mkdir -p dist/stage/libexec dist/stage/LICENSES/ftxr-modem
           cp target/release/digi-dx dist/stage/digi-dx
           chmod 0755 dist/stage/digi-dx
-          cp README.md dist/stage/
+          cp ftxr-stage/ftxr-modem dist/stage/libexec/ftxr-modem
+          chmod 0755 dist/stage/libexec/ftxr-modem
+          cp ftxr-stage/LICENSE ftxr-stage/NOTICE dist/stage/LICENSES/ftxr-modem/
+          cp README.md LICENSE dist/stage/
           cp -r deploy dist/stage/
+          PREFLIGHT_TMP="$(mktemp -d)"
+          DIGI_DX_DATA_DIR="$PREFLIGHT_TMP" dist/stage/digi-dx preflight | grep -q "decoder: ftxr"
+          rm -rf "$PREFLIGHT_TMP"
           tar -czf "dist/digi-dx-linux-${ARCH}.tar.gz" -C dist/stage .
 
       - name: Upload release archive
@@ -125,13 +152,31 @@ jobs:
           file target/release/digi-dx
           codesign --verify --verbose target/release/digi-dx
 
+      - name: Fetch and verify bundled FT8/FT4 decoder sidecar
+        run: |
+          mkdir -p ftxr-stage
+          TARBALL="ftxr-modem-${FTXR_VERSION}-darwin-aarch64.tar.gz"
+          curl -fsSL "https://github.com/${FTXR_REPO}/releases/download/${FTXR_VERSION}/${TARBALL}" -o "ftxr-stage/${TARBALL}"
+          echo "${FTXR_SHA256_DARWIN_AARCH64}  ftxr-stage/${TARBALL}" | shasum -a 256 -c -
+          tar -xzf "ftxr-stage/${TARBALL}" -C ftxr-stage
+          chmod 0755 ftxr-stage/ftxr-modem
+          file ftxr-stage/ftxr-modem
+          codesign --verify --verbose ftxr-stage/ftxr-modem
+          ftxr-stage/ftxr-modem --version --json
+
       - name: Package release archive
         run: |
-          mkdir -p dist/stage
+          mkdir -p dist/stage/libexec dist/stage/LICENSES/ftxr-modem
           cp target/release/digi-dx dist/stage/digi-dx
           chmod 0755 dist/stage/digi-dx
-          cp README.md dist/stage/
+          cp ftxr-stage/ftxr-modem dist/stage/libexec/ftxr-modem
+          chmod 0755 dist/stage/libexec/ftxr-modem
+          cp ftxr-stage/LICENSE ftxr-stage/NOTICE dist/stage/LICENSES/ftxr-modem/
+          cp README.md LICENSE dist/stage/
           cp -r deploy dist/stage/
+          PREFLIGHT_TMP="$(mktemp -d)"
+          DIGI_DX_DATA_DIR="$PREFLIGHT_TMP" dist/stage/digi-dx preflight | grep -q "decoder: ftxr"
+          rm -rf "$PREFLIGHT_TMP"
           tar -czf "dist/digi-dx-darwin-aarch64.tar.gz" -C dist/stage .
 
       - name: Upload release archive
@@ -171,11 +216,17 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Fetch GPLv3 corresponding source archive for bundled decoder
+        run: |
+          SRC_TARBALL="ftxr-modem-${FTXR_VERSION}-src.tar.gz"
+          curl -fsSL "https://github.com/${FTXR_REPO}/releases/download/${FTXR_VERSION}/${SRC_TARBALL}" -o "release-assets/${SRC_TARBALL}"
+          echo "${FTXR_SHA256_SRC}  release-assets/${SRC_TARBALL}" | sha256sum -c -
+
       - name: Generate SHA256SUMS
         id: checksums
         run: |
           cd release-assets
-          sha256sum digi-dx-*.tar.gz > SHA256SUMS
+          sha256sum digi-dx-*.tar.gz "ftxr-modem-${FTXR_VERSION}-src.tar.gz" > SHA256SUMS
           cat SHA256SUMS
           DARWIN_SHA="$(awk '/digi-dx-darwin-aarch64\.tar\.gz$/ {print $1}' SHA256SUMS)"
           echo "darwin_arm64_sha256=${DARWIN_SHA}" >> "$GITHUB_OUTPUT"
@@ -186,10 +237,11 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release-assets/digi-dx-*.tar.gz release-assets/SHA256SUMS --clobber
+            gh release upload "$TAG" release-assets/digi-dx-*.tar.gz "release-assets/ftxr-modem-${FTXR_VERSION}-src.tar.gz" release-assets/SHA256SUMS --clobber
           else
             gh release create "$TAG" \
               release-assets/digi-dx-*.tar.gz \
+              "release-assets/ftxr-modem-${FTXR_VERSION}-src.tar.gz" \
               release-assets/SHA256SUMS \
               --title "Digi-Dx ${TAG}" \
               --generate-notes
@@ -223,7 +275,7 @@ jobs:
           mkdir -p Formula
           cat > Formula/digi-dx.rb <<EOF
           class DigiDx < Formula
-            desc "Local-first FT8 & transceiver daemon with embedded web console"
+            desc "Local-first FT8/FT4 & transceiver daemon with embedded web console"
             homepage "https://github.com/mpmbq2/digi-dx"
             url "${TARBALL_URL}"
             version "${VERSION}"
@@ -236,6 +288,10 @@ jobs:
 
             def install
               bin.install "digi-dx"
+              libexec.install "libexec/ftxr-modem" if File.exist?("libexec/ftxr-modem")
+              if Dir.exist?("LICENSES/ftxr-modem")
+                (doc/"licenses/ftxr-modem").install "LICENSES/ftxr-modem/LICENSE", "LICENSES/ftxr-modem/NOTICE"
+              end
             end
 
             service do
@@ -259,10 +315,6 @@ jobs:
                 Then open the web console in your browser:
                   http://127.0.0.1:8788
 
-                Default weak-signal FT8/FT4 decoder: install ftxr-modem
-                (otherwise Digi-Dx falls back to jt9 or its built-in ft8_lib decoder):
-                  https://github.com/mpmbq2/ftxr-modem/releases
-
                 Note: on first run, macOS may ask for Microphone permission so
                 Digi-Dx can read RX audio from your radio's USB soundcard.
                 If RX audio appears silent, run:
@@ -273,6 +325,7 @@ jobs:
 
             test do
               assert_match "digi-dx", shell_output("#{bin}/digi-dx --help")
+              assert_predicate libexec/"ftxr-modem", :executable?
             end
           end
           EOF
